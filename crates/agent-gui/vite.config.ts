@@ -9,7 +9,7 @@ const packageJson = JSON.parse(
 ) as { version?: string };
 
 const env = process.env as Record<string, string | undefined>;
-const appVersion = env.LIVEAGENT_APP_VERSION?.trim() || packageJson.version || "0.0.0";
+const appVersion = env.ONEAGENT_APP_VERSION?.trim() || packageJson.version || "0.0.0";
 const host = env.TAURI_DEV_HOST;
 
 // https://vite.dev/config/
@@ -25,7 +25,7 @@ export default defineConfig(async () => ({
     },
   },
   define: {
-    __LIVEAGENT_APP_VERSION__: JSON.stringify(appVersion),
+    __ONEAGENT_APP_VERSION__: JSON.stringify(appVersion),
   },
   optimizeDeps: {
     // @tanstack/react-virtual imports the vendored @tanstack/virtual-core

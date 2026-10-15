@@ -421,7 +421,7 @@ fn sensitive_home_subdirs() -> [&'static str; 4] {
 }
 
 fn app_config_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(format!(".{}", env!("CARGO_PKG_NAME"))))
+    crate::storage::canonical_storage_dir().ok()
 }
 
 fn sensitive_dirs() -> Vec<PathBuf> {

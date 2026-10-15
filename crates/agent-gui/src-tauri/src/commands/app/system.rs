@@ -130,9 +130,7 @@ pub struct SystemCreateProjectFolderResponse {
 }
 
 fn app_storage_dir() -> Result<PathBuf, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "Failed to locate the user home directory".to_string())?;
-    let dir = home.join(format!(".{}", env!("CARGO_PKG_NAME")));
+    let dir = crate::storage::ensure_canonical_storage()?;
     fs::create_dir_all(&dir)
         .map_err(|e| format!("Failed to create the application directory: {e}"))?;
     Ok(dir)

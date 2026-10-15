@@ -44,16 +44,16 @@ pub struct BrowserExtensionInstallInfo {
     /// 扩展是否已连上桥接服务（已连即视为安装完成）。
     pub connected: bool,
     /// 扩展安装目录（chrome://extensions「加载已解压的扩展程序」的目标），
-    /// 固定为 `~/.liveagent/extension`。同步失败（找不到内置资源）为 None。
+    /// 固定为 `~/.oneagent/extension`。同步失败（找不到内置资源）为 None。
     pub extension_dir: Option<String>,
 }
 
-/// 扩展的稳定安装目录：`~/.liveagent/extension`。Chrome 加载解压扩展记录的
+/// 扩展的稳定安装目录：`~/.oneagent/extension`。Chrome 加载解压扩展记录的
 /// 是绝对路径——若直接指向 bundle resources，应用更新（安装目录整体替换）
-/// 或 .app 移动后即失效；固定到 .liveagent 下路径终身稳定，内容由每次启动
+/// 或 .app 移动后即失效；固定到 .oneagent 下路径终身稳定，内容由每次启动
 /// 的同步保持最新。
 fn liveagent_extension_dir() -> Option<PathBuf> {
-    dirs::home_dir().map(|home| home.join(".liveagent").join("extension"))
+    crate::storage::ensure_canonical_storage().ok().map(|dir| dir.join("extension"))
 }
 
 /// 同步数据源：打包产物为 bundle resources 下的 browser-extension/
@@ -72,7 +72,7 @@ fn bundled_extension_source(app: &tauri::AppHandle) -> Option<PathBuf> {
         })
 }
 
-/// 应用启动时把内置扩展同步到 `~/.liveagent/extension`（整目录替换）。
+/// 应用启动时把内置扩展同步到 `~/.oneagent/extension`（整目录替换）。
 /// 应用更新后重启即拿到新版扩展文件，Chrome 里已加载的目录无需重选。
 pub fn sync_bundled_browser_extension(app: &tauri::AppHandle) -> Result<(), String> {
     let source =

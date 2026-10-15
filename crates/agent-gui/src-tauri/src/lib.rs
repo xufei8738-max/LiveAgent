@@ -1,6 +1,7 @@
 mod commands;
 mod runtime;
 mod services;
+mod storage;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,7 +38,7 @@ struct TerminalExitRequestedEvent {
 }
 
 pub fn app_version() -> &'static str {
-    env!("LIVEAGENT_APP_VERSION")
+    env!("ONEAGENT_APP_VERSION")
 }
 
 macro_rules! app_invoke_handler {

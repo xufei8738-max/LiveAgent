@@ -1,13 +1,13 @@
 {
-  "name": "liveagent-workspace",
+  "name": "oneagent-workspace",
   "private": true,
   "packageManager": "pnpm@10.32.1",
   "scripts": {
     "format": "biome format --write crates/agent-ui/src crates/agent-gui/src crates/agent-gateway/web/src",
     "lint": "biome check crates/agent-ui/src crates/agent-gui/src crates/agent-gateway/web/src --max-diagnostics=none",
     "lint:fix": "biome check --write crates/agent-ui/src crates/agent-gui/src crates/agent-gateway/web/src --max-diagnostics=none",
-    "build:gui": "pnpm --filter liveagent build",
-    "build:webui": "pnpm --filter @liveagent/gateway-webui build",
+    "build:gui": "pnpm --filter oneagent build",
+    "build:webui": "pnpm --filter @oneagent/gateway-webui build",
     "dev:stack": "node scripts/dev-stack.mjs start",
     "dev:stack:stop": "node scripts/dev-stack.mjs stop",
     "dev:stack:restart": "node scripts/dev-stack.mjs restart",
@@ -18,16 +18,16 @@
     "check:strict": "node scripts/check.mjs strict",
     "check:script-tests": "node --test scripts/ui-boundary-declarations.test.mjs scripts/run-node-tests.test.mjs scripts/check-biome-changed.test.mjs scripts/check-diff-hygiene.test.mjs scripts/release/release-version.test.mjs scripts/release/create-ai-release-notes.test.mjs",
     "check:ui-boundaries": "node scripts/check-ui-boundaries.mjs",
-    "typecheck:ui": "pnpm --filter @liveagent/ui typecheck",
+    "typecheck:ui": "pnpm --filter @oneagent/ui typecheck",
     "typecheck:virtual-core": "pnpm --filter @tanstack/virtual-core typecheck",
     "test:virtual-core": "pnpm --filter @tanstack/virtual-core test",
-    "lint:ui": "pnpm --filter @liveagent/ui lint",
-    "lint:gui": "pnpm --filter liveagent lint",
-    "lint:webui": "pnpm --filter @liveagent/gateway-webui lint",
-    "typecheck:gui": "pnpm --filter liveagent typecheck",
-    "typecheck:webui": "pnpm --filter @liveagent/gateway-webui typecheck",
-    "test:gui": "pnpm --filter liveagent test:frontend",
-    "test:webui": "pnpm --filter @liveagent/gateway-webui test"
+    "lint:ui": "pnpm --filter @oneagent/ui lint",
+    "lint:gui": "pnpm --filter oneagent lint",
+    "lint:webui": "pnpm --filter @oneagent/gateway-webui lint",
+    "typecheck:gui": "pnpm --filter oneagent typecheck",
+    "typecheck:webui": "pnpm --filter @oneagent/gateway-webui typecheck",
+    "test:gui": "pnpm --filter oneagent test:frontend",
+    "test:webui": "pnpm --filter @oneagent/gateway-webui test"
   },
   "pnpm": {
     "overrides": {

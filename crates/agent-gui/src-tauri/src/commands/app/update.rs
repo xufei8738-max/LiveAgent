@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Url};
 use tauri_plugin_updater::UpdaterExt;
 
-const DEFAULT_UPDATE_REPOSITORY: &str = "Stack-Cairn/LiveAgent";
+const DEFAULT_UPDATE_REPOSITORY: &str = "Stack-Cairn/LiveAgent"; // compatibility: existing release repository
 const UPDATE_MANIFEST_ASSET: &str = "latest.json";
 
 #[derive(Debug, Clone, Serialize)]
@@ -89,18 +89,18 @@ fn current_version(app: &AppHandle) -> String {
 }
 
 fn update_repository() -> String {
-    std::env::var("LIVEAGENT_UPDATE_REPOSITORY")
+    std::env::var("ONEAGENT_UPDATE_REPOSITORY")
         .ok()
-        .or_else(|| option_env!("LIVEAGENT_UPDATE_REPOSITORY").map(str::to_string))
+        .or_else(|| option_env!("ONEAGENT_UPDATE_REPOSITORY").map(str::to_string))
         .map(|value| value.trim().trim_matches('/').to_string())
         .filter(|value| !value.is_empty())
         .unwrap_or_else(|| DEFAULT_UPDATE_REPOSITORY.to_string())
 }
 
 fn updater_public_key_override() -> Option<String> {
-    std::env::var("LIVEAGENT_UPDATER_PUBLIC_KEY")
+    std::env::var("ONEAGENT_UPDATER_PUBLIC_KEY")
         .ok()
-        .or_else(|| option_env!("LIVEAGENT_UPDATER_PUBLIC_KEY").map(str::to_string))
+        .or_else(|| option_env!("ONEAGENT_UPDATER_PUBLIC_KEY").map(str::to_string))
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
 }

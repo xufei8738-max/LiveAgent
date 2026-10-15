@@ -1,0 +1,102 @@
+name: OneAgent Windows Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to build (defaults to the workflow ref)
+        required: false
+        type: string
+      app_version:
+        description: Application version (for example 1.3.7)
+        required: false
+        default: "1.3.7"
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.19.0
+  PNPM_VERSION: 10.32.1
+
+jobs:
+  windows:
+    name: OneAgent Windows x64
+    runs-on: windows-latest
+    steps:
+      - name: Check out requested ref
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm
+        shell: pwsh
+        run: npm install -g pnpm@${env:PNPM_VERSION}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install protobuf compiler
+        shell: pwsh
+        run: |
+          choco install protoc -y --no-progress
+          "$env:ChocolateyInstall\lib\protoc\tools\bin" | Out-File -Append $env:GITHUB_PATH
+          protoc --version
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/agent-gui/src-tauri
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Prepare OneAgent version
+        shell: pwsh
+        env:
+          ONEAGENT_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          node scripts/release/prepare-app-version-from-tag.mjs "v$env:ONEAGENT_APP_VERSION" --github-env "$env:GITHUB_ENV" --tauri-config crates/agent-gui/src-tauri/tauri.version.generated.conf.json
+
+      - name: Build unsigned Windows installers
+        working-directory: crates/agent-gui
+        shell: pwsh
+        env:
+          ONEAGENT_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          pnpm tauri build `
+            --config src-tauri/tauri.windows.release.conf.json `
+            --config src-tauri/tauri.version.generated.conf.json `
+            --target x86_64-pc-windows-msvc
+
+      - name: Stage installers and portable executable
+        shell: bash
+        env:
+          ONEAGENT_APP_VERSION: ${{ inputs.app_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist/portable/OneAgent
+          msi_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.msi' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          nsis_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.exe' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          portable_path="$(find target crates/agent-gui/src-tauri/target -type f -name 'oneagent.exe' -path '*/release/*' ! -path '*bundle*' -print -quit 2>/dev/null || true)"
+          test -n "$msi_path"
+          test -n "$nsis_path"
+          test -n "$portable_path"
+          cp "$msi_path" "dist/OneAgent-${ONEAGENT_APP_VERSION}-Windows-x64.msi"
+          cp "$nsis_path" "dist/OneAgent-${ONEAGENT_APP_VERSION}-Windows-x64-Setup.exe"
+          cp "$portable_path" dist/portable/OneAgent/OneAgent.exe
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist/portable/OneAgent/*' -DestinationPath 'dist/OneAgent-${ONEAGENT_APP_VERSION}-Windows-x64-portable.zip' -Force"
+          rm -rf dist/portable
+          ls -lh dist
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: oneagent-windows-x64-${{ inputs.app_version }}
+          path: dist/*
+          if-no-files-found: error

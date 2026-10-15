@@ -98,9 +98,9 @@ macOS signed/notarized release 需要这些 secrets：
 |---|---|
 | `APPLE_CERTIFICATE_P12_BASE64` | Developer ID Application `.p12` 的 base64。 |
 | `APPLE_CERTIFICATE_PASSWORD` | 导出 `.p12` 时设置的密码。 |
-| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: wenlin fei (UU94JSVAA9)`。 |
+| `APPLE_SIGNING_IDENTITY` | `Developer ID Application: Your Name (ABC1234567)`。 |
 | `APPLE_ID` | Apple Developer 账号邮箱。 |
-| `APPLE_TEAM_ID` | `UU94JSVAA9`。 |
+| `APPLE_TEAM_ID` | `ABC1234567`。 |
 | `APPLE_APP_SPECIFIC_PASSWORD` | Apple app-specific password。 |
 | `TAURI_SIGNING_PRIVATE_KEY` | Tauri updater 私钥，用于生成 release 更新包签名。 |
 | `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | Tauri updater 私钥密码；无密码时可为空。 |
@@ -114,7 +114,7 @@ APPLE_CERTIFICATE_PASSWORD=<p12-export-password> \
   scripts/release/bootstrap-github-secrets.sh
 ```
 
-如果 `CERT_DIR/developer_id_application.p12` 不存在，脚本会从本机 Keychain 中的 `Developer ID Application: wenlin fei (UU94JSVAA9)` 自动导出，并生成 `.p12` 密码写入 GitHub Secret。`CERT_DIR` 默认优先使用 `~/Personal/cert`，不存在时使用 `~/Downloads/cert`。已有 `.p12` 时需要传入 `APPLE_CERTIFICATE_PASSWORD=<p12-password>`。
+如果 `CERT_DIR/developer_id_application.p12` 不存在，脚本会从本机 Keychain 中的 `Developer ID Application: Your Name (ABC1234567)` 自动导出，并生成 `.p12` 密码写入 GitHub Secret。`CERT_DIR` 默认优先使用 `~/Personal/cert`，不存在时使用 `~/Downloads/cert`。已有 `.p12` 时需要传入 `APPLE_CERTIFICATE_PASSWORD=<p12-password>`。
 
 如果自动导出失败，先确认本机能看到可签名 identity：
 

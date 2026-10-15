@@ -2,7 +2,7 @@
 
 set -euo pipefail
 
-dmg_path="${1:?usage: verify-macos-dmg.sh /path/to/LiveAgent.dmg}"
+dmg_path="${1:?usage: verify-macos-dmg.sh /path/to/OneAgent.dmg}"
 if [[ ! -f "$dmg_path" ]]; then
   echo "macOS DMG not found: $dmg_path" >&2
   exit 1
@@ -29,8 +29,8 @@ fi
 
 required_paths=(
   ".DS_Store"
-  ".background.png"
-  "LiveAgent.app"
+  ".background/background.png"
+  "OneAgent.app"
   "Applications"
 )
 

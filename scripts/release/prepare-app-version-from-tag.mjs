@@ -90,7 +90,7 @@ function writeTauriConfig(path, appVersion) {
 try {
   const options = parseArgs(process.argv.slice(2));
   const metadata = parseReleaseVersion(
-    options.releaseTag || process.env.LIVEAGENT_RELEASE_TAG || process.env.RELEASE_TAG,
+    options.releaseTag || process.env.ONEAGENT_RELEASE_TAG || process.env.RELEASE_TAG,
   );
   const msiVersion = msiVersionFor(metadata.appVersion);
 
@@ -100,12 +100,12 @@ try {
 
   if (options.githubEnvPath) {
     const envLines = [
-      `LIVEAGENT_RELEASE_TAG=${metadata.releaseTag}`,
-      `LIVEAGENT_APP_VERSION=${metadata.appVersion}`,
-      `LIVEAGENT_IS_PRERELEASE=${metadata.isPrerelease}`,
+      `ONEAGENT_RELEASE_TAG=${metadata.releaseTag}`,
+      `ONEAGENT_APP_VERSION=${metadata.appVersion}`,
+      `ONEAGENT_IS_PRERELEASE=${metadata.isPrerelease}`,
     ];
     if (options.tauriConfigPath) {
-      envLines.push(`LIVEAGENT_TAURI_VERSION_CONFIG=${options.tauriConfigPath}`);
+      envLines.push(`ONEAGENT_TAURI_VERSION_CONFIG=${options.tauriConfigPath}`);
     }
     appendLines(options.githubEnvPath, envLines);
   }

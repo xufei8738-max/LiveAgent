@@ -1831,11 +1831,11 @@ pub(crate) fn git_create_branch_sync(
     )
 }
 
-/// Worktree 存储基目录（`~/.liveagent/worktree`）。Worktree 是仓库的检出
+/// Worktree 存储基目录（`~/.oneagent/worktree`）。Worktree 是仓库的检出
 /// 副本，落在应用存储域，避免污染工作区目录结构。
 fn worktree_storage_base() -> Result<PathBuf, String> {
     let home = dirs::home_dir().ok_or_else(|| "无法定位用户目录。".to_string())?;
-    let dir = home.join(".liveagent").join("worktree");
+    let dir = crate::storage::ensure_canonical_storage()?.join("worktree");
     fs::create_dir_all(&dir).map_err(|error| format!("创建 worktree 目录失败：{error}"))?;
     Ok(dir)
 }
@@ -1925,7 +1925,7 @@ pub(crate) fn git_create_worktree_sync(
     )
 }
 
-/// 默认基目录由调用方注入（生产为 `~/.liveagent/worktree`，测试传临时目录）；
+/// 默认基目录由调用方注入（生产为 `~/.oneagent/worktree`，测试传临时目录）；
 /// 显式 parent_directory 存在时直接使用经过校验的用户目录。
 fn git_create_worktree_with_base(
     workdir: String,

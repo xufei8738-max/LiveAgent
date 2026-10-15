@@ -3,7 +3,7 @@
   "app": {
     "windows": [
       {
-        "title": "LiveAgent",
+        "title": "OneAgent",
         "width": 1400,
         "height": 800,
         "minWidth": 480,
@@ -14,7 +14,7 @@
     ]
   },
   "bundle": {
-    "createUpdaterArtifacts": true,
+    "createUpdaterArtifacts": false,
     "targets": [
       "nsis",
       "msi"

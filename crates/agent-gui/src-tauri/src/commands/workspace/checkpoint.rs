@@ -1,5 +1,5 @@
 //! 会话级文件检查点:fs 写入类命令在落盘前把被改文件的"前像"存到
-//! `~/.liveagent/checkpoints/<conversationId>/`,供 rewind 把工作区回退到
+//! `~/.oneagent/checkpoints/<conversationId>/`,供 rewind 把工作区回退到
 //! 某轮开始前的状态。
 //!
 //! 设计要点(schema v2):
@@ -150,9 +150,7 @@ fn sanitize_conversation_id(id: &str) -> Option<String> {
 }
 
 fn checkpoints_root() -> Result<PathBuf, String> {
-    let home =
-        dirs::home_dir().ok_or_else(|| "Failed to locate the user home directory".to_string())?;
-    Ok(home.join(".liveagent").join("checkpoints"))
+    Ok(crate::storage::ensure_canonical_storage()?.join("checkpoints"))
 }
 
 fn conversation_dir(conversation_id: &str) -> Result<PathBuf, String> {

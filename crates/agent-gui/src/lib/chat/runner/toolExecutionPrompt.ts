@@ -272,9 +272,9 @@ export function buildToolsSuffix(
             ]
           : []),
         "- Use ManagedProcess instead of Bash for dev servers, watchers, preview servers, or anything that should keep running.",
-        "- For reading, listing, or searching Skill content, always use Read/List/Glob/Grep with skill:// paths — Bash cat/ls/find/grep/rg/sed/awk against ~/.liveagent/skills is still routed back to the file tools.",
+        "- For reading, listing, or searching Skill content, always use Read/List/Glob/Grep with skill:// paths — Bash cat/ls/find/grep/rg/sed/awk against ~/.oneagent/skills (legacy ~/.liveagent/skills is also accepted for existing installations) is still routed back to the file tools.",
         "- Do not guess `skills/` paths inside the workspace; if a Skill is needed, enable it in the chat Skills selector first.",
-        "- Do not cd into ~/.liveagent/skills or workspace skills/ guesses.",
+        "- Do not cd into ~/.oneagent/skills (legacy ~/.liveagent/skills is also accepted for existing installations) or workspace skills/ guesses.",
       ].join("\n"),
     );
   }

@@ -181,7 +181,7 @@ export function AboutSection(props: AboutSectionProps) {
   const channelLabel = includePrereleases
     ? t("settings.aboutChannelPrerelease")
     : t("settings.aboutChannelStable");
-  const currentVersion = latestResult?.currentVersion || __LIVEAGENT_APP_VERSION__;
+  const currentVersion = latestResult?.currentVersion || __ONEAGENT_APP_VERSION__;
   const nextVersion = latestResult?.version || latestResult?.releaseTag || "";
   const releaseDate = formatReleaseDate(latestResult?.date);
   const checking = checkState.status === "checking";

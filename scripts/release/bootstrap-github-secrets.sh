@@ -10,9 +10,9 @@ if [ -z "${CERT_DIR:-}" ]; then
 fi
 P12_PATH="${P12_PATH:-$CERT_DIR/developer_id_application.p12}"
 APP_PASSWORD_FILE="${APP_PASSWORD_FILE:-$CERT_DIR/app key.md}"
-APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-Developer ID Application: wenlin fei (UU94JSVAA9)}"
-APPLE_ID="${APPLE_ID:-apple@stackcairn.io}"
-APPLE_TEAM_ID="${APPLE_TEAM_ID:-UU94JSVAA9}"
+APPLE_SIGNING_IDENTITY="${APPLE_SIGNING_IDENTITY:-}"
+APPLE_ID="${APPLE_ID:-}"
+APPLE_TEAM_ID="${APPLE_TEAM_ID:-}"
 KEYCHAIN_PATH="${KEYCHAIN_PATH:-$HOME/Library/Keychains/login.keychain-db}"
 BOOTSTRAP_APPLE_SECRETS="${BOOTSTRAP_APPLE_SECRETS:-1}"
 
@@ -22,6 +22,12 @@ if ! command -v gh >/dev/null 2>&1; then
 fi
 
 bootstrap_apple_release_secrets() {
+  if [ -z "$APPLE_SIGNING_IDENTITY" ] || [ -z "$APPLE_ID" ] || [ -z "$APPLE_TEAM_ID" ]; then
+    echo "APPLE_SIGNING_IDENTITY, APPLE_ID and APPLE_TEAM_ID must be set explicitly." >&2
+    echo "Example: APPLE_SIGNING_IDENTITY='Developer ID Application: Your Name (TEAMID)' APPLE_ID=you@example.com APPLE_TEAM_ID=TEAMID \"$0\"" >&2
+    exit 1
+  fi
+
   if [ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]; then
     if [ ! -f "$APP_PASSWORD_FILE" ]; then
       echo "missing Apple app-specific password file: $APP_PASSWORD_FILE" >&2

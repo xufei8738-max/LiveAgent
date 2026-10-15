@@ -59,7 +59,7 @@ importers:
       '@iconify-json/gravity-ui':
         specifier: 1.2.12
         version: 1.2.12
-      '@liveagent/ui':
+      '@oneagent/ui':
         specifier: workspace:*
         version: link:../../agent-ui
       '@sinclair/typebox':
@@ -195,7 +195,7 @@ importers:
       '@iconify-json/gravity-ui':
         specifier: 1.2.12
         version: 1.2.12
-      '@liveagent/ui':
+      '@oneagent/ui':
         specifier: workspace:*
         version: link:../agent-ui
       '@streamdown/cjk':

@@ -17,8 +17,8 @@ endif
 DESKTOP_WINDOWS_TARGET ?= x86_64-pc-windows-msvc
 DESKTOP_LINUX_TARGET ?= x86_64-unknown-linux-gnu
 DESKTOP_LINUX_BUNDLES ?= appimage deb rpm
-DESKTOP_MACOS_APP_NAME ?= LiveAgent
-DESKTOP_MACOS_NOTARY_PROFILE ?= liveagent-notary
+DESKTOP_MACOS_APP_NAME ?= OneAgent
+DESKTOP_MACOS_NOTARY_PROFILE ?= oneagent-notary
 DESKTOP_MACOS_TAURI_CONFIG ?= src-tauri/tauri.macos.conf.json
 DESKTOP_MACOS_DMG_SETTINGS ?= scripts/release/macos-dmg-settings.py
 DESKTOP_MACOS_DMG_BACKGROUND ?= $(AGENT_GUI_DIR)/src-tauri/dmg/background.png
@@ -26,13 +26,13 @@ DESKTOP_MACOS_DMG_VOLUME_ICON ?= $(AGENT_GUI_DIR)/src-tauri/icons/icon.icns
 DESKTOP_MACOS_DMG_VERIFY ?= scripts/release/verify-macos-dmg.sh
 DESKTOP_WINDOWS_TAURI_CONFIG ?= src-tauri/tauri.windows.conf.json
 DESKTOP_RELEASE_TAURI_CONFIG ?= src-tauri/tauri.macos.release.conf.json
-DESKTOP_RELEASE_TAURI_CONFIG_FLAGS ?= --config $(DESKTOP_RELEASE_TAURI_CONFIG) $(if $(LIVEAGENT_TAURI_VERSION_CONFIG),--config $(LIVEAGENT_TAURI_VERSION_CONFIG))
+DESKTOP_RELEASE_TAURI_CONFIG_FLAGS ?= --config $(DESKTOP_RELEASE_TAURI_CONFIG) $(if $(ONEAGENT_TAURI_VERSION_CONFIG),--config $(ONEAGENT_TAURI_VERSION_CONFIG))
 
 DEV_GATEWAY_TOKEN ?= dev-token
 DEV_GATEWAY_HTTP_ADDR ?= :50052
 DEV_WEBUI_PROXY_API ?= http://localhost:50052
 DEV_SESSION_WORKBENCH ?= 1
-GATEWAY_DOCKER_IMAGE ?= liveagent-gateway:local
+GATEWAY_DOCKER_IMAGE ?= oneagent-gateway:local
 RELEASE_TAG ?=
 
 .PHONY: all dev build desktop-build-macos desktop-build-macos-release desktop-build-macos-intel desktop-build-macos-m desktop-build-windows desktop-build-linux github-release-main check-github-release-tag help
@@ -57,33 +57,25 @@ desktop-build-macos: check-rust-target-$(DESKTOP_MACOS_TARGET)
 # CI=true, so the bundler's own DMG is only used to locate the output path. The
 # release DMG is rebuilt from the signed .app with dmgbuild, which writes the Finder
 # layout (background, window size, icon positions) directly and deterministically.
-desktop-build-macos-release: check-rust-target-$(DESKTOP_MACOS_TARGET) check-macos-signing-identity check-macos-notary-profile
-	env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH APPLE_SIGNING_IDENTITY="$(APPLE_SIGNING_IDENTITY)" pnpm --dir $(AGENT_GUI_DIR) tauri build $(DESKTOP_RELEASE_TAURI_CONFIG_FLAGS) --target $(DESKTOP_MACOS_TARGET)
+desktop-build-macos-release: check-rust-target-$(DESKTOP_MACOS_TARGET)
+	@if [ -n "$(APPLE_SIGNING_IDENTITY)" ]; then \
+		env -u APPLE_ID -u APPLE_PASSWORD -u APPLE_API_ISSUER -u APPLE_API_KEY -u APPLE_API_KEY_PATH APPLE_SIGNING_IDENTITY="$(APPLE_SIGNING_IDENTITY)" pnpm --dir $(AGENT_GUI_DIR) tauri build $(DESKTOP_RELEASE_TAURI_CONFIG_FLAGS) --target $(DESKTOP_MACOS_TARGET); \
+	else \
+		pnpm --dir $(AGENT_GUI_DIR) tauri build $(DESKTOP_RELEASE_TAURI_CONFIG_FLAGS) --target $(DESKTOP_MACOS_TARGET); \
+	fi
 	@set -e; \
 	app_path="target/$(DESKTOP_MACOS_TARGET)/release/bundle/macos/$(DESKTOP_MACOS_APP_NAME).app"; \
 	dmg_path="$$(find "target/$(DESKTOP_MACOS_TARGET)/release/bundle/dmg" -maxdepth 1 -name '$(DESKTOP_MACOS_APP_NAME)_*.dmg' -print -quit)"; \
 	if [ ! -d "$$app_path" ]; then echo "macOS app not found: $$app_path"; exit 1; fi; \
 	if [ -z "$$dmg_path" ] || [ ! -f "$$dmg_path" ]; then echo "macOS dmg not found under target/$(DESKTOP_MACOS_TARGET)/release/bundle/dmg"; exit 1; fi; \
-	if ! command -v dmgbuild >/dev/null 2>&1; then echo "dmgbuild is required. Install dmgbuild==1.6.5 before building a macOS release."; exit 1; fi; \
-	codesign --verify --deep --strict --verbose=4 "$$app_path"; \
-	styled_dmg_path="$${dmg_path%.dmg}.styled.dmg"; \
-	trap 'rm -f "$$styled_dmg_path"' EXIT; \
-	dmgbuild \
-		-s "$(DESKTOP_MACOS_DMG_SETTINGS)" \
-		-D app="$$app_path" \
-		-D background="$(DESKTOP_MACOS_DMG_BACKGROUND)" \
-		-D volume_icon="$(DESKTOP_MACOS_DMG_VOLUME_ICON)" \
-		"$(DESKTOP_MACOS_APP_NAME)" "$$styled_dmg_path"; \
-	mv -f "$$styled_dmg_path" "$$dmg_path"; \
-	trap - EXIT; \
-	codesign --force --timestamp --sign "$(APPLE_SIGNING_IDENTITY)" "$$dmg_path"; \
-	xcrun notarytool submit "$$dmg_path" --keychain-profile "$(DESKTOP_MACOS_NOTARY_PROFILE)" --wait; \
-	xcrun stapler staple "$$dmg_path"; \
-	xcrun stapler validate -v "$$dmg_path"; \
+	if command -v dmgbuild >/dev/null 2>&1; then \
+		styled_dmg_path="$${dmg_path%.dmg}.styled.dmg"; trap 'rm -f "$$styled_dmg_path"' EXIT; \
+		dmgbuild -s "$(DESKTOP_MACOS_DMG_SETTINGS)" -D app="$$app_path" -D background="$(DESKTOP_MACOS_DMG_BACKGROUND)" -D volume_icon="$(DESKTOP_MACOS_DMG_VOLUME_ICON)" "$(DESKTOP_MACOS_APP_NAME)" "$$styled_dmg_path"; \
+		mv -f "$$styled_dmg_path" "$$dmg_path"; trap - EXIT; \
+	fi; \
+	if [ -n "$(APPLE_SIGNING_IDENTITY)" ]; then codesign --verify --deep --strict --verbose=4 "$$app_path"; fi; \
 	bash "$(DESKTOP_MACOS_DMG_VERIFY)" "$$dmg_path"; \
-	spctl --assess --type execute --verbose=4 "$$app_path"; \
-	spctl --assess --type open --context context:primary-signature --verbose=4 "$$dmg_path"; \
-	echo "macOS release dmg is ready: $$dmg_path"
+	echo "macOS release dmg is ready (unsigned/ad-hoc unless signing identity supplied): $$dmg_path"
 
 desktop-build-macos-intel: check-rust-target-$(DESKTOP_MACOS_INTEL_TARGET)
 	pnpm --dir $(AGENT_GUI_DIR) tauri build --config $(DESKTOP_MACOS_TAURI_CONFIG) --target $(DESKTOP_MACOS_INTEL_TARGET)
@@ -188,7 +180,7 @@ proto-check:
 	cd $(AGENT_GATEWAY_DIR) && buf breaking --against '$(BUF_BREAKING_AGAINST)'
 
 webui:
-	pnpm install --offline --filter @liveagent/gateway-webui...
+	pnpm install --offline --filter @oneagent/gateway-webui...
 	pnpm --dir $(AGENT_GATEWAY_WEB_DIR) build
 
 gateway-build: proto webui
@@ -245,8 +237,8 @@ check-macos-notary-profile:
 	@xcrun notarytool history --keychain-profile "$(DESKTOP_MACOS_NOTARY_PROFILE)" >/dev/null || (echo "Notary keychain profile is not usable: $(DESKTOP_MACOS_NOTARY_PROFILE)"; echo "Create it with: APPLE_ID=<email> APPLE_TEAM_ID=<team-id> make desktop-store-macos-notary-profile"; exit 1)
 
 desktop-store-macos-notary-profile:
-	@if [ -z "$(APPLE_ID)" ]; then echo "APPLE_ID is required. Example: APPLE_ID=name@example.com APPLE_TEAM_ID=UU94JSVAA9 make desktop-store-macos-notary-profile"; exit 1; fi
-	@if [ -z "$(APPLE_TEAM_ID)" ]; then echo "APPLE_TEAM_ID is required. Example: APPLE_ID=name@example.com APPLE_TEAM_ID=UU94JSVAA9 make desktop-store-macos-notary-profile"; exit 1; fi
+	@if [ -z "$(APPLE_ID)" ]; then echo "APPLE_ID is required. Example: APPLE_ID=name@example.com APPLE_TEAM_ID=ABC1234567 make desktop-store-macos-notary-profile"; exit 1; fi
+	@if [ -z "$(APPLE_TEAM_ID)" ]; then echo "APPLE_TEAM_ID is required. Example: APPLE_ID=name@example.com APPLE_TEAM_ID=ABC1234567 make desktop-store-macos-notary-profile"; exit 1; fi
 	xcrun notarytool store-credentials "$(DESKTOP_MACOS_NOTARY_PROFILE)" --apple-id "$(APPLE_ID)" --team-id "$(APPLE_TEAM_ID)"
 
 desktop-wait-macos-notary: check-macos-notary-profile

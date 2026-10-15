@@ -194,13 +194,19 @@ func normalizeLegacyArgs(args []string) []string {
 }
 
 func defaultAgentDBPath() string {
-	if dataDir := strings.TrimSpace(os.Getenv("LIVEAGENT_GATEWAY_DATA_DIR")); dataDir != "" {
+	// OneAgent is the canonical identity; retain the old environment variable
+	// as a compatibility alias for existing gateway launchers.
+	dataDir := strings.TrimSpace(os.Getenv("ONEAGENT_GATEWAY_DATA_DIR"))
+	if dataDir == "" {
+		dataDir = strings.TrimSpace(os.Getenv("LIVEAGENT_GATEWAY_DATA_DIR"))
+	}
+	if dataDir != "" {
 		return filepath.Join(dataDir, "gateway.db")
 	}
 	if configDir, err := os.UserConfigDir(); err == nil && strings.TrimSpace(configDir) != "" {
-		return filepath.Join(configDir, "liveagent", "gateway.db")
+		return filepath.Join(configDir, "oneagent", "gateway.db")
 	}
-	return filepath.Join(".", "liveagent-gateway.db")
+	return filepath.Join(".", "oneagent-gateway.db")
 }
 
 func getenv(key, fallback string) string {

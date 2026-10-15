@@ -4,9 +4,9 @@ fn main() {
         .join("..")
         .join("package.json");
     println!("cargo:rerun-if-changed={}", package_json.display());
-    println!("cargo:rerun-if-env-changed=LIVEAGENT_APP_VERSION");
+    println!("cargo:rerun-if-env-changed=ONEAGENT_APP_VERSION");
 
-    let app_version = std::env::var("LIVEAGENT_APP_VERSION")
+    let app_version = std::env::var("ONEAGENT_APP_VERSION")
         .ok()
         .map(|version| version.trim().to_owned())
         .filter(|version| !version.is_empty())
@@ -23,7 +23,7 @@ fn main() {
                 .trim()
                 .to_owned()
         });
-    println!("cargo:rustc-env=LIVEAGENT_APP_VERSION={app_version}");
+    println!("cargo:rustc-env=ONEAGENT_APP_VERSION={app_version}");
 
     // v2 业务消息与 WebSocket 帧壳共用 agent-gateway 目录为 include 根。
     let gateway_root = std::path::Path::new(&manifest_dir)

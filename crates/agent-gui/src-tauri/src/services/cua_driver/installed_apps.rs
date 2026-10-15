@@ -706,7 +706,7 @@ mod tests {
     #[cfg(target_os = "windows")]
     #[test]
     fn windows_listing_is_sorted_deduplicated_and_path_addressed() {
-        let apps = list_installed_apps("com.xiaofei.liveagent");
+        let apps = list_installed_apps("com.xiaofei.oneagent");
         let names: Vec<String> = apps.iter().map(|app| app.name.to_lowercase()).collect();
         let mut sorted = names.clone();
         sorted.sort();

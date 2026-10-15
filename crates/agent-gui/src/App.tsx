@@ -666,7 +666,7 @@ export default function App() {
   });
   const releaseAnnouncement = useReleaseAnnouncementController({
     enabled: settingsReady,
-    currentVersion: __LIVEAGENT_APP_VERSION__,
+    currentVersion: __ONEAGENT_APP_VERSION__,
   });
   // 托盘「检查更新」动作：controller 在监听 effect 之后创建，经 ref 回填。
   runUpdateCheckRef.current = () => {

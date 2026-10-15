@@ -184,10 +184,11 @@ const PROJECT_ROOT_MUTATION_INTENTS = new Set<PathIntent>(["write", "edit", "del
 
 function fixedSkillsRelativePathFromAbsolute(value: string) {
   const normalized = normalizeComparablePath(value);
-  const marker = "/.liveagent/skills/";
-  const index = normalized.indexOf(marker);
-  if (index < 0) return null;
-  return normalized.slice(index + marker.length);
+  for (const marker of ["/.oneagent/skills/", "/.liveagent/skills/"]) {
+    const index = normalized.indexOf(marker);
+    if (index >= 0) return normalized.slice(index + marker.length);
+  }
+  return null;
 }
 
 // Uploaded attachments are staged under ~/.liveagent/uploads (outside the
@@ -200,22 +201,23 @@ function fixedSkillsRelativePathFromAbsolute(value: string) {
 // Windows drive letters, symlinked homes). The deliberate looseness — any
 // absolute path containing the marker is treated as staged — only ever grants
 // read access; mutating intents are rejected for everything it matches.
-const UPLOAD_STAGING_MARKER = "/.liveagent/uploads/";
+const UPLOAD_STAGING_MARKERS = ["/.oneagent/uploads/", "/.liveagent/uploads/"];
 const UPLOAD_STAGING_READ_INTENTS = new Set<PathIntent>(["read", "list", "search", "image"]);
 
 function uploadStagingSplitFromAbsolute(value: string) {
   const normalized = normalizeComparablePath(value);
-  const index = normalized.indexOf(UPLOAD_STAGING_MARKER);
-  if (index >= 0) {
-    return {
-      root: normalized.slice(0, index + UPLOAD_STAGING_MARKER.length - 1),
-      relativePath: normalized.slice(index + UPLOAD_STAGING_MARKER.length),
-    };
-  }
-  // The bare staging root (no trailing separator) must resolve too, so List
-  // on ~/.liveagent/uploads can enumerate batch directories.
-  if (normalized.endsWith(UPLOAD_STAGING_MARKER.slice(0, -1))) {
-    return { root: normalized, relativePath: "" };
+  for (const marker of UPLOAD_STAGING_MARKERS) {
+    const index = normalized.indexOf(marker);
+    if (index >= 0) {
+      return {
+        root: normalized.slice(0, index + marker.length - 1),
+        relativePath: normalized.slice(index + marker.length),
+      };
+    }
+    // The bare staging root (no trailing separator) must resolve too.
+    if (normalized.endsWith(marker.slice(0, -1))) {
+      return { root: normalized, relativePath: "" };
+    }
   }
   return null;
 }
