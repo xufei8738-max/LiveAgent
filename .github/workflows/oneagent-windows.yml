@@ -11,7 +11,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   NODE_VERSION: 22.19.0
@@ -101,3 +101,23 @@ jobs:
           name: oneagent-windows-x64-exe-${{ env.APP_VERSION }}
           path: dist/exe/*
           if-no-files-found: error
+
+      - name: Publish to release assets
+        if: success()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="oneagent-v${APP_VERSION}-windows-x64"
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/msi/* dist/exe/* --repo "${{ github.repository }}" --clobber
+          else
+            gh release create "$tag" dist/msi/* dist/exe/* \
+              --repo "${{ github.repository }}" \
+              --title "OneAgent ${APP_VERSION} Windows x64" \
+              --notes "Unsigned zero-key build of OneAgent ${APP_VERSION} (LiveAgent v2.0.25 based). See job log for SHA256." \
+              --prerelease
+          fi
+          echo "=== Release assets ==="
+          gh release view "$tag" --repo "${{ github.repository }}" --json assets --jq '.assets[] | "\(.name) \(.size)"'
