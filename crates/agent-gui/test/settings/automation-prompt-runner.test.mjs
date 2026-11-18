@@ -1,0 +1,335 @@
+import { assertJsxDimensions } from "../helpers/style-dimensions.mjs";
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
+
+const invokeCalls = [];
+const loader = createTsModuleLoader({
+  mocks: {
+    "@tauri-apps/api/core": {
+      async invoke(command, args) {
+        invokeCalls.push({ command, args });
+        if (command === "automation_claim_prompt_runs") return [];
+        if (command === "automation_complete_prompt_run") {
+          return { status: "completed" };
+        }
+        if (command === "automation_run_cron_now") {
+          return { startedAt: 1234 };
+        }
+      },
+    },
+    "@tauri-apps/api/event": {
+      async listen() {
+        return () => {};
+      },
+    },
+  },
+});
+
+const { backend } = loader.loadModule("src/lib/automation/backend.ts");
+const {
+  findManualCronRun,
+  isManualCronRunFinished,
+  MANUAL_CRON_RUN_POLL_INTERVAL_MS,
+  MANUAL_CRON_RUN_TIMEOUT_MS,
+  MAX_BASH_HTTP_CRON_TIMEOUT_SECONDS,
+  MAX_PROMPT_CRON_TIMEOUT_SECONDS,
+  maxCronTimeoutSeconds,
+  PROMPT_PENDING_CLAIM_WINDOW_MS,
+} = loader.loadModule("@liveagent/ui/lib/automation/types.ts");
+const { createCompletePromptRunInput, PROMPT_RUN_RECONCILE_INTERVAL_MS } = loader.loadModule(
+  "src/components/cron/promptRunProtocol.ts",
+);
+const runnerSource = readFileSync(
+  new URL("../../src/components/cron/CronPromptRunner.tsx", import.meta.url),
+  "utf8",
+);
+const cronViewSource = readFileSync(
+  new URL("../../../agent-ui/src/pages/settings/CronTaskViewModal.tsx", import.meta.url),
+  "utf8",
+);
+const webAutomationBackendSource = readFileSync(
+  new URL("../../../agent-gateway/web/src/lib/automation/backend.ts", import.meta.url),
+  "utf8",
+);
+const cronModalSource = readFileSync(
+  new URL("../../../agent-ui/src/pages/settings/CronTaskModal.tsx", import.meta.url),
+  "utf8",
+);
+const cronToolsSource = readFileSync(
+  new URL("../../src/lib/tools/cronTools.ts", import.meta.url),
+  "utf8",
+);
+const builtinRegistrySource = readFileSync(
+  new URL("../../src/lib/tools/builtinRegistry.ts", import.meta.url),
+  "utf8",
+);
+
+test.beforeEach(() => {
+  invokeCalls.length = 0;
+});
+
+test("K-brain Auto Prompt uses the claimed workdir for the backend session", () => {
+  assert.match(runnerSource, /const workdir = request\.workdir\.trim\(\)/);
+  assert.match(runnerSource, /runKBrainTurn\(/);
+  assert.match(runnerSource, /cwd: workdir/);
+  assert.doesNotMatch(runnerSource, /resolveEffectivePromptSettings/);
+});
+
+test("Auto Prompt completion uses the Rust camelCase wire contract", async () => {
+  const input = createCompletePromptRunInput("execution-1", true, 1200, "conclusion");
+
+  assert.deepEqual(input, {
+    executionId: "execution-1",
+    success: true,
+    durationMs: 1200,
+    output: "conclusion",
+  });
+
+  await backend.completePromptRun(input);
+  assert.deepEqual(invokeCalls, [
+    {
+      command: "automation_complete_prompt_run",
+      args: { input },
+    },
+  ]);
+});
+
+test("Auto Prompt transport keeps command arguments snake_case", async () => {
+  await backend.claimPromptRuns();
+  await backend.releasePromptRun("execution-1");
+
+  assert.deepEqual(invokeCalls, [
+    { command: "automation_claim_prompt_runs", args: undefined },
+    {
+      command: "automation_release_prompt_run",
+      args: { execution_id: "execution-1" },
+    },
+  ]);
+});
+
+test("Cron manual run uses the task-scoped run-now command", async () => {
+  const response = await backend.runNow("task-1");
+
+  assert.deepEqual(response, { startedAt: 1234 });
+  assert.deepEqual(invokeCalls, [
+    {
+      command: "automation_run_cron_now",
+      args: { task_id: "task-1" },
+    },
+  ]);
+});
+
+test("Cron manual run stays wired in shared UI", () => {
+  assert.match(cronViewSource, /const response = await runCronNow\(selectedTaskId\)/);
+  assert.match(cronViewSource, /disabled=\{isCancelling \|\| \(isRunningNow && !canCancelRun\)\}/);
+  assert.match(cronViewSource, /settings\.cronViewCancelRun/);
+  assert.match(cronViewSource, /settings\.cronViewLogCancelled/);
+  assert.match(cronViewSource, /terminationReason === "cancelled"/);
+  assert.match(cronViewSource, /settings\.cronViewLogExpired/);
+  assert.match(
+    cronViewSource,
+    /cancelCronRun\(selectedTaskId, manualRunExecutionId \?\? undefined\)/,
+  );
+  const cancelHandler = cronViewSource.split("async function handleCancelRun")[1].split("return (")[0];
+  assert.doesNotMatch(cancelHandler, /setIsRunningNow\(false\)|setManualRunStartedAt\(null\)/);
+  assert.match(cronViewSource, /onRunsLoaded=\{handleRunsLoaded\}/);
+  assert.match(cronViewSource, /setManualRunStartedAt\(activeRun.startedAt\)/);
+  assert.match(cronViewSource, /if \(runNowLockRef\.current\) return/);
+  assert.match(cronViewSource, /setManualRunStartedAt\(response\.startedAt\)/);
+  assert.match(cronViewSource, /listCronRuns\(taskId, 500\)/);
+  assert.match(cronViewSource, /requestGenerationRef/);
+  assert.match(cronViewSource, /clearInFlightRef/);
+  assert.match(cronViewSource, /activeTaskIdRef\.current !== loadedTaskId/);
+  assert.match(cronViewSource, /setManualRunStartedAt\(null\)/);
+  assert.match(cronViewSource, /setIsCancelling\(false\)/);
+  assert.match(cronViewSource, /activeRun\.counted !== true/);
+  assert.match(cronViewSource, /refreshKey=\{runsRefreshKey\}/);
+  assert.match(cronViewSource, /key=\{task\.id\}/);
+  assert.match(cronViewSource, /settings\.cronViewRunNow/);
+  assertJsxDimensions(cronViewSource, "Play", { width: "3.5", height: "3.5" });
+  assert.match(
+    webAutomationBackendSource,
+    /return cronManage<CronRunNowResponse>\("run_now", taskId\)/,
+  );
+});
+
+test("Cron manual run remains locked until its non-skip run reaches a terminal state", () => {
+  const run = (id, state, startedAt, output = "") => ({
+    id,
+    taskId: "task-1",
+    state,
+    success: state === "done",
+    startedAt,
+    durationMs: 0,
+    output,
+    counted: false,
+  });
+  const marker = 1_000;
+  const skip = run(
+    "skip",
+    "done",
+    marker + 1,
+    "Skipped: previous run is still in progress.",
+  );
+
+  assert.equal(MANUAL_CRON_RUN_POLL_INTERVAL_MS, 1_000);
+  assert.equal(MANUAL_CRON_RUN_TIMEOUT_MS, 6 * 60_000);
+  assert.equal(findManualCronRun([skip], marker), undefined);
+  assert.equal(
+    findManualCronRun([{ ...run("scheduler", "leased", marker + 2), counted: true }], marker),
+    undefined,
+  );
+  assert.equal(
+    findManualCronRun([{ ...run("manual", "leased", marker + 2), counted: false }], marker)?.id,
+    "manual",
+  );
+  assert.equal(
+    findManualCronRun([{ ...run("legacy", "leased", marker + 2) }], marker)?.id,
+    "legacy",
+    "legacy snapshots without counted remain manual-compatible",
+  );
+  assert.equal(
+    findManualCronRun(
+      [{ ...run("other", "done", marker + 2), counted: false }, { ...run("manual", "leased", marker + 3), counted: false }],
+      marker,
+      "manual",
+    )?.id,
+    "manual",
+  );
+  assert.equal(
+    isManualCronRunFinished(
+      [{ ...run("scheduler", "done", marker + 2), counted: true }],
+      marker,
+    ),
+    false,
+  );
+  assert.equal(isManualCronRunFinished([skip, run("pending", "pending", marker + 2)], marker), false);
+  assert.equal(isManualCronRunFinished([skip, run("leased", "leased", marker + 2)], marker), false);
+  assert.equal(isManualCronRunFinished([skip, run("done", "done", marker + 2)], marker), true);
+  assert.equal(isManualCronRunFinished([skip, run("expired", "expired", marker + 2)], marker), true);
+});
+
+test("K-brain Auto Prompt claims and completes through the backend-owned runner", () => {
+  assert.match(runnerSource, /let claimed: PromptRunRequest\[\] = \[\]/);
+  assert.match(runnerSource, /backend\.claimPromptRuns\(\)/);
+  assert.match(runnerSource, /createCompletePromptRunInput\(/);
+  assert.match(runnerSource, /backend\.completePromptRun\(/);
+  assert.doesNotMatch(runnerSource, /resolveWorkspaceResources/);
+  assert.doesNotMatch(runnerSource, /resolveShellSandboxSettings/);
+});
+
+test("Cron workspace pin stays wired in shared UI", () => {
+  for (const source of [cronModalSource]) {
+    // Radix SelectItem rejects empty-string values, so "follow active" must
+    // go through the sentinel and map back to "" on save; the custom-path
+    // mode keeps arbitrary (tool-pinned) paths visible and editable.
+    assert.match(
+      source,
+      /const FOLLOW_ACTIVE_WORKSPACE_VALUE = "__follow-active-workspace__"/,
+    );
+    assert.match(source, /const CUSTOM_WORKDIR_VALUE = "__custom-workdir__"/);
+    assert.match(
+      source,
+      /customWorkdir\s*\? CUSTOM_WORKDIR_VALUE\s*: workdir \|\| FOLLOW_ACTIVE_WORKSPACE_VALUE/,
+    );
+    // The save payload must always carry the workdir key: an empty string is
+    // the explicit clear signal — dropping the key would keep a stale pin.
+    assert.match(source, /workdir: type === "http" \? "" : workdir\.trim\(\)/);
+    assert.match(source, /workspaceOptions: CronWorkspaceOption\[\]/);
+    // Windows pins may spell the same directory differently than the
+    // workspace list ("\" vs "/", drive-letter case): matching must be
+    // shape-insensitive and snap to the list entry's spelling.
+    assert.match(source, /function comparableWorkdirPath\(path: string\)/);
+    assert.match(source, /const isWindowsShape = \/\^\[A-Za-z\]:\/\.test\(normalized\)/);
+    assert.match(
+      source,
+      /findWorkspaceOptionByPath\(workspaceOptions, initialWorkdir\)\?\.path \?\? initialWorkdir/,
+    );
+    assert.match(
+      source,
+      /Boolean\(initialWorkdir && !findWorkspaceOptionByPath\(workspaceOptions, initialWorkdir\)\)/,
+    );
+    assert.match(source, /: findWorkspaceOptionByPath\(workspaceOptions, workdir\)/);
+  }
+  assert.match(cronViewSource, /\{task\.workdir \? \(/);
+});
+
+test("CronTaskManager create pins the agent's current workspace by default", () => {
+  // Create with the workdir key absent injects the runtime workspace (http
+  // tasks excluded); an explicitly EMPTY workdir also resolves to the
+  // runtime workspace — the model has no "follow active workspace" spelling.
+  assert.match(cronToolsSource, /fields\.type !== "http" && !Object\.hasOwn\(args, "workdir"\)/);
+  assert.match(cronToolsSource, /if \(Object\.hasOwn\(fields, "workdir"\)\)/);
+  assert.match(cronToolsSource, /if \(!explicit && runtimeWorkdir\)/);
+  assert.match(cronToolsSource, /fields\.workdir = runtimeWorkdir/);
+  // Prompt creation force-sets the runtime model and a medium thinking
+  // level in code — neither is a model-facing parameter.
+  assert.match(cronToolsSource, /fields\.selectedModel = options\.currentChatModel/);
+  assert.match(cronToolsSource, /fields\.reasoning = "medium"/);
+  // The registry wires the runtime workdir into the tool bundle.
+  assert.match(
+    builtinRegistrySource,
+    /createCronTools\(\{\s*currentChatModel: params\.currentChatModel,\s*workdir: params\.workdir,\s*\}\)/,
+  );
+});
+
+test("Cron reasoning levels follow the selected model in shared UI", () => {
+  for (const source of [cronModalSource]) {
+    assert.match(source, /providers: CustomProvider\[\]/);
+    assert.match(source, /const selectedModel = parseModelValue\(selectedModelValue\)/);
+    assert.match(source, /getChatRuntimeReasoningLevelsForProvider\(\{/);
+    assert.match(source, /isThinkingAlwaysOnForModel\(/);
+    assert.match(source, /return thinkingAlwaysOn \? supportedLevels : \["off", \.\.\.supportedLevels\]/);
+    assert.match(source, /\{cronReasoningLevels\.map\(\(level\) => \(/);
+    assert.match(source, /coerceCronReasoningLevel\(nextReasoningLevels, current\)/);
+    assert.match(
+      source,
+      /if \(levels\.includes\(DEFAULT_CRON_REASONING\)\) return DEFAULT_CRON_REASONING;\s*return levels\[0\] \?\? DEFAULT_CRON_REASONING;/,
+    );
+  }
+});
+
+test("Cron timeout upper bound is per task kind and mirrors Rust", () => {
+  // Bounds mirror validate.rs: bash/http stay at the shell runner's cap,
+  // prompt tasks get the higher frontend-execution ceiling.
+  assert.equal(MAX_BASH_HTTP_CRON_TIMEOUT_SECONDS, 600);
+  assert.equal(MAX_PROMPT_CRON_TIMEOUT_SECONDS, 3600);
+  assert.equal(maxCronTimeoutSeconds("prompt"), 3600);
+  assert.equal(maxCronTimeoutSeconds("bash"), 600);
+  assert.equal(maxCronTimeoutSeconds("http"), 600);
+  // Pending claim window mirrors PROMPT_PENDING_CLAIM_WINDOW_MS in store.rs.
+  assert.equal(PROMPT_PENDING_CLAIM_WINDOW_MS, 600_000);
+
+  // The modal validates against the per-kind max (rejects, never clamps) and
+  // shows a kind-aware hint under the timeout input.
+  assert.match(cronModalSource, /const timeoutMax = maxCronTimeoutSeconds\(type\)/);
+  assert.match(cronModalSource, /parsedTimeoutSeconds > timeoutMax/);
+  assert.match(
+    cronModalSource,
+    /settings\.cronTimeoutSecondsMaxHint"\)\.replace\(\s*"\{max\}",\s*String\(maxCronTimeoutSeconds\(type\)\),?\s*\)/,
+  );
+
+  // Manual prompt runs are watched across the pending claim window plus the
+  // execution lease.
+  assert.match(
+    cronViewSource,
+    /task\?\.type === "prompt" \? PROMPT_PENDING_CLAIM_WINDOW_MS : 0/,
+  );
+
+  // The LLM tool schema advertises the widened prompt ceiling; Rust remains
+  // the authority for the per-kind rejection.
+  assert.match(cronToolsSource, /maximum: 3600/);
+  assert.match(cronToolsSource, /up to 3600 for type=prompt/);
+});
+
+test("legacy automation hosts retain their existing run behavior", async () => {
+  assert.equal(backend.canCancelRun(), false);
+  await assert.rejects(backend.cancelRun("task"), /unavailable on this host/);
+  assert.deepEqual(invokeCalls, []);
+  assert.match(webAutomationBackendSource, /async cancelRun\(taskId: string, executionId\?: string\): Promise<void>/);
+  assert.match(webAutomationBackendSource, /executionId \? \{ executionId \} : undefined/);
+  assert.match(webAutomationBackendSource, /canCancelRun\(\): boolean \{\s*return true/);
+});

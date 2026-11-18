@@ -1,0 +1,2434 @@
+import { type WorkspaceProject, workspaceProjectPathKey } from "@liveagent/app/lib/settings";
+import {
+  AlertCircle,
+  Archive,
+  Blend,
+  Brain,
+  Cable,
+  CalendarDays,
+  Check,
+  ChevronDown,
+  ChevronRight,
+  ChevronUp,
+  CirclePlus,
+  Clock3,
+  Folder,
+  FolderClosed,
+  FolderOpen,
+  ImageIcon,
+  ListChecks,
+  Loader2,
+  MessageSquare,
+  PanelLeftClose,
+  Plus,
+  Search,
+  Settings,
+  Share2,
+  Trash2,
+  X,
+} from "@liveagent/ui/components/IconSet";
+import { Button } from "@liveagent/ui/components/ui/button";
+import { useConfirmDialog } from "@liveagent/ui/components/ui/confirm-dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@liveagent/ui/components/ui/dropdown-menu";
+import { Input } from "@liveagent/ui/components/ui/input";
+import { Skeleton } from "@liveagent/ui/components/ui/skeleton";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import {
+  type CommandPaletteAction,
+  isCommandPaletteShortcut,
+  isCommandPaletteSuppressed,
+  isMacLikePlatform,
+} from "@liveagent/ui/lib/chat/commandPalette";
+import { withCommandShortcuts } from "@liveagent/ui/lib/chat/commandPaletteActions";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import {
+  getShortcutCommand,
+  matchesShortcutCommand,
+  type ShortcutCommandId,
+} from "@liveagent/ui/lib/shortcuts/shortcutCommands";
+import { isKeyEventHandledElsewhere } from "@liveagent/ui/lib/shortcuts/shortcutKeys";
+import type {
+  SidebarBatchDeleteOptions,
+  SidebarBatchDeleteResult,
+} from "@liveagent/ui/lib/sidebar/batchDelete";
+import {
+  reconcileSidebarSelection,
+  updateSidebarSelection,
+} from "@liveagent/ui/lib/sidebar/selection";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import {
+  type CSSProperties,
+  Fragment,
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { normalizeSidebarShortcuts, SIDEBAR_SHORTCUTS } from "../../lib/settings/sidebarShortcuts";
+import type { ConversationOpenOptions } from "../../lib/sidebar/openController";
+import {
+  buildSidebarPinnedEntries,
+  reorderSidebarPinnedEntries,
+  reorderSidebarProjects,
+  sidebarConversationOrderKey,
+  sidebarWorkspaceOrderKey,
+} from "../../lib/sidebar/preferences";
+import { WORKSPACE_HISTORY_PAGE_SIZE } from "../../lib/sidebar/store";
+import type { SidebarConversation } from "../../lib/sidebar/types";
+import { useSidebarReorderDrag } from "../../lib/sidebar/useSidebarReorderDrag";
+import {
+  buildWorkspaceProjectSections,
+  sliceWorkspaceProjectSections,
+} from "../../lib/workspaceProjects";
+import type { WorkspaceProjectGroup } from "../../lib/workspaceProjectTypes";
+import { ShortcutTooltip } from "../ui/shortcut-tooltip";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarTrigger,
+  useSidebarToggleShortcut,
+} from "../ui/sidebar";
+import { ArchivedConversationsModal } from "./ArchivedConversationsModal";
+import { HistoryRow, ProjectGroupHeader, ProjectRow } from "./ChatHistorySidebarRows";
+import {
+  HISTORY_RENAME_INPUT_CLASS,
+  PROJECT_ICON_BUTTON_CLASS,
+  SIDEBAR_CONTEXT_MENU_CLASS,
+} from "./ChatHistorySidebarStyles";
+import type {
+  ChatHistorySidebarProps,
+  WorkspaceProjectRemoveOptions,
+} from "./ChatHistorySidebarTypes";
+import { ConversationSearchDialog } from "./ConversationSearchDialog";
+
+export type {
+  ChatHistorySidebarContainerSource,
+  ChatHistorySidebarListStatus,
+  ChatHistorySidebarMutationKind,
+  ChatHistorySidebarProps,
+  ChatHistorySidebarWorkspaceSource,
+  WorkspaceProjectRemoveOptions,
+} from "./ChatHistorySidebarTypes";
+export {
+  buildChatHistorySidebarBaseProps,
+  buildChatHistorySidebarConversationProps,
+  buildChatHistorySidebarWorkspaceProps,
+} from "./ChatHistorySidebarTypes";
+
+type PendingWorkspaceProjectAction = {
+  projectId: string;
+  mode: "remove" | "deleteWorktree";
+};
+
+const MOBILE_SIDEBAR_MEDIA_QUERY = "(max-width: 820px)";
+const HISTORY_ROW_ESTIMATED_HEIGHT = 30;
+const HISTORY_ROW_GAP = 1;
+const HISTORY_ROW_OVERSCAN_COUNT = 8;
+const PROJECT_LIST_COLLAPSED_MAX = 30;
+const EMPTY_PROJECT_PATH_KEYS = new Set<string>();
+const EMPTY_APPROVAL_CONVERSATION_IDS = new Set<string>();
+const EMPTY_QUESTION_CONVERSATION_IDS = new Set<string>();
+const EMPTY_UNREAD_CONVERSATION_IDS = new Set<string>();
+const HISTORY_LOADING_SKELETON_ROWS = [
+  { title: "w-36", meta: "w-20" },
+  { title: "w-44", meta: "w-24" },
+  { title: "w-32", meta: "w-16" },
+  { title: "w-40", meta: "w-28" },
+  { title: "w-28", meta: "w-20" },
+] as const;
+
+function forkSourceFor(
+  bySessionId: ReadonlyMap<string, SidebarConversation>,
+  item: SidebarConversation,
+) {
+  const source = item.forkedFromSessionId ? bySessionId.get(item.forkedFromSessionId) : undefined;
+  return source && source.id !== item.id ? { id: source.id, title: source.title } : null;
+}
+
+function isMobileSidebarLayout() {
+  if (typeof window === "undefined") {
+    return false;
+  }
+  return window.matchMedia(MOBILE_SIDEBAR_MEDIA_QUERY).matches;
+}
+
+const SIDEBAR_SHORTCUT_COMMANDS: readonly ShortcutCommandId[] = [
+  "newConversation",
+  "openSettings",
+  "searchConversations",
+  "previousConversation",
+  "nextConversation",
+  "toggleRightPanel",
+];
+const SHORTCUT_DIALOG_SELECTOR = "[role=dialog], [role=alertdialog], [aria-modal=true]";
+
+function useStableEvent<Args extends unknown[], Return>(
+  handler: (...args: Args) => Return,
+): (...args: Args) => Return {
+  const handlerRef = useRef(handler);
+  handlerRef.current = handler;
+
+  return useCallback((...args: Args) => handlerRef.current(...args), []);
+}
+
+function HistoryListLoadingSkeleton() {
+  const { t } = useLocale();
+
+  return (
+    <div
+      className="space-y-1.5 pt-1"
+      role="status"
+      aria-live="polite"
+      aria-label={t("sidebar.readingHistory")}
+    >
+      <div className="flex items-center gap-2 px-2 pb-1 text-xs font-medium text-muted-foreground/75">
+        <span className="relative flex size-2 shrink-0" aria-hidden="true">
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary/35 opacity-75" />
+          <span className="relative inline-flex size-2 rounded-full bg-primary/70" />
+        </span>
+        <span>{t("sidebar.readingHistory")}</span>
+      </div>
+      {HISTORY_LOADING_SKELETON_ROWS.map((row) => (
+        <div key={`${row.title}-${row.meta}`} className="rounded-lg px-2 py-2.5">
+          <div className="flex items-start gap-2">
+            <Skeleton className="mt-1 size-3.5 shrink-0 rounded-md" />
+            <div className="min-w-0 flex-1 space-y-2">
+              <Skeleton className={cn("h-3.5 rounded", row.title)} />
+              <Skeleton className={cn("h-2.5 rounded", row.meta)} />
+            </div>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+export const ChatHistorySidebar = memo(function ChatHistorySidebar(props: ChatHistorySidebarProps) {
+  const {
+    items,
+    onReorderProjects,
+    pinnedOrder,
+    onReorderPinned,
+    workspaceHistory,
+    onLoadWorkspaceHistory,
+    currentConversationId,
+    busyConversationIds,
+    runningConversationIds,
+    approvalConversationIds = EMPTY_APPROVAL_CONVERSATION_IDS,
+    questionConversationIds = EMPTY_QUESTION_CONVERSATION_IDS,
+    unreadConversationIds = EMPTY_UNREAD_CONVERSATION_IDS,
+    listStatus,
+    scopeKey = "",
+    hasMore,
+    isLoadingMore,
+    errorMessage,
+    actionErrorMessage = null,
+    onDismissActionError,
+    sectionsDisabled = false,
+    renamingId,
+    renameDraft,
+    isOpen,
+    fontScale = 1,
+    conversationSearchRequestKey,
+    getCommandPaletteActions,
+    activeView = "chat",
+    showProjects = false,
+    projects = [],
+    workspaceProjectGroups = [],
+    activeProjectId,
+    missingProjectPathKeys,
+    runningProjectPathKeys,
+    projectsCollapsed: persistedProjectsCollapsed = false,
+    workspaceFolderDropActive = false,
+    workspaceFolderDropHandlers,
+    recentCollapsed: persistedRecentCollapsed = false,
+    onProjectsCollapsedChange,
+    onRecentCollapsedChange,
+    onCreateProject,
+    onCreateWorkspaceGroup,
+    onRenameWorkspaceGroup,
+    onDeleteWorkspaceGroup,
+    onMoveProjectToGroup,
+    onToggleWorkspaceGroupCollapsed,
+    onSelectProject,
+    onNewConversationForProject,
+    onBrowseProjectInFileTree,
+    onConfigureProject,
+    onBrowseProjectInSystemFileManager,
+    onSetProjectPinned,
+    onRemoveProject,
+    onArchiveProject,
+    onUnarchiveProject,
+    archivedProjectPathKeys = EMPTY_PROJECT_PATH_KEYS,
+    onNewConversation,
+    onSelectConversation,
+    onConversationWorkbenchDragIntent,
+    onConversationOpenInWorkbenchSplit,
+    onProjectWorkbenchDragIntent,
+    onStartRenaming,
+    onRenameDraftChange,
+    onCommitRename,
+    onCancelRename,
+    onSetPinned,
+    onSetArchived,
+    archivedConversations,
+    onMoveToWorkspace,
+    onMoveConversationsToWorkspace,
+    canShareConversations,
+    sharedConversationCount,
+    onShareConversation,
+    onOpenSharedConversations,
+    onDeleteConversation,
+    onDeleteConversations,
+    onLoadMore,
+    sidebarShortcuts = normalizeSidebarShortcuts(undefined),
+    onOpenSettings,
+    onOpenResourceHub,
+    headerTop,
+    brand,
+    hideCloseButton = false,
+    footerTrailing,
+  } = props;
+  const { t } = useLocale();
+  const sidebarToggleShortcut = useSidebarToggleShortcut();
+
+  const [conversationSearchOpen, setConversationSearchOpen] = useState(false);
+  const [conversationSearchMode, setConversationSearchMode] = useState<"search" | "palette">(
+    "search",
+  );
+  const conversationSearchOpenRef = useRef(conversationSearchOpen);
+  conversationSearchOpenRef.current = conversationSearchOpen;
+  const [revealedSearchConversationId, setRevealedSearchConversationId] = useState<string | null>(
+    null,
+  );
+  const pendingSearchScrollRef = useRef<string | null>(null);
+  const workspaceTreeRef = useRef<HTMLDivElement | null>(null);
+  const [pinnedCollapsed, setPinnedCollapsed] = useState(false);
+  const revealingSearch = revealedSearchConversationId === currentConversationId;
+  const projectsCollapsed = revealingSearch ? false : persistedProjectsCollapsed;
+  const recentCollapsed =
+    revealedSearchConversationId === currentConversationId ? false : persistedRecentCollapsed;
+  const lastConversationSearchRequestKeyRef = useRef(conversationSearchRequestKey);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
+  const [selectionMode, setSelectionMode] = useState(false);
+  const [selectedConversationIds, setSelectedConversationIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  );
+  const [isBulkDeleting, setIsBulkDeleting] = useState(false);
+  const [isBulkMoving, setIsBulkMoving] = useState(false);
+  const [bulkMoveMenuOpen, setBulkMoveMenuOpen] = useState(false);
+  const [pendingProjectAction, setPendingProjectAction] =
+    useState<PendingWorkspaceProjectAction | null>(null);
+  const [showAllProjects, setShowAllProjects] = useState(false);
+  const [openMenuId, setOpenMenuId] = useState<string | null>(null);
+  const [openProjectMenuId, setOpenProjectMenuId] = useState<string | null>(null);
+  const [isMobileMenuLayout, setIsMobileMenuLayout] = useState(isMobileSidebarLayout);
+  const sidebarSelectedProjectRef = useRef<string | null>(null);
+  const [expandedProjectIds, setExpandedProjectIds] = useState<ReadonlySet<string>>(
+    () => new Set(activeProjectId ? [activeProjectId] : []),
+  );
+  useEffect(() => {
+    // A title click already chose whether to expand or collapse this folder.
+    // Selecting that workspace must not undo the same click's collapse.
+    const selectedFromSidebar = sidebarSelectedProjectRef.current === activeProjectId;
+    sidebarSelectedProjectRef.current = null;
+    if (activeProjectId && !selectedFromSidebar) {
+      setExpandedProjectIds((current) => new Set(current).add(activeProjectId));
+    }
+  }, [activeProjectId]);
+  useEffect(() => {
+    if (!showProjects || !isOpen || sectionsDisabled) return;
+    for (const project of projects) {
+      if (project.isPinned ? pinnedCollapsed : projectsCollapsed) continue;
+      const history = workspaceHistory?.get(workspaceProjectPathKey(project.path));
+      if (expandedProjectIds.has(project.id) && !history) {
+        void onLoadWorkspaceHistory?.(project.path, false);
+      }
+    }
+  }, [
+    expandedProjectIds,
+    isOpen,
+    onLoadWorkspaceHistory,
+    projects,
+    projectsCollapsed,
+    pinnedCollapsed,
+    sectionsDisabled,
+    showProjects,
+    workspaceHistory,
+  ]);
+  const toggleProjectExpanded = (project: WorkspaceProject) => {
+    setExpandedProjectIds((current) => {
+      const next = new Set(current);
+      if (next.has(project.id)) next.delete(project.id);
+      else next.add(project.id);
+      return next;
+    });
+  };
+
+  const itemById = useMemo(() => {
+    const index = new Map<string, SidebarConversation>();
+    for (const item of items) {
+      // Preserve Array.find's first-match behavior if malformed input contains
+      // duplicate ids while making repeated lookups constant-time.
+      if (!index.has(item.id)) index.set(item.id, item);
+    }
+    return index;
+  }, [items]);
+  const pinnedConversations = useMemo(() => items.filter((item) => item.isPinned), [items]);
+  const currentConversationWorkdir = useMemo(
+    () => itemById.get(currentConversationId)?.cwd,
+    [currentConversationId, itemById],
+  );
+
+  useEffect(() => {
+    if (!sectionsDisabled) return;
+    setConversationSearchOpen(false);
+  }, [sectionsDisabled]);
+
+  useEffect(() => {
+    if (
+      conversationSearchRequestKey === undefined ||
+      conversationSearchRequestKey === lastConversationSearchRequestKeyRef.current
+    ) {
+      return;
+    }
+    lastConversationSearchRequestKeyRef.current = conversationSearchRequestKey;
+    if (!sectionsDisabled) {
+      setConversationSearchMode("search");
+      setConversationSearchOpen(true);
+    }
+  }, [conversationSearchRequestKey, sectionsDisabled]);
+
+  const commandPaletteEnabled = Boolean(getCommandPaletteActions) && !sectionsDisabled;
+  // Shortcut commands the sidebar runs itself: the palette, plain search,
+  // stepping through the visible conversation list, and palette actions that
+  // already exist for the host (new conversation, settings, right panel).
+  const runSidebarShortcut = useStableEvent((command: ShortcutCommandId): boolean => {
+    if (command === "searchConversations") {
+      setConversationSearchMode("search");
+      setConversationSearchOpen(true);
+      return true;
+    }
+    if (command === "previousConversation" || command === "nextConversation") {
+      return stepConversation(command === "nextConversation" ? 1 : -1);
+    }
+    const paletteActionId = getShortcutCommand(command)?.paletteActionId;
+    const action = paletteActionId
+      ? getCommandPaletteActions?.().find((entry) => entry.id === paletteActionId)
+      : undefined;
+    if (!action) return false;
+    action.run();
+    return true;
+  });
+  useEffect(() => {
+    if (sectionsDisabled) return;
+    const isMac = isMacLikePlatform();
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (commandPaletteEnabled && isCommandPaletteShortcut(event, isMac)) {
+        // A covering surface (the desktop settings overlay) owns the keyboard.
+        if (isCommandPaletteSuppressed()) return;
+        event.preventDefault();
+        if (event.repeat) return;
+        // The same chord closes an open palette (focus sits in its input).
+        if (conversationSearchOpenRef.current) {
+          setConversationSearchOpen(false);
+          return;
+        }
+        setConversationSearchMode("palette");
+        setConversationSearchOpen(true);
+        return;
+      }
+      if (isKeyEventHandledElsewhere(event) || isCommandPaletteSuppressed()) return;
+      const command = SIDEBAR_SHORTCUT_COMMANDS.find((id) =>
+        matchesShortcutCommand(event, id, isMac),
+      );
+      if (!command) return;
+      // An open dialog (the palette itself, confirmations) owns the keyboard.
+      const target = event.target instanceof Element ? event.target : null;
+      if (target?.closest(SHORTCUT_DIALOG_SELECTOR)) return;
+      const repeatable = command === "previousConversation" || command === "nextConversation";
+      if (event.repeat && !repeatable) {
+        event.preventDefault();
+        return;
+      }
+      if (runSidebarShortcut(command)) event.preventDefault();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [commandPaletteEnabled, runSidebarShortcut, sectionsDisabled]);
+  const selectionAnchorRef = useRef<string | null>(null);
+  const bulkConfirmOpenRef = useRef(false);
+  // Bumped to invalidate an in-flight bulk delete: its shouldStop callback
+  // starts returning true and its continuation stops touching state.
+  const bulkDeleteRunRef = useRef(0);
+  const bulkMoveRunRef = useRef(0);
+  const { confirm: requestBulkDeleteConfirm, dialog: bulkDeleteDialog } = useConfirmDialog();
+  // Archived rows are split into their own collapsed group at the list end;
+  // the render cap only applies to the active rows.
+  const activeProjects = useMemo(
+    () =>
+      projects.filter(
+        (project) => !archivedProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+      ),
+    [archivedProjectPathKeys, projects],
+  );
+  const archivedProjects = useMemo(
+    () =>
+      projects.filter((project) =>
+        archivedProjectPathKeys.has(workspaceProjectPathKey(project.path)),
+      ),
+    [archivedProjectPathKeys, projects],
+  );
+  // Projects arrive pre-sorted from the container; the view organizes them
+  // into group sections (worktree projects auto-grouped under their source
+  // repository) plus the ungrouped remainder. The collapsed view slices by
+  // section so a group is never split.
+  const pinnedProjects = useMemo(
+    () => activeProjects.filter((project) => project.isPinned),
+    [activeProjects],
+  );
+  const pinnedEntries = useMemo(
+    () => buildSidebarPinnedEntries(pinnedConversations, pinnedProjects, pinnedOrder),
+    [pinnedConversations, pinnedProjects, pinnedOrder],
+  );
+  const projectSections = useMemo(
+    () =>
+      buildWorkspaceProjectSections(
+        activeProjects.filter((project) => !project.isPinned),
+        workspaceProjectGroups ?? [],
+      ),
+    [activeProjects, workspaceProjectGroups],
+  );
+  const slicedSections = useMemo(
+    () =>
+      showAllProjects || revealingSearch
+        ? { sections: projectSections, hiddenProjectCount: 0 }
+        : sliceWorkspaceProjectSections(projectSections, PROJECT_LIST_COLLAPSED_MAX),
+    [projectSections, showAllProjects, revealingSearch],
+  );
+  const renderedSections = slicedSections.sections;
+  const hiddenProjectCount = slicedSections.hiddenProjectCount;
+  const projectConversations = useMemo(() => {
+    const result = new Map<string, SidebarConversation[]>();
+    for (const item of items) {
+      if (item.isPinned) continue;
+      const key = workspaceProjectPathKey(item.cwd ?? "");
+      const group = result.get(key) ?? [];
+      group.push(item);
+      result.set(key, group);
+    }
+    return result;
+  }, [items]);
+  // Branch rows point at their source by backend session ID.
+  const conversationsBySessionId = useMemo(() => {
+    const result = new Map<string, SidebarConversation>();
+    for (const item of items) if (item.sessionId) result.set(item.sessionId, item);
+    return result;
+  }, [items]);
+  const visibleProjectConversations = useCallback(
+    (project: WorkspaceProject) => {
+      const key = workspaceProjectPathKey(project.path);
+      const conversations = projectConversations.get(key) ?? [];
+      const visible = conversations.slice(
+        0,
+        workspaceHistory?.get(key)?.limit ?? WORKSPACE_HISTORY_PAGE_SIZE,
+      );
+      const revealed = revealingSearch
+        ? conversations.find((item) => item.id === currentConversationId)
+        : undefined;
+      return revealed && !visible.some((item) => item.id === revealed.id)
+        ? [...visible, revealed]
+        : visible;
+    },
+    [currentConversationId, projectConversations, revealingSearch, workspaceHistory],
+  );
+  const isGroupCollapsed = useCallback(
+    (group: WorkspaceProjectGroup, members: WorkspaceProject[]) =>
+      group.collapsed === true &&
+      !(revealingSearch && members.some((project) => project.id === activeProjectId)),
+    [activeProjectId, revealingSearch],
+  );
+  const visibleItems = useMemo(() => {
+    if (!showProjects) return items;
+    const visibleProjects = [
+      ...(projectsCollapsed
+        ? []
+        : [
+            ...renderedSections.grouped.flatMap((section) =>
+              isGroupCollapsed(section.group, section.projects) ? [] : section.projects,
+            ),
+            ...renderedSections.ungrouped,
+          ]),
+    ];
+    return [
+      ...(pinnedCollapsed
+        ? []
+        : pinnedEntries.flatMap((entry) =>
+            entry.kind === "conversation"
+              ? [entry.item]
+              : expandedProjectIds.has(entry.project.id)
+                ? visibleProjectConversations(entry.project)
+                : [],
+          )),
+      ...visibleProjects.flatMap((project) => {
+        if (!expandedProjectIds.has(project.id)) return [];
+        return visibleProjectConversations(project);
+      }),
+    ];
+  }, [
+    expandedProjectIds,
+    items,
+    pinnedEntries,
+    projectsCollapsed,
+    pinnedCollapsed,
+    renderedSections,
+    showProjects,
+    isGroupCollapsed,
+    visibleProjectConversations,
+  ]);
+  const orderedConversationIds = useMemo(() => visibleItems.map((item) => item.id), [visibleItems]);
+  // Previous/next conversation follow the list as rendered (pinned first, then
+  // expanded projects); collapsed sections are skipped. No wrap-around.
+  const stepConversation = useStableEvent((direction: 1 | -1): boolean => {
+    const ids = orderedConversationIds;
+    if (ids.length === 0) return false;
+    const index = currentConversationId ? ids.indexOf(currentConversationId) : -1;
+    const nextIndex = index < 0 ? (direction > 0 ? 0 : ids.length - 1) : index + direction;
+    const nextId = ids[nextIndex];
+    if (!nextId) return true;
+    handleSelectConversation(nextId);
+    return true;
+  });
+  const getPaletteActions = useStableEvent((): CommandPaletteAction[] => {
+    const actions = [...(getCommandPaletteActions?.() ?? [])];
+    if (orderedConversationIds.length > 1) {
+      actions.push(
+        {
+          id: "previous-conversation",
+          group: "navigation",
+          label: t("shortcuts.command.previousConversation"),
+          keywords: ["previous", "up", "conversation"],
+          icon: ChevronUp,
+          run: () => void stepConversation(-1),
+        },
+        {
+          id: "next-conversation",
+          group: "navigation",
+          label: t("shortcuts.command.nextConversation"),
+          keywords: ["next", "down", "conversation"],
+          icon: ChevronDown,
+          run: () => void stepConversation(1),
+        },
+      );
+    }
+    return withCommandShortcuts(actions, isMacLikePlatform());
+  });
+  const visibleRunningProjectPathKeys = useMemo(() => {
+    // A conversation waiting on the user — for a tool approval or for an
+    // AskUserQuestion answer — is suspended, not working. Both must drop out of
+    // the workspace's "running" dot the same way, or the two blocked states
+    // would disagree at the project-row level.
+    if (approvalConversationIds.size === 0 && questionConversationIds.size === 0) {
+      return runningProjectPathKeys;
+    }
+
+    const blockedOnlyCandidates = new Set<string>();
+    const activelyRunningPathKeys = new Set<string>();
+    for (const item of items) {
+      if (!runningConversationIds.has(item.id)) continue;
+      const pathKey = workspaceProjectPathKey(item.cwd ?? "");
+      if (!pathKey) continue;
+      if (approvalConversationIds.has(item.id) || questionConversationIds.has(item.id)) {
+        blockedOnlyCandidates.add(pathKey);
+      } else {
+        activelyRunningPathKeys.add(pathKey);
+      }
+    }
+
+    let next: Set<string> | null = null;
+    for (const pathKey of blockedOnlyCandidates) {
+      if (activelyRunningPathKeys.has(pathKey) || !runningProjectPathKeys.has(pathKey)) continue;
+      next ??= new Set(runningProjectPathKeys);
+      next.delete(pathKey);
+    }
+    return next ?? runningProjectPathKeys;
+  }, [
+    approvalConversationIds,
+    questionConversationIds,
+    items,
+    runningConversationIds,
+    runningProjectPathKeys,
+  ]);
+  const selectableConversationIds = useMemo(
+    () =>
+      new Set(
+        sectionsDisabled
+          ? []
+          : visibleItems
+              .filter(
+                (item) => !runningConversationIds.has(item.id) && !busyConversationIds.has(item.id),
+              )
+              .map((item) => item.id),
+      ),
+    [busyConversationIds, visibleItems, runningConversationIds, sectionsDisabled],
+  );
+  const handleSelectConversation = useStableEvent(
+    (id: string, options?: ConversationOpenOptions) => {
+      if (!sectionsDisabled) {
+        selectionAnchorRef.current = id;
+        onSelectConversation(
+          id,
+          options?.source === "search"
+            ? {
+                ...options,
+                afterCommit: () => {
+                  pendingSearchScrollRef.current = id;
+                  setRevealedSearchConversationId(id);
+                  options.afterCommit?.();
+                },
+              }
+            : options,
+        );
+      }
+    },
+  );
+  const handleStartRenaming = useStableEvent((item: SidebarConversation) => {
+    if (!sectionsDisabled) {
+      onStartRenaming(item);
+    }
+  });
+  const handleRenameDraftChange = useStableEvent((value: string) => {
+    if (!sectionsDisabled) {
+      onRenameDraftChange(value);
+    }
+  });
+  const handleCommitRename = useStableEvent(() => {
+    if (!sectionsDisabled) {
+      onCommitRename();
+    }
+  });
+  const handleCancelRename = useStableEvent(onCancelRename);
+  const handleSetPinned = useStableEvent((id: string, isPinned: boolean) => {
+    if (!sectionsDisabled) {
+      onSetPinned(id, isPinned);
+    }
+  });
+  const handleMoveToWorkspace = useStableEvent((id: string, cwd: string) => {
+    if (!sectionsDisabled) {
+      onMoveToWorkspace(id, cwd);
+    }
+  });
+  const handleMoveConversationsToWorkspace = useStableEvent(
+    (ids: readonly string[], cwd: string) => {
+      if (sectionsDisabled) {
+        return Promise.resolve<readonly string[]>(ids);
+      }
+      return onMoveConversationsToWorkspace(ids, cwd);
+    },
+  );
+  const handleShareConversation = useStableEvent((item: SidebarConversation) => {
+    if (!sectionsDisabled) {
+      onShareConversation(item);
+    }
+  });
+  const handleOpenSharedConversations = useStableEvent(() => {
+    if (!sectionsDisabled) {
+      onOpenSharedConversations();
+    }
+  });
+  const handleSetArchivedEvent = useStableEvent((id: string, archived: boolean) => {
+    if (!sectionsDisabled) onSetArchived?.(id, archived);
+  });
+  const handleSetArchived = onSetArchived ? handleSetArchivedEvent : undefined;
+  const [archivedListOpen, setArchivedListOpen] = useState(false);
+  const handleOpenArchivedConversations = useStableEvent(() => {
+    if (!sectionsDisabled) setArchivedListOpen(true);
+  });
+  const handleCloseArchivedConversations = useStableEvent(() => setArchivedListOpen(false));
+  const handleDeleteConversation = useStableEvent((id: string) => {
+    if (!sectionsDisabled) {
+      onDeleteConversation(id);
+    }
+  });
+  const handleDeleteConversations = useStableEvent(
+    (ids: readonly string[], options?: SidebarBatchDeleteOptions) => {
+      if (sectionsDisabled) {
+        return Promise.resolve<SidebarBatchDeleteResult>({
+          deletedIds: [],
+          failedIds: ids,
+          skippedIds: [],
+        });
+      }
+      return onDeleteConversations(ids, options);
+    },
+  );
+  const handleLoadMore = useStableEvent(() => {
+    if (!sectionsDisabled) {
+      onLoadMore();
+    }
+  });
+  const handleSetPendingDelete = useStableEvent((id: string | null) => {
+    if (!sectionsDisabled || id === null) {
+      setPendingDeleteId(id);
+    }
+  });
+  const handleSetPendingProjectAction = useStableEvent(
+    (action: PendingWorkspaceProjectAction | null) => {
+      if (!sectionsDisabled || action === null) {
+        setPendingProjectAction(action);
+      }
+    },
+  );
+  const handleProjectsCollapsedChange = useStableEvent(() => {
+    setRevealedSearchConversationId(null);
+    if (!sectionsDisabled) {
+      onProjectsCollapsedChange?.(!projectsCollapsed);
+    }
+  });
+  const handleRecentCollapsedChange = useStableEvent(() => {
+    if (!sectionsDisabled) {
+      setRevealedSearchConversationId(null);
+      onRecentCollapsedChange?.(!recentCollapsed);
+    }
+  });
+  const handleShowAllProjects = useStableEvent(() => {
+    if (!sectionsDisabled) {
+      setShowAllProjects((current) => !current);
+    }
+  });
+  const handleSelectProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      sidebarSelectedProjectRef.current = project.id;
+      onSelectProject?.(project);
+    }
+  });
+  const handleBrowseProjectInFileTree = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onBrowseProjectInFileTree?.(project);
+    }
+  });
+  const handleConfigureProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onConfigureProject?.(project);
+    }
+  });
+  const handleBrowseProjectInSystemFileManager = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onBrowseProjectInSystemFileManager?.(project);
+    }
+  });
+  const handleSetProjectPinned = useStableEvent((project: WorkspaceProject, isPinned: boolean) => {
+    if (!sectionsDisabled) {
+      onSetProjectPinned?.(project, isPinned);
+    }
+  });
+  const handleRemoveProject = useStableEvent(
+    (project: WorkspaceProject, options?: WorkspaceProjectRemoveOptions) => {
+      if (!sectionsDisabled) {
+        onRemoveProject?.(project, options);
+      }
+    },
+  );
+  const handleArchiveProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onArchiveProject?.(project);
+    }
+  });
+  const handleUnarchiveProject = useStableEvent((project: WorkspaceProject) => {
+    if (!sectionsDisabled) {
+      onUnarchiveProject?.(project);
+    }
+  });
+  const exitSelectionMode = useCallback(() => {
+    bulkDeleteRunRef.current += 1;
+    bulkMoveRunRef.current += 1;
+    setIsBulkDeleting(false);
+    setIsBulkMoving(false);
+    setBulkMoveMenuOpen(false);
+    setSelectionMode(false);
+    setSelectedConversationIds(new Set());
+    selectionAnchorRef.current = null;
+  }, []);
+  const enterSelectionMode = useStableEvent((initialId?: string) => {
+    if (sectionsDisabled) {
+      return;
+    }
+    setPendingDeleteId(null);
+    setOpenMenuId(null);
+    handleCancelRename();
+    if (!showProjects) onRecentCollapsedChange?.(false);
+    setSelectionMode(true);
+    if (initialId && selectableConversationIds.has(initialId)) {
+      setSelectedConversationIds(new Set([initialId]));
+      selectionAnchorRef.current = initialId;
+    } else {
+      setSelectedConversationIds(new Set());
+      selectionAnchorRef.current = null;
+    }
+  });
+  const handleSelectForBulk = useStableEvent(
+    (id: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => {
+      if (sectionsDisabled || !selectableConversationIds.has(id)) {
+        return;
+      }
+      setPendingDeleteId(null);
+      setOpenMenuId(null);
+      handleCancelRename();
+      setSelectionMode(true);
+      setSelectedConversationIds((current) => {
+        const next = updateSidebarSelection({
+          orderedIds: orderedConversationIds,
+          selectableIds: selectableConversationIds,
+          selectedIds: current,
+          anchorId: selectionAnchorRef.current,
+          targetId: id,
+          shiftKey: modifiers.shiftKey,
+          toggleKey: modifiers.toggleKey,
+        });
+        selectionAnchorRef.current = next.anchorId;
+        return next.selectedIds;
+      });
+    },
+  );
+  const handleBulkDelete = useStableEvent(async () => {
+    const ids = orderedConversationIds.filter(
+      (id) => selectedConversationIds.has(id) && selectableConversationIds.has(id),
+    );
+    if (ids.length === 0 || isBulkDeleting || sectionsDisabled) {
+      return;
+    }
+
+    const count = String(ids.length);
+    bulkConfirmOpenRef.current = true;
+    const confirmed = await requestBulkDeleteConfirm({
+      title: t(
+        ids.length === 1
+          ? "chat.conversationBulkDeleteConfirmOne"
+          : "chat.conversationBulkDeleteConfirm",
+      ).replace("{count}", count),
+      description: t("chat.conversationBulkDeleteDescription"),
+      confirmLabel: t("chat.conversationBulkDelete"),
+      cancelLabel: t("chat.cancel"),
+      closeLabel: t("chat.cancel"),
+    }).finally(() => {
+      bulkConfirmOpenRef.current = false;
+    });
+    if (!confirmed) {
+      return;
+    }
+
+    const runId = bulkDeleteRunRef.current + 1;
+    bulkDeleteRunRef.current = runId;
+    setIsBulkDeleting(true);
+    try {
+      const result = await handleDeleteConversations(ids, {
+        shouldStop: () => bulkDeleteRunRef.current !== runId,
+      });
+      if (bulkDeleteRunRef.current !== runId) {
+        // Cancelled mid-batch: exitSelectionMode already reset the selection UI.
+        return;
+      }
+      const orderedConversationIdSet = new Set(orderedConversationIds);
+      const failedIds = result.failedIds.filter((id) => orderedConversationIdSet.has(id));
+      setSelectedConversationIds(new Set(failedIds));
+      selectionAnchorRef.current = failedIds[0] ?? null;
+      if (failedIds.length === 0) {
+        setSelectionMode(false);
+      }
+    } finally {
+      if (bulkDeleteRunRef.current === runId) {
+        setIsBulkDeleting(false);
+      }
+    }
+  });
+  const handleBulkMove = useStableEvent(async (cwd: string) => {
+    const ids = orderedConversationIds.filter(
+      (id) => selectedConversationIds.has(id) && selectableConversationIds.has(id),
+    );
+    if (ids.length === 0 || isBulkMoving || sectionsDisabled) {
+      return;
+    }
+
+    const runId = bulkMoveRunRef.current + 1;
+    bulkMoveRunRef.current = runId;
+    setIsBulkMoving(true);
+    try {
+      const failedIds = await handleMoveConversationsToWorkspace(ids, cwd);
+      if (bulkMoveRunRef.current !== runId) {
+        return;
+      }
+      const orderedConversationIdSet = new Set(orderedConversationIds);
+      const remainingFailedIds = failedIds.filter((id) => orderedConversationIdSet.has(id));
+      setSelectedConversationIds(new Set(remainingFailedIds));
+      selectionAnchorRef.current = remainingFailedIds[0] ?? null;
+      if (remainingFailedIds.length === 0) {
+        setSelectionMode(false);
+      }
+    } finally {
+      if (bulkMoveRunRef.current === runId) {
+        setIsBulkMoving(false);
+      }
+    }
+  });
+  // Archiving must always leave at least one active workspace behind.
+  const canArchiveProjects = Boolean(onArchiveProject) && activeProjects.length > 1;
+  const [archivedGroupOpen, setArchivedGroupOpen] = useState(false);
+  const [creatingGroup, setCreatingGroup] = useState(false);
+  const [groupDraft, setGroupDraft] = useState("");
+  // Base UI resolves the "+" menu's return-focus target synchronously while the
+  // menu unmounts — the same commit that mounts the draft input — so the trigger
+  // would take focus straight back and the empty-draft blur would silently close
+  // the row again ("new group does nothing"). The menu's finalFocus consumes this
+  // one-shot flag and the effect below owns focus placement, which is why the
+  // input has no autoFocus.
+  const suppressAddMenuReturnFocusRef = useRef(false);
+  const groupDraftInputRef = useRef<HTMLInputElement | null>(null);
+  // Enter/Escape mark the blur as handled so onBlur commits exactly once —
+  // without it, committing on Enter unmounts a focused input and the trailing
+  // focusout creates the group a second time.
+  const skipNextGroupBlurCommitRef = useRef(false);
+
+  useEffect(() => {
+    if (!creatingGroup) return;
+    skipNextGroupBlurCommitRef.current = false;
+    groupDraftInputRef.current?.focus();
+  }, [creatingGroup]);
+  const [renamingGroupId, setRenamingGroupId] = useState<string | null>(null);
+  const [groupRenameDraft, setGroupRenameDraft] = useState("");
+  const { confirm: requestGroupDeleteConfirm, dialog: groupDeleteDialog } = useConfirmDialog();
+
+  const commitNewGroup = useCallback(() => {
+    const name = groupDraft.trim();
+    if (name) onCreateWorkspaceGroup?.(name);
+    setCreatingGroup(false);
+    setGroupDraft("");
+  }, [groupDraft, onCreateWorkspaceGroup]);
+
+  const cancelNewGroup = useCallback(() => {
+    setCreatingGroup(false);
+    setGroupDraft("");
+  }, []);
+
+  const commitGroupRename = useCallback(() => {
+    const name = groupRenameDraft.trim();
+    if (renamingGroupId && name) onRenameWorkspaceGroup?.(renamingGroupId, name);
+    setRenamingGroupId(null);
+    setGroupRenameDraft("");
+  }, [groupRenameDraft, onRenameWorkspaceGroup, renamingGroupId]);
+
+  const cancelGroupRename = useCallback(() => {
+    setRenamingGroupId(null);
+    setGroupRenameDraft("");
+  }, []);
+
+  const requestDeleteGroup = useCallback(
+    async (group: WorkspaceProjectGroup) => {
+      const confirmed = await requestGroupDeleteConfirm({
+        title: t("chat.workspaceGroupDeleteConfirmTitle").replace("{name}", group.name),
+        description: t("chat.workspaceGroupDeleteConfirmDescription"),
+        confirmLabel: t("chat.workspaceGroupDelete"),
+        cancelLabel: t("chat.cancel"),
+      });
+      if (confirmed) onDeleteWorkspaceGroup?.(group.id);
+    },
+    [onDeleteWorkspaceGroup, requestGroupDeleteConfirm, t],
+  );
+  const handleMenuOpenChange = useStableEvent((id: string, open: boolean) => {
+    if (open && sectionsDisabled) {
+      return;
+    }
+    setOpenMenuId((current) => {
+      if (open) {
+        return id;
+      }
+      return current === id ? null : current;
+    });
+  });
+  const handleProjectMenuOpenChange = useStableEvent((projectId: string, open: boolean) => {
+    if (open && sectionsDisabled) {
+      return;
+    }
+    setOpenProjectMenuId((current) => {
+      if (open) {
+        return projectId;
+      }
+      return current === projectId ? null : current;
+    });
+  });
+  useEffect(() => {
+    if (typeof window === "undefined") {
+      return;
+    }
+
+    const mediaQueryList = window.matchMedia(MOBILE_SIDEBAR_MEDIA_QUERY);
+    const syncMobileLayout = () => setIsMobileMenuLayout(mediaQueryList.matches);
+
+    syncMobileLayout();
+    mediaQueryList.addEventListener("change", syncMobileLayout);
+    return () => mediaQueryList.removeEventListener("change", syncMobileLayout);
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setOpenMenuId(null);
+      setOpenProjectMenuId(null);
+    }
+  }, [isOpen]);
+
+  useEffect(() => {
+    if (!sectionsDisabled) {
+      return;
+    }
+
+    setOpenMenuId(null);
+    setOpenProjectMenuId(null);
+    setPendingDeleteId(null);
+    setPendingProjectAction(null);
+    exitSelectionMode();
+    handleCancelRename();
+  }, [exitSelectionMode, handleCancelRename, sectionsDisabled]);
+
+  useEffect(() => {
+    if (!pendingProjectAction) {
+      return;
+    }
+    if (!projects.some((project) => project.id === pendingProjectAction.projectId)) {
+      setPendingProjectAction(null);
+    }
+  }, [pendingProjectAction, projects]);
+
+  useEffect(() => {
+    if (pendingDeleteId !== null || renamingId !== null) {
+      setOpenMenuId(null);
+    }
+  }, [pendingDeleteId, renamingId]);
+
+  useEffect(() => {
+    if (selectionMode) {
+      setOpenMenuId(null);
+    }
+  }, [selectionMode]);
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: selection cannot cross sidebar scopes
+  useEffect(() => {
+    exitSelectionMode();
+  }, [exitSelectionMode, scopeKey]);
+
+  useEffect(() => {
+    setSelectedConversationIds((current) => {
+      const next = reconcileSidebarSelection({
+        orderedIds: orderedConversationIds,
+        selectableIds: selectableConversationIds,
+        selectedIds: current,
+        anchorId: selectionAnchorRef.current,
+      });
+      selectionAnchorRef.current = next.anchorId;
+      return next.selectedIds;
+    });
+  }, [orderedConversationIds, selectableConversationIds]);
+
+  useEffect(() => {
+    if (!selectionMode) {
+      return;
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || bulkConfirmOpenRef.current) {
+        return;
+      }
+      // Escape inside the composer or any text field belongs to that editor,
+      // not to the sidebar selection.
+      const target = event.target as HTMLElement | null;
+      if (
+        target &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)
+      ) {
+        return;
+      }
+      exitSelectionMode();
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => window.removeEventListener("keydown", handleKeyDown);
+  }, [exitSelectionMode, selectionMode]);
+
+  const menuSide = isMobileMenuLayout ? "bottom" : "right";
+  const historyScrollRef = useRef<HTMLDivElement | null>(null);
+  // Divider slot between the pinned block and the rest: index of the first
+  // unpinned row, only when at least one pinned row sits above it.
+  const firstUnpinnedHistoryIndex = useMemo(() => {
+    if (items[0]?.isPinned !== true) {
+      return -1;
+    }
+    const index = items.findIndex((item) => item.isPinned !== true);
+    return index > 0 ? index : -1;
+  }, [items]);
+  const getHistoryItemKey = useCallback((index: number) => items[index]?.id ?? index, [items]);
+  const historyVirtualizer = useVirtualizer({
+    count: showProjects ? 0 : items.length,
+    getScrollElement: () => historyScrollRef.current,
+    estimateSize: () => HISTORY_ROW_ESTIMATED_HEIGHT + HISTORY_ROW_GAP,
+    getItemKey: getHistoryItemKey,
+    overscan: HISTORY_ROW_OVERSCAN_COUNT,
+  });
+  const virtualHistoryRows = historyVirtualizer.getVirtualItems();
+  // Workspace switch: land the new scope at the top; the scope-keyed content
+  // wrapper below replays the soft enter transition at the same time.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scope identity intentionally drives the reset
+  useEffect(() => {
+    historyScrollRef.current?.scrollTo({ top: 0 });
+  }, [scopeKey]);
+
+  useEffect(() => {
+    if (
+      !isOpen ||
+      listStatus !== "ready" ||
+      revealedSearchConversationId !== currentConversationId ||
+      recentCollapsed ||
+      pendingSearchScrollRef.current !== currentConversationId
+    )
+      return;
+    if (showProjects) {
+      if (!visibleItems.some((item) => item.id === currentConversationId) && !activeProjectId)
+        return;
+      const project = projects.find((item) => item.id === activeProjectId);
+      if (project && !expandedProjectIds.has(project.id)) {
+        setExpandedProjectIds((current) => new Set(current).add(project.id));
+        return;
+      }
+      if (
+        pinnedCollapsed &&
+        (project?.isPinned || pinnedConversations.some((item) => item.id === currentConversationId))
+      ) {
+        setPinnedCollapsed(false);
+        return;
+      }
+      const row = Array.from(
+        workspaceTreeRef.current?.querySelectorAll<HTMLElement>("[data-conversation-id]") ?? [],
+      ).find((element) => element.dataset.conversationId === currentConversationId);
+      if (!row) return;
+      row.scrollIntoView({ block: "nearest" });
+    } else {
+      const index = items.findIndex((item) => item.id === revealedSearchConversationId);
+      if (index < 0) return;
+      historyVirtualizer.scrollToIndex(index, { align: "auto" });
+    }
+    pendingSearchScrollRef.current = null;
+  }, [
+    currentConversationId,
+    historyVirtualizer,
+    isOpen,
+    items,
+    showProjects,
+    projects,
+    activeProjectId,
+    expandedProjectIds,
+    pinnedCollapsed,
+    pinnedConversations,
+    visibleItems,
+    listStatus,
+    recentCollapsed,
+    revealedSearchConversationId,
+  ]);
+
+  const projectGroupKey = (id: string) =>
+    projectSections.grouped.find((section) => section.projects.some((project) => project.id === id))
+      ?.group.id ?? "";
+  const reorder = useSidebarReorderDrag({
+    containerRef: workspaceTreeRef,
+    disabled: sectionsDisabled || selectionMode || !isOpen,
+    scopeKey,
+    canDrop: (source, target) => {
+      if (source === target) return false;
+      const pinnedKeys = new Set(pinnedEntries.map((entry) => entry.key));
+      if (pinnedKeys.has(source) || pinnedKeys.has(target)) {
+        return Boolean(onReorderPinned) && pinnedKeys.has(source) && pinnedKeys.has(target);
+      }
+      const sourceProject = activeProjects.find(
+        (project) => sidebarWorkspaceOrderKey(project.path) === source,
+      );
+      const targetProject = activeProjects.find(
+        (project) => sidebarWorkspaceOrderKey(project.path) === target,
+      );
+      return Boolean(
+        onReorderProjects &&
+          sourceProject &&
+          targetProject &&
+          projectGroupKey(sourceProject.id) === projectGroupKey(targetProject.id),
+      );
+    },
+    onDrop: (source, target, position) => {
+      if (pinnedEntries.some((entry) => entry.key === source)) {
+        const order = reorderSidebarPinnedEntries(pinnedEntries, source, target, position);
+        if (order) onReorderPinned?.(order);
+        return;
+      }
+      const sourceProject = activeProjects.find(
+        (project) => sidebarWorkspaceOrderKey(project.path) === source,
+      );
+      const targetProject = activeProjects.find(
+        (project) => sidebarWorkspaceOrderKey(project.path) === target,
+      );
+      if (!sourceProject || !targetProject) return;
+      const order = reorderSidebarProjects(projects, sourceProject.id, targetProject.id, position);
+      if (order) onReorderProjects?.(order);
+    },
+  });
+  const draggedPinnedEntry = pinnedEntries.find((entry) => entry.key === reorder.draggingKey);
+  const draggedWorkspace = activeProjects.find(
+    (project) => sidebarWorkspaceOrderKey(project.path) === reorder.draggingKey,
+  );
+  const draggedTitle =
+    draggedPinnedEntry?.kind === "conversation"
+      ? draggedPinnedEntry.item.title
+      : draggedWorkspace?.name;
+  const showWorkspaceFolderDrop = workspaceFolderDropActive && !reorder.draggingKey;
+
+  const renderHistoryRow = useCallback(
+    (item: SidebarConversation, showIcon = false) => (
+      <HistoryRow
+        showIcon={showIcon}
+        reorderKey={showIcon && showProjects ? sidebarConversationOrderKey(item.id) : undefined}
+        onReorderPointerDown={
+          showIcon && showProjects && onReorderPinned ? reorder.onPointerDown : undefined
+        }
+        dropPosition={
+          reorder.dropTarget?.key === sidebarConversationOrderKey(item.id)
+            ? reorder.dropTarget.position
+            : undefined
+        }
+        isDragging={reorder.draggingKey === sidebarConversationOrderKey(item.id)}
+        key={item.id}
+        item={item}
+        forkSource={forkSourceFor(conversationsBySessionId, item)}
+        isActive={currentConversationId === item.id}
+        isBusy={busyConversationIds.has(item.id)}
+        isRunning={runningConversationIds.has(item.id) || Boolean(item.externalRun)}
+        needsApproval={approvalConversationIds.has(item.id)}
+        hasPendingQuestion={questionConversationIds.has(item.id)}
+        isUnread={unreadConversationIds.has(item.id) && currentConversationId !== item.id}
+        isDeleteDisabled={runningConversationIds.has(item.id) || Boolean(item.externalRun)}
+        canShareConversation={canShareConversations}
+        isRenaming={renamingId === item.id}
+        isPendingDelete={pendingDeleteId === item.id}
+        isSelectionMode={selectionMode}
+        isSelected={selectedConversationIds.has(item.id)}
+        isSelectionDisabled={
+          isBulkDeleting || isBulkMoving || !selectableConversationIds.has(item.id)
+        }
+        isInteractionDisabled={sectionsDisabled}
+        isMobileMenuLayout={isMobileMenuLayout}
+        renameDraft={renamingId === item.id ? renameDraft : ""}
+        onSelectConversation={handleSelectConversation}
+        onStartRenaming={handleStartRenaming}
+        onRenameDraftChange={handleRenameDraftChange}
+        onCommitRename={handleCommitRename}
+        onCancelRename={handleCancelRename}
+        onSetPinned={handleSetPinned}
+        onSetArchived={handleSetArchived}
+        onMoveToWorkspace={handleMoveToWorkspace}
+        moveWorkspaces={activeProjects}
+        onShareConversation={handleShareConversation}
+        onDeleteConversation={handleDeleteConversation}
+        onSetPendingDelete={handleSetPendingDelete}
+        onSelectForBulk={handleSelectForBulk}
+        onEnterSelectionMode={enterSelectionMode}
+        menuOpen={!sectionsDisabled && openMenuId === item.id}
+        menuSide={menuSide}
+        onMenuOpenChange={handleMenuOpenChange}
+        onWorkbenchDragIntent={onConversationWorkbenchDragIntent}
+        onOpenInWorkbenchSplit={onConversationOpenInWorkbenchSplit}
+      />
+    ),
+    [
+      showProjects,
+      onReorderPinned,
+      reorder.onPointerDown,
+      reorder.dropTarget,
+      reorder.draggingKey,
+      conversationsBySessionId,
+      currentConversationId,
+      handleCancelRename,
+      handleCommitRename,
+      handleDeleteConversation,
+      handleSelectForBulk,
+      handleMenuOpenChange,
+      handleRenameDraftChange,
+      handleSelectConversation,
+      onConversationWorkbenchDragIntent,
+      onConversationOpenInWorkbenchSplit,
+      handleMoveToWorkspace,
+      handleSetPinned,
+      handleSetArchived,
+      handleSetPendingDelete,
+      handleShareConversation,
+      handleStartRenaming,
+      busyConversationIds,
+      canShareConversations,
+      activeProjects,
+      approvalConversationIds,
+      questionConversationIds,
+      unreadConversationIds,
+      enterSelectionMode,
+      isBulkDeleting,
+      isBulkMoving,
+      isMobileMenuLayout,
+      menuSide,
+      openMenuId,
+      pendingDeleteId,
+      renameDraft,
+      renamingId,
+      runningConversationIds,
+      selectableConversationIds,
+      selectedConversationIds,
+      selectionMode,
+      sectionsDisabled,
+    ],
+  );
+
+  const renderProjectConversations = (project: WorkspaceProject, indented = false) => {
+    if (!expandedProjectIds.has(project.id)) return null;
+    const key = workspaceProjectPathKey(project.path);
+    const state = workspaceHistory?.get(key);
+    const conversations = projectConversations.get(key) ?? [];
+    const visible = visibleProjectConversations(project);
+    const canLoadMore = conversations.length > visible.length || state?.hasMore === true;
+    return (
+      <div
+        data-testid={`workspace-conversations-${project.id}`}
+        className={cn("mb-2 ml-3 space-y-px pl-2", indented && "ml-7")}
+      >
+        {visible.map((item) => renderHistoryRow(item))}
+        {!state || (state.loading && visible.length === 0) ? (
+          <div role="status" className="p-2 text-xs text-muted-foreground">
+            {t("sidebar.readingHistory")}
+          </div>
+        ) : visible.length === 0 && !state.error ? (
+          <div className="p-2 text-xs text-muted-foreground">{t("chat.emptyChatHistory")}</div>
+        ) : null}
+        {state?.error ? (
+          <div role="alert" className="px-2 py-1 text-xs text-destructive">
+            {state.error}
+          </div>
+        ) : null}
+        {canLoadMore || state?.error ? (
+          <button
+            type="button"
+            disabled={sectionsDisabled || state?.loading}
+            onClick={() => void onLoadWorkspaceHistory?.(project.path, !state?.error)}
+            className={cn(
+              "flex sidebar-list-row w-full items-center rounded-md px-2",
+              "text-left text-sm font-normal leading-5 text-foreground/60",
+              "hover:bg-foreground/[0.06] hover:text-foreground/80 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50",
+            )}
+          >
+            {state?.loading
+              ? t("sidebar.loadingMoreHistory")
+              : state?.error
+                ? t("chat.workspaceHistoryRetry")
+                : t("sidebar.continueLoadingHistory")}
+          </button>
+        ) : null}
+      </div>
+    );
+  };
+
+  const hasVisibleActiveConversation = visibleItems.some(
+    (item) => item.id === currentConversationId,
+  );
+  const renderWorkspaceProject = (
+    project: WorkspaceProject,
+    indented = false,
+    archived = false,
+  ) => {
+    const pathKey = workspaceProjectPathKey(project.path);
+    return (
+      <Fragment key={project.id}>
+        <ProjectRow
+          project={project}
+          indented={indented}
+          isActive={activeProjectId === project.id && !hasVisibleActiveConversation}
+          isMissing={missingProjectPathKeys.has(pathKey)}
+          isRunning={visibleRunningProjectPathKeys.has(pathKey)}
+          pendingAction={
+            pendingProjectAction?.projectId === project.id ? pendingProjectAction.mode : null
+          }
+          isInteractionDisabled={sectionsDisabled}
+          onSelectProject={handleSelectProject}
+          onWorkbenchDragIntent={onProjectWorkbenchDragIntent}
+          onNewConversation={onNewConversationForProject}
+          onBrowseProjectInFileTree={
+            onBrowseProjectInFileTree ? handleBrowseProjectInFileTree : undefined
+          }
+          onBrowseProjectInSystemFileManager={
+            onBrowseProjectInSystemFileManager ? handleBrowseProjectInSystemFileManager : undefined
+          }
+          onConfigureProject={handleConfigureProject}
+          onSetProjectPinned={handleSetProjectPinned}
+          onRemoveProject={handleRemoveProject}
+          isArchived={archived}
+          canArchive={!archived && canArchiveProjects}
+          onArchiveProject={handleArchiveProject}
+          onUnarchiveProject={handleUnarchiveProject}
+          onSetPendingAction={handleSetPendingProjectAction}
+          workspaceProjectGroups={workspaceProjectGroups}
+          onMoveProjectToGroup={onMoveProjectToGroup}
+          menuOpen={!sectionsDisabled && openProjectMenuId === project.id}
+          onMenuOpenChange={handleProjectMenuOpenChange}
+          expanded={!archived && expandedProjectIds.has(project.id)}
+          onToggleExpanded={archived ? undefined : toggleProjectExpanded}
+          reorderKey={!archived ? sidebarWorkspaceOrderKey(project.path) : undefined}
+          onReorderPointerDown={
+            !archived && (project.isPinned ? onReorderPinned : onReorderProjects)
+              ? reorder.onPointerDown
+              : undefined
+          }
+          isDragging={reorder.draggingKey === sidebarWorkspaceOrderKey(project.path)}
+          dropPosition={
+            reorder.dropTarget?.key === sidebarWorkspaceOrderKey(project.path)
+              ? reorder.dropTarget.position
+              : undefined
+          }
+        />
+        {!archived && renderProjectConversations(project, indented)}
+      </Fragment>
+    );
+  };
+  return (
+    <>
+      <Sidebar
+        label={t("sidebar.navigation")}
+        data-app-frame-column="sidebar"
+        // Esc leaves selection mode here; the composer's Esc-to-stop yields to it.
+        data-escape-owner={selectionMode ? "sidebar-selection" : undefined}
+        className="chat-history-sidebar zone-font-scale bg-settings-rail group-data-[side=left]:border-r-0 [&_button:not(:disabled)]:cursor-pointer"
+        style={{ "--zone-font-scale": fontScale } as CSSProperties}
+      >
+        {reorder.draggingKey && draggedTitle ? (
+          <div
+            ref={reorder.ghostRef}
+            aria-hidden="true"
+            data-sidebar-drag-ghost
+            className={cn(
+              "pointer-events-none fixed left-0 top-0 layer-popover flex h-8 max-w-240px",
+              "items-center gap-2 rounded-lg border border-border/30 bg-popover/95 px-3",
+              "text-sm text-popover-foreground shadow-lg backdrop-blur-sm",
+            )}
+            style={{
+              transform: "translate3d(var(--sidebar-drag-x), var(--sidebar-drag-y), 0)",
+            }}
+          >
+            {draggedPinnedEntry?.kind === "conversation" ? (
+              <MessageSquare className="size-4 shrink-0" />
+            ) : (
+              <FolderClosed className="size-4 shrink-0" />
+            )}
+            <span className="truncate">{draggedTitle}</span>
+          </div>
+        ) : null}
+        <div
+          className={cn(
+            "chat-history-sidebar-inner flex w-272px min-w-272px min-h-0 flex-1 flex-col",
+            "web:max-820:w-full web:max-820:min-w-0 web:max-820:translate-z-0 web:max-820:[backface-visibility:hidden]",
+          )}
+        >
+          {headerTop}
+          <SidebarHeader className="px-3 pb-2 pt-2">
+            <div className="flex items-center justify-between gap-2">
+              {brand ?? (
+                <div className="flex min-w-0 -translate-y-0.5 items-center gap-2">
+                  <img
+                    src="/icon-simple.png"
+                    alt=""
+                    aria-hidden="true"
+                    draggable={false}
+                    className="size-8 shrink-0 select-none rounded-xl object-contain"
+                  />
+                  <div className="min-w-0">
+                    <div className="truncate font-semibold tracking-tight">Live Agent</div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex shrink-0 items-center gap-0.5">
+                <ShortcutTooltip
+                  label={t("chat.searchConversations")}
+                  triggerDisabled={sectionsDisabled}
+                  side="bottom"
+                >
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon-sm"
+                    disabled={sectionsDisabled}
+                    onClick={() => {
+                      setConversationSearchMode("search");
+                      setConversationSearchOpen(true);
+                    }}
+                    aria-label={t("chat.searchConversations")}
+                    className="chat-history-search-button rounded-lg text-muted-foreground hover:text-foreground"
+                  >
+                    <Search className="size-4" />
+                  </Button>
+                </ShortcutTooltip>
+                {!hideCloseButton || isMobileMenuLayout ? (
+                  <ShortcutTooltip
+                    label={t("sidebar.closeSidebar")}
+                    shortcut={sidebarToggleShortcut}
+                    side="bottom"
+                  >
+                    <SidebarTrigger
+                      type="button"
+                      variant="ghost"
+                      size="icon-sm"
+                      aria-label={t("sidebar.closeSidebar")}
+                      className="shrink-0 rounded-lg text-muted-foreground hover:text-foreground desktop:min-[768px]:hidden"
+                    >
+                      <PanelLeftClose className="size-4" />
+                    </SidebarTrigger>
+                  </ShortcutTooltip>
+                ) : null}
+              </div>
+            </div>
+
+            <SidebarMenu className="mt-2.5 gap-px">
+              <SidebarMenuItem>
+                <SidebarMenuButton
+                  type="button"
+                  isActive={activeView === "chat"}
+                  onClick={onNewConversation}
+                  className={cn(
+                    "sidebar-list-row w-full justify-start gap-2.5 rounded-md px-2.5",
+                    "text-sm font-normal leading-5 shadow-none transition-colors",
+                    "web:text-sm! web:leading-20px! web:font-normal",
+                    activeView === "chat"
+                      ? "bg-settings-active font-medium text-foreground hover:bg-settings-active"
+                      : "text-foreground/75 hover:bg-settings-tile-hover hover:text-foreground",
+                  )}
+                >
+                  <CirclePlus className="size-4 shrink-0 text-foreground/85" />
+                  <span className="web:font-app web:[font-size:inherit] web:[line-height:inherit] web:[font-weight:inherit]">
+                    {t("chat.newConversation")}
+                  </span>
+                </SidebarMenuButton>
+              </SidebarMenuItem>
+              {SIDEBAR_SHORTCUTS.filter(({ id }) => sidebarShortcuts[id]).map(
+                ({ id, labelKey }) => {
+                  const Icon = {
+                    skills: Blend,
+                    mcp: Cable,
+                    cron: Clock3,
+                    planning: CalendarDays,
+                    "image-studio": ImageIcon,
+                    memory: Brain,
+                  }[id];
+                  const active = activeView === `${id}-hub`;
+                  return (
+                    <SidebarMenuItem key={id}>
+                      <SidebarMenuButton
+                        isActive={active}
+                        type="button"
+                        data-testid={`sidebar-shortcut-${id}`}
+                        aria-current={active ? "page" : undefined}
+                        onClick={() => onOpenResourceHub(id)}
+                        className={cn(
+                          "sidebar-hub-menu-item sidebar-list-row w-full justify-start gap-2.5 rounded-md px-2.5",
+                          "text-sm font-normal leading-5 shadow-none transition-colors",
+                          active
+                            ? "bg-settings-active font-medium text-foreground hover:bg-settings-active focus-visible:bg-settings-active"
+                            : "text-foreground/75 hover:bg-settings-tile-hover hover:text-foreground focus-visible:bg-settings-tile-hover",
+                        )}
+                        title={t(labelKey)}
+                      >
+                        <Icon className="size-4 shrink-0 text-foreground/85" />
+                        <span className="truncate">{t(labelKey)}</span>
+                      </SidebarMenuButton>
+                    </SidebarMenuItem>
+                  );
+                },
+              )}
+            </SidebarMenu>
+          </SidebarHeader>
+
+          <SidebarContent
+            aria-disabled={sectionsDisabled || undefined}
+            inert={sectionsDisabled}
+            className={cn(
+              "flex min-h-0 flex-1 flex-col overflow-hidden",
+              sectionsDisabled && "pointer-events-none select-none opacity-50",
+            )}
+          >
+            {showProjects ? (
+              <div
+                ref={workspaceTreeRef}
+                onClickCapture={reorder.onClickCapture}
+                onPointerDownCapture={reorder.onPointerDownCapture}
+                className="scroll-fade min-h-0 flex-1 overflow-y-auto overflow-x-hidden flex flex-col"
+              >
+                {pinnedConversations.length > 0 || pinnedProjects.length > 0 ? (
+                  <SidebarGroup
+                    role="region"
+                    aria-label={t("chat.pinnedSection")}
+                    className="shrink-0 pb-2"
+                  >
+                    <div className="flex items-center px-2 pb-1 pt-2">
+                      <SidebarGroupLabel
+                        render={<button type="button" />}
+                        aria-expanded={!pinnedCollapsed}
+                        onClick={() => setPinnedCollapsed((collapsed) => !collapsed)}
+                        className={cn(
+                          "group flex min-w-0 items-center gap-1 rounded-md px-2.5 py-1",
+                          "text-xs font-medium text-muted-foreground/70 outline-hidden",
+                        )}
+                      >
+                        {t("chat.pinnedSection")}
+                        <ChevronRight
+                          aria-hidden="true"
+                          className="size-3.5 opacity-0 transition-[opacity,transform] group-hover:opacity-100"
+                          style={{ transform: `rotate(${pinnedCollapsed ? 0 : 90}deg)` }}
+                        />
+                      </SidebarGroupLabel>
+                    </div>
+                    {!pinnedCollapsed && (
+                      <SidebarGroupContent className="space-y-px px-2">
+                        {pinnedEntries.map((entry) =>
+                          entry.kind === "conversation"
+                            ? renderHistoryRow(entry.item, true)
+                            : renderWorkspaceProject(entry.project),
+                        )}
+                      </SidebarGroupContent>
+                    )}
+                  </SidebarGroup>
+                ) : null}
+                <SidebarGroup
+                  role="region"
+                  aria-label={t("chat.workspaceSection")}
+                  data-workspace-folder-drop-zone={
+                    !sectionsDisabled && !reorder.draggingKey ? "" : undefined
+                  }
+                  {...(!sectionsDisabled && !reorder.draggingKey
+                    ? workspaceFolderDropHandlers
+                    : undefined)}
+                  className="flex flex-1 flex-col"
+                >
+                  <div
+                    className={cn(
+                      "flex shrink-0 items-center justify-between rounded-t-xl",
+                      "px-2 pb-1 pt-2 transition-colors",
+                      showWorkspaceFolderDrop &&
+                        "bg-primary/[0.08] ring-1 ring-primary/40 ring-inset",
+                    )}
+                  >
+                    <SidebarGroupLabel
+                      render={<button type="button" disabled={sectionsDisabled} />}
+                      aria-expanded={!projectsCollapsed}
+                      className={cn(
+                        "group flex min-w-0 items-center gap-1 rounded-md px-2.5 py-1",
+                        "text-xs font-medium text-muted-foreground/70 outline-hidden",
+                      )}
+                      onClick={handleProjectsCollapsedChange}
+                    >
+                      <span className="truncate">
+                        {showWorkspaceFolderDrop
+                          ? t("chat.workspaceDropFolder")
+                          : t("chat.workspaceSection")}
+                      </span>
+                      <ChevronRight
+                        aria-hidden="true"
+                        className="size-3.5 shrink-0 opacity-0 transition-[opacity,transform] duration-300 ease-in-out group-hover:opacity-100"
+                        style={{ transform: `rotate(${projectsCollapsed ? 0 : 90}deg)` }}
+                      />
+                    </SidebarGroupLabel>
+                    <div className="flex items-center gap-0.5">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        className={PROJECT_ICON_BUTTON_CLASS}
+                        onClick={() => (selectionMode ? exitSelectionMode() : enterSelectionMode())}
+                        aria-pressed={selectionMode}
+                        disabled={
+                          sectionsDisabled ||
+                          (!selectionMode && selectableConversationIds.size === 0)
+                        }
+                        aria-label={t("chat.conversationBulkSelect")}
+                        title={t("chat.conversationBulkSelect")}
+                      >
+                        <ListChecks className="size-3.5" />
+                      </Button>
+                      {archivedConversations ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={handleOpenArchivedConversations}
+                          disabled={sectionsDisabled}
+                          className={PROJECT_ICON_BUTTON_CLASS}
+                          title={t("chat.archivedConversations.open")}
+                          aria-label={t("chat.archivedConversations.open")}
+                          data-archived-conversations-button=""
+                        >
+                          <Archive className="size-3.5" />
+                        </Button>
+                      ) : null}
+                      {canShareConversations && (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          className={PROJECT_ICON_BUTTON_CLASS}
+                          onClick={handleOpenSharedConversations}
+                          aria-label={t("chat.manageSharedConversations").replace(
+                            "{count}",
+                            String(sharedConversationCount),
+                          )}
+                        >
+                          <Share2 className="size-3.5" />
+                        </Button>
+                      )}
+                      <DropdownMenu>
+                        <DropdownMenuTrigger
+                          render={
+                            <Button
+                              type="button"
+                              variant="ghost"
+                              size="icon"
+                              className={cn(PROJECT_ICON_BUTTON_CLASS, "hover:!bg-transparent")}
+                              title={t("chat.workspaceAdd")}
+                              aria-label={t("chat.workspaceAdd")}
+                              disabled={
+                                sectionsDisabled || (!onCreateProject && !onCreateWorkspaceGroup)
+                              }
+                            />
+                          }
+                        >
+                          <Plus className="size-3.5" />
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          side="right"
+                          align="start"
+                          sideOffset={6}
+                          className={SIDEBAR_CONTEXT_MENU_CLASS}
+                          finalFocus={() => {
+                            if (suppressAddMenuReturnFocusRef.current) {
+                              suppressAddMenuReturnFocusRef.current = false;
+                              return false;
+                            }
+                            return true;
+                          }}
+                        >
+                          <DropdownMenuItem
+                            disabled={sectionsDisabled || !onCreateProject}
+                            onSelect={() => onCreateProject?.()}
+                            className="gap-2 text-xs"
+                          >
+                            <Plus className="size-3.5" />
+                            <span>{t("chat.workspaceCreate")}</span>
+                          </DropdownMenuItem>
+                          <DropdownMenuItem
+                            disabled={sectionsDisabled || !onCreateWorkspaceGroup}
+                            onSelect={() => {
+                              // Only this item mounts an input in the same commit that
+                              // unmounts the menu, so only this item opts out of Base
+                              // UI's return-focus. "New workspace" opens a dialog that
+                              // owns its own focus and still wants the trigger back.
+                              suppressAddMenuReturnFocusRef.current = true;
+                              onProjectsCollapsedChange?.(false);
+                              if (hiddenProjectCount > 0) setShowAllProjects(true);
+                              setCreatingGroup(true);
+                              setGroupDraft("");
+                            }}
+                            className="gap-2 text-xs"
+                          >
+                            <Folder className="size-3.5" />
+                            <span>{t("chat.workspaceGroupCreate")}</span>
+                          </DropdownMenuItem>
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    </div>
+                  </div>
+                  {actionErrorMessage && (
+                    <div role="alert" className="mx-3 mb-2 flex gap-2 text-xs text-destructive">
+                      <span className="min-w-0 flex-1">{actionErrorMessage}</span>
+                      {onDismissActionError && (
+                        <button
+                          type="button"
+                          onClick={onDismissActionError}
+                          aria-label={t("chat.cancel")}
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                  <div
+                    aria-hidden={projectsCollapsed}
+                    inert={projectsCollapsed}
+                    className={cn(
+                      "flex-1 rounded-b-xl transition-[opacity,background-color,box-shadow] duration-300 ease-out motion-reduce:transition-none",
+                      projectsCollapsed ? "hidden" : "opacity-100",
+                      showWorkspaceFolderDrop &&
+                        "bg-primary/[0.045] ring-1 ring-primary/40 ring-inset",
+                    )}
+                  >
+                    <SidebarGroupContent className="space-y-px px-2 pb-px">
+                      {showWorkspaceFolderDrop ? (
+                        <div
+                          role="status"
+                          aria-live="polite"
+                          className="flex sidebar-list-row items-center gap-2 px-2 text-xs text-muted-foreground"
+                        >
+                          <FolderOpen className="size-4 shrink-0" />
+                          <span className="truncate">{t("chat.workspaceDropFolder")}</span>
+                        </div>
+                      ) : null}
+                      {creatingGroup ? (
+                        // Same geometry as ProjectGroupHeader and ProjectRow —
+                        // pl-1 + px-2 + a 16px icon slot + gap-2 puts the draft name
+                        // at 36px, the shared left edge for every row in this list.
+                        // Committing the name must not shift it.
+                        <div className="flex sidebar-list-row items-center rounded-lg pl-1">
+                          <div className="flex sidebar-list-row min-w-0 flex-1 items-center gap-2 px-2">
+                            <Folder
+                              aria-hidden="true"
+                              className="size-4 shrink-0 text-muted-foreground"
+                            />
+                            <Input
+                              ref={groupDraftInputRef}
+                              value={groupDraft}
+                              onChange={(event) => setGroupDraft(event.currentTarget.value)}
+                              onBlur={() => {
+                                if (skipNextGroupBlurCommitRef.current) {
+                                  skipNextGroupBlurCommitRef.current = false;
+                                  return;
+                                }
+                                commitNewGroup();
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.nativeEvent.isComposing || event.keyCode === 229) return;
+                                if (event.key === "Enter") {
+                                  event.preventDefault();
+                                  skipNextGroupBlurCommitRef.current = true;
+                                  commitNewGroup();
+                                } else if (event.key === "Escape") {
+                                  event.preventDefault();
+                                  skipNextGroupBlurCommitRef.current = true;
+                                  cancelNewGroup();
+                                }
+                              }}
+                              aria-label={t("chat.workspaceGroupNamePlaceholder")}
+                              placeholder={t("chat.workspaceGroupNamePlaceholder")}
+                              className={HISTORY_RENAME_INPUT_CLASS}
+                            />
+                          </div>
+                          {/* Mirrors ProjectRow's action column: gap-0.5 between
+                          28px hit targets, 14px glyphs, flush to the row's
+                          right edge. Both buttons preventDefault on mousedown so
+                          focus stays in the input — otherwise the blur lands
+                          first, commits the draft, and the row unmounts before
+                          the click reaches its handler (pressing ✕ would create
+                          the group). Arming the skip flag then covers the blur
+                          that the unmount itself dispatches. */}
+                          <div className="flex shrink-0 items-center gap-0.5">
+                            <button
+                              type="button"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                skipNextGroupBlurCommitRef.current = true;
+                              }}
+                              onClick={commitNewGroup}
+                              className="flex size-7 items-center justify-center rounded-lg text-emerald-600 transition-colors hover:bg-emerald-500/10 dark:text-emerald-300"
+                              aria-label={t("chat.workspaceGroupCreate")}
+                            >
+                              <Check className="size-3.5" />
+                            </button>
+                            <button
+                              type="button"
+                              onMouseDown={(event) => {
+                                event.preventDefault();
+                                skipNextGroupBlurCommitRef.current = true;
+                              }}
+                              onClick={cancelNewGroup}
+                              className="flex size-7 items-center justify-center rounded-lg text-muted-foreground transition-colors hover:bg-foreground/[0.06] hover:text-foreground"
+                              aria-label={t("chat.cancel")}
+                            >
+                              <X className="size-3.5" />
+                            </button>
+                          </div>
+                        </div>
+                      ) : null}
+                      {renderedSections.grouped.map((section) => {
+                        const { group, projects: members } = section;
+                        const collapsed = isGroupCollapsed(group, members);
+                        return (
+                          <Fragment key={group.id}>
+                            <ProjectGroupHeader
+                              group={group}
+                              memberCount={members.length}
+                              isRenaming={renamingGroupId === group.id}
+                              renameDraft={groupRenameDraft}
+                              onRenameDraftChange={setGroupRenameDraft}
+                              onCommitRename={commitGroupRename}
+                              onCancelRename={cancelGroupRename}
+                              onToggleCollapsed={() => {
+                                setRevealedSearchConversationId(null);
+                                onToggleWorkspaceGroupCollapsed?.(group.id);
+                              }}
+                              onStartRename={() => {
+                                setRenamingGroupId(group.id);
+                                setGroupRenameDraft(group.name);
+                              }}
+                              onDelete={() => void requestDeleteGroup(group)}
+                            />
+                            {!collapsed
+                              ? members.map((project) => renderWorkspaceProject(project, true))
+                              : null}
+                          </Fragment>
+                        );
+                      })}
+                      {renderedSections.ungrouped.length > 0 ? (
+                        <Fragment>
+                          {renderedSections.grouped.length > 0 ? (
+                            <div className="px-2 pt-1.5 text-xs font-medium uppercase tracking-wide text-muted-foreground/70">
+                              {t("chat.workspaceUngrouped")}
+                            </div>
+                          ) : null}
+                          {renderedSections.ungrouped.map((project) =>
+                            renderWorkspaceProject(project),
+                          )}
+                        </Fragment>
+                      ) : null}
+                      {hiddenProjectCount > 0 || showAllProjects ? (
+                        <button
+                          type="button"
+                          className={cn(
+                            "flex w-full items-center justify-center gap-1 rounded-md px-2 py-1.5",
+                            "text-xs font-medium text-muted-foreground outline-hidden transition-colors",
+                            "hover:!bg-foreground/[0.06] hover:text-foreground active:!bg-foreground/[0.1] focus-visible:!bg-foreground/[0.08] focus-visible:ring-2 focus-visible:ring-ring",
+                          )}
+                          onClick={handleShowAllProjects}
+                          disabled={sectionsDisabled}
+                        >
+                          {showAllProjects
+                            ? t("chat.workspaceShowLessProjects")
+                            : t("chat.workspaceShowAllProjects").replace(
+                                "{count}",
+                                String(activeProjects.length),
+                              )}
+                        </button>
+                      ) : null}
+                      {archivedProjects.length > 0 ? (
+                        <div className="pt-0.5">
+                          <button
+                            type="button"
+                            onClick={() => setArchivedGroupOpen((current) => !current)}
+                            disabled={sectionsDisabled}
+                            className={cn(
+                              "flex w-full items-center gap-1 rounded-md px-2 py-1.5",
+                              "text-xs font-medium text-muted-foreground/80 outline-hidden transition-colors",
+                              "hover:!bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+                            )}
+                          >
+                            <ChevronRight
+                              className={cn(
+                                "size-3 shrink-0 transition-transform duration-200",
+                                archivedGroupOpen && "rotate-90",
+                              )}
+                            />
+                            {t("chat.workspaceArchivedGroup").replace(
+                              "{count}",
+                              String(archivedProjects.length),
+                            )}
+                          </button>
+                          {archivedGroupOpen
+                            ? archivedProjects.map((project) =>
+                                renderWorkspaceProject(project, false, true),
+                              )
+                            : null}
+                        </div>
+                      ) : null}
+                    </SidebarGroupContent>
+                  </div>
+                </SidebarGroup>
+              </div>
+            ) : null}
+
+            {(!showProjects || selectionMode) && (
+              <div
+                className={cn(
+                  "grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2 px-2 pb-2",
+                  showProjects ? "border-t border-border/35 pt-0.5" : "pt-3",
+                )}
+              >
+                {selectionMode ? (
+                  <div
+                    role="status"
+                    aria-live="polite"
+                    className={cn(
+                      "flex min-w-0 items-center gap-1.5 px-3 py-1",
+                      "text-xs font-semibold text-foreground/85",
+                    )}
+                  >
+                    <ListChecks className="size-3.5 shrink-0" />
+                    <span className="min-w-0 truncate">
+                      {t("chat.conversationBulkSelectedCount").replace(
+                        "{count}",
+                        String(selectedConversationIds.size),
+                      )}
+                    </span>
+                  </div>
+                ) : (
+                  <SidebarGroupLabel
+                    render={<button type="button" disabled={sectionsDisabled} />}
+                    aria-expanded={!recentCollapsed}
+                    className={cn(
+                      "group flex min-w-0 items-center gap-1 rounded-md px-2.5 py-1",
+                      "text-xs font-medium text-muted-foreground/70 outline-hidden",
+                    )}
+                    onClick={handleRecentCollapsedChange}
+                  >
+                    <span className="min-w-0 truncate">{t("chat.recentConversation")}</span>
+                    <ChevronRight
+                      aria-hidden="true"
+                      className="size-3.5 shrink-0 opacity-0 transition-[opacity,transform] duration-300 ease-in-out group-hover:opacity-100"
+                      style={{ transform: `rotate(${recentCollapsed ? 0 : 90}deg)` }}
+                    />
+                  </SidebarGroupLabel>
+                )}
+                <div className="flex items-center gap-1.5">
+                  {selectionMode ? (
+                    <>
+                      <DropdownMenu
+                        open={bulkMoveMenuOpen}
+                        onOpenChange={(open) => {
+                          if (!sectionsDisabled || !open) {
+                            setBulkMoveMenuOpen(open);
+                          }
+                        }}
+                      >
+                        <DropdownMenuTrigger
+                          type="button"
+                          disabled={
+                            sectionsDisabled ||
+                            selectedConversationIds.size === 0 ||
+                            isBulkDeleting ||
+                            isBulkMoving ||
+                            activeProjects.length === 0
+                          }
+                          className={cn(
+                            PROJECT_ICON_BUTTON_CLASS,
+                            "inline-flex items-center justify-center",
+                            "disabled:pointer-events-none disabled:opacity-50",
+                          )}
+                          title={t("chat.conversationMoveToWorkspace")}
+                          aria-label={t("chat.conversationMoveToWorkspace")}
+                        >
+                          {isBulkMoving ? (
+                            <Loader2 className="size-3.5 animate-spin" />
+                          ) : (
+                            <Folder className="size-3.5" />
+                          )}
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent
+                          variant="soft"
+                          side="top"
+                          align="start"
+                          collisionPadding={12}
+                          className={cn(SIDEBAR_CONTEXT_MENU_CLASS, "max-h-72")}
+                        >
+                          {activeProjects.map((workspace) => (
+                            <DropdownMenuItem
+                              key={workspace.id}
+                              onSelect={() => void handleBulkMove(workspace.path)}
+                              className="gap-2"
+                            >
+                              <FolderClosed className="size-3.5 shrink-0" />
+                              <span className="truncate">{workspace.path}</span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={handleBulkDelete}
+                        disabled={
+                          sectionsDisabled ||
+                          selectedConversationIds.size === 0 ||
+                          isBulkDeleting ||
+                          isBulkMoving
+                        }
+                        className={cn(PROJECT_ICON_BUTTON_CLASS, "text-destructive")}
+                        title={t("chat.conversationBulkDelete")}
+                        aria-label={t("chat.conversationBulkDelete")}
+                      >
+                        {isBulkDeleting ? (
+                          <Loader2 className="size-3.5 animate-spin" />
+                        ) : (
+                          <Trash2 className="size-3.5" />
+                        )}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon"
+                        onClick={exitSelectionMode}
+                        className={PROJECT_ICON_BUTTON_CLASS}
+                        title={t("chat.cancel")}
+                        aria-label={t("chat.cancel")}
+                      >
+                        <X className="size-3.5" />
+                      </Button>
+                    </>
+                  ) : (
+                    <>
+                      {listStatus === "syncing" ? (
+                        <span
+                          role="status"
+                          aria-live="polite"
+                          className={cn(
+                            "flex items-center gap-1",
+                            "rounded-full border border-primary/20 bg-primary/[0.06] px-2 py-0.5",
+                            "text-tiny font-medium text-primary/80",
+                          )}
+                        >
+                          <span className="relative flex size-1.5 shrink-0" aria-hidden="true">
+                            <span className="absolute inline-flex size-full animate-ping rounded-full bg-primary/35 opacity-75" />
+                            <span className="relative inline-flex size-1.5 rounded-full bg-primary/70" />
+                          </span>
+                          {t("chat.history.syncing")}
+                        </span>
+                      ) : null}
+                      {errorMessage ? (
+                        <span
+                          role="status"
+                          title={`${t("chat.historyReadFailed")}: ${errorMessage}`}
+                          className="flex size-7 items-center justify-center text-destructive"
+                        >
+                          <AlertCircle
+                            className="size-3.5 shrink-0"
+                            aria-label={t("chat.historyReadFailed")}
+                          />
+                        </span>
+                      ) : null}
+                      {items.length > 0 ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={() =>
+                            selectionMode ? exitSelectionMode() : enterSelectionMode()
+                          }
+                          aria-pressed={selectionMode}
+                          disabled={
+                            sectionsDisabled ||
+                            (!selectionMode && selectableConversationIds.size === 0)
+                          }
+                          className={PROJECT_ICON_BUTTON_CLASS}
+                          title={t("chat.conversationBulkSelectHint")}
+                          aria-label={t("chat.conversationBulkSelect")}
+                        >
+                          <ListChecks className="size-3.5" />
+                        </Button>
+                      ) : null}
+                      {archivedConversations ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={handleOpenArchivedConversations}
+                          disabled={sectionsDisabled}
+                          className={PROJECT_ICON_BUTTON_CLASS}
+                          title={t("chat.archivedConversations.open")}
+                          aria-label={t("chat.archivedConversations.open")}
+                          data-archived-conversations-button=""
+                        >
+                          <Archive className="size-3.5" />
+                        </Button>
+                      ) : null}
+                      {canShareConversations ? (
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="icon"
+                          onClick={handleOpenSharedConversations}
+                          disabled={sectionsDisabled}
+                          className={PROJECT_ICON_BUTTON_CLASS}
+                          title={t("chat.manageSharedConversations").replace(
+                            "{count}",
+                            String(sharedConversationCount),
+                          )}
+                          aria-label={t("chat.manageSharedConversations").replace(
+                            "{count}",
+                            String(sharedConversationCount),
+                          )}
+                        >
+                          <Share2 className="size-3.5" />
+                        </Button>
+                      ) : null}
+                    </>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div
+              aria-hidden={showProjects || recentCollapsed}
+              inert={showProjects || recentCollapsed}
+              className={cn(
+                "flex min-h-0 flex-1 flex-col transition-[opacity,transform] duration-300 ease-out motion-reduce:transition-none",
+                showProjects || recentCollapsed ? "hidden" : "translate-y-0 opacity-100",
+              )}
+            >
+              {/* Read failures surface as the red count badge in the section
+                header. Mutation/project errors keep their own message surface
+                and never replace or relabel the successfully loaded rows. */}
+              {actionErrorMessage ? (
+                <div className="shrink-0 px-2 pb-2">
+                  <div
+                    role="alert"
+                    title={actionErrorMessage}
+                    className={cn(
+                      "flex items-start gap-2",
+                      "rounded-xl border border-destructive/25 bg-destructive/10 px-3 py-2",
+                      "text-xs leading-4 text-destructive",
+                    )}
+                  >
+                    <AlertCircle className="mt-0.5 size-3.5 shrink-0" />
+                    <span className="min-w-0 break-words">{actionErrorMessage}</span>
+                    {onDismissActionError ? (
+                      <button
+                        type="button"
+                        className="ml-auto shrink-0 rounded p-0.5 hover:bg-destructive/10"
+                        onClick={onDismissActionError}
+                        title={t("chat.cancel")}
+                      >
+                        <X className="size-3.5" />
+                      </button>
+                    ) : null}
+                  </div>
+                </div>
+              ) : null}
+              <div
+                ref={historyScrollRef}
+                aria-busy={listStatus === "loading" || listStatus === "syncing" || isLoadingMore}
+                className="chat-history-list scroll-fade min-h-0 flex-1 overflow-y-auto overflow-x-hidden px-2 pb-3"
+              >
+                {items.length > 0 ? (
+                  <div
+                    key={scopeKey || "scope"}
+                    className="relative"
+                    style={{ height: historyVirtualizer.getTotalSize() }}
+                  >
+                    {virtualHistoryRows.map((virtualRow) => {
+                      const item = items[virtualRow.index];
+                      if (!item) return null;
+
+                      return (
+                        <div
+                          key={virtualRow.key}
+                          data-index={virtualRow.index}
+                          ref={historyVirtualizer.measureElement}
+                          className="absolute inset-x-0 top-0 pb-px"
+                          style={{ transform: `translateY(${virtualRow.start}px)` }}
+                        >
+                          {virtualRow.index === firstUnpinnedHistoryIndex ? (
+                            <div
+                              aria-hidden="true"
+                              className="mx-2 mb-1.5 mt-1 h-px bg-gradient-to-r from-border/80 via-border/45 to-transparent"
+                            />
+                          ) : null}
+                          {renderHistoryRow(item, item.isPinned === true)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ) : listStatus === "loading" || listStatus === "initial" ? (
+                  <HistoryListLoadingSkeleton />
+                ) : listStatus === "ready" && !errorMessage ? (
+                  <div className="flex items-center justify-center px-4 py-8 text-center">
+                    <p className="text-xs font-medium text-muted-foreground/60">
+                      {t("chat.emptyChatHistory")}
+                    </p>
+                  </div>
+                ) : null}
+                {items.length > 0 && (hasMore || isLoadingMore) ? (
+                  <button
+                    type="button"
+                    onClick={handleLoadMore}
+                    disabled={sectionsDisabled || isLoadingMore}
+                    className={cn(
+                      "w-full rounded-md px-2 pb-2 pt-1",
+                      "text-center text-xs leading-5 text-muted-foreground",
+                      "hover:bg-foreground/[0.06] focus-visible:ring-2 focus-visible:ring-ring",
+                    )}
+                  >
+                    {isLoadingMore
+                      ? t("sidebar.loadingMoreHistory")
+                      : t("sidebar.continueLoadingHistory")}
+                  </button>
+                ) : null}
+              </div>
+            </div>
+          </SidebarContent>
+          <SidebarFooter
+            className={cn(
+              "grid shrink-0 grid-cols-[minmax(0,1fr)_auto] items-center gap-2",
+              "bg-settings-rail px-2.5 pb-3 pt-2",
+            )}
+          >
+            <Button
+              type="button"
+              variant="ghost"
+              // 与 macOS 标题栏那个设置入口同一个 testid：自动化脚本据此定位，
+              // 不必靠文案或坐标去猜。可读名走 i18n——屏幕阅读器念给用户听的
+              // 东西不该为了脚本方便固定成英文。
+              data-testid="open-settings"
+              onClick={() => onOpenSettings()}
+              className={cn(
+                "sidebar-list-row w-full justify-start gap-2.5 rounded-md px-2.5",
+                "text-sm font-normal text-foreground/75 shadow-none hover:bg-settings-tile-hover hover:text-foreground",
+              )}
+              title={t("tooltip.settings")}
+            >
+              <Settings className="size-4 shrink-0 text-foreground/75" />
+              <span className="truncate">{t("tooltip.settings")}</span>
+            </Button>
+            {footerTrailing}
+          </SidebarFooter>
+        </div>
+      </Sidebar>
+      {bulkDeleteDialog}
+      {groupDeleteDialog}
+      <ConversationSearchDialog
+        open={conversationSearchOpen}
+        onOpenChange={setConversationSearchOpen}
+        conversations={items}
+        currentWorkdir={currentConversationWorkdir}
+        onSelectConversation={handleSelectConversation}
+        mode={conversationSearchMode}
+        getActions={getCommandPaletteActions ? getPaletteActions : undefined}
+      />
+      {archivedConversations && archivedListOpen ? (
+        <ArchivedConversationsModal
+          archive={archivedConversations}
+          onClose={handleCloseArchivedConversations}
+        />
+      ) : null}
+    </>
+  );
+});

@@ -1,0 +1,95 @@
+name: OneAgent Windows Build
+
+# Zero-key Windows build for the OneAgent (LiveAgent v2.0.25 based) desktop app.
+# Produces an MSI and an NSIS setup EXE. No code signing, no updater signature:
+# the config used here (tauri.windows.conf.json) does not request updater artifacts.
+
+on:
+  push:
+    branches:
+      - oneagent-v2.0.25-windows
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: 22.19.0
+  APP_VERSION: 2.0.25
+
+jobs:
+  windows:
+    name: OneAgent Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install pnpm
+        run: npm install -g pnpm@10.32.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install protobuf compiler
+        env:
+          PROTOC_VERSION: "34.0"
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "protoc.zip"
+          $destination = Join-Path $env:RUNNER_TEMP "protoc-$env:PROTOC_VERSION"
+          Invoke-WebRequest -Uri "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip" -OutFile $archive -MaximumRetryCount 8 -RetryIntervalSec 20
+          Expand-Archive -Path $archive -DestinationPath $destination -Force
+          $protoc = Join-Path $destination "bin\protoc.exe"
+          & $protoc --version
+          if ($LASTEXITCODE -ne 0) { throw "protoc verification failed: $LASTEXITCODE" }
+          "PROTOC=$protoc" | Out-File -Append $env:GITHUB_ENV
+          (Split-Path $protoc) | Out-File -Append $env:GITHUB_PATH
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: crates/agent-gateway/go.mod
+          cache-dependency-path: crates/agent-gateway/go.sum
+
+      - name: Prepare locked K-brain external binaries
+        env:
+          TAURI_ENV_TARGET_TRIPLE: x86_64-pc-windows-msvc
+        run: pnpm --dir crates/agent-gui prepare:kbrain
+
+      - name: Build Windows bundles
+        working-directory: crates/agent-gui
+        shell: bash
+        env:
+          TAURI_ENV_TARGET_TRIPLE: x86_64-pc-windows-msvc
+          LIVEAGENT_APP_VERSION: ${{ env.APP_VERSION }}
+        run: pnpm tauri build --config src-tauri/tauri.windows.conf.json --target x86_64-pc-windows-msvc
+
+      - name: Stage Windows artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          msi_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.msi' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          setup_path="$(find target crates/agent-gui/src-tauri/target -type f -iname '*setup.exe' -path '*bundle*' -print -quit 2>/dev/null || true)"
+          echo "msi=$msi_path"
+          echo "setup=$setup_path"
+          if [ -z "$msi_path" ]; then echo "no MSI produced"; exit 1; fi
+          cp "$msi_path" "dist/OneAgent-${APP_VERSION}-Windows-x64.msi"
+          if [ -n "$setup_path" ]; then cp "$setup_path" "dist/OneAgent-${APP_VERSION}-Windows-x64-Setup.exe"; fi
+          ls -la dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oneagent-windows-x64-${{ env.APP_VERSION }}
+          path: dist/*
+          if-no-files-found: error

@@ -1,0 +1,481 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, Once};
+use std::thread;
+
+use serde_json::{json, Value};
+use tauri::Emitter;
+use tokio::sync::watch;
+
+use crate::commands::git::GitCloneTaskRegistry;
+use crate::commands::settings::{
+    load_remote_settings, normalize_remote_settings_payload, open_db, RemoteSettingsPayload,
+};
+use crate::runtime::managed_process::ManagedProcessRegistry;
+use crate::runtime::sftp::SftpSessionRegistry;
+use crate::runtime::terminal::TerminalSessionRegistry;
+use crate::services::automation::AutomationStore;
+use crate::services::chat_run_ledger::ChatRunLedger;
+use crate::services::provider_usage::ProviderUsageService;
+use crate::services::tunnel::{TunnelProxy, TunnelStore};
+use crate::services::workspace_watch::WorkspaceWatchService;
+
+use super::*;
+
+/// The managed Gateway serves the WebUI Image Studio from the desktop's K-Brain.
+/// Every start reads the live backend under the manager's lock, and each K-Brain
+/// start/restart/shutdown rebinds a running Gateway to the new port/token.
+fn follow_kbrain_for_images(
+    app: &tauri::AppHandle,
+    gateway: &Arc<crate::services::local_gateway::LocalGatewayManager>,
+) {
+    use tauri::Manager as _;
+    let source_app = app.clone();
+    gateway.set_image_backend_source(Arc::new(move || {
+        super::connection::local_image_backend(&source_app)
+    }));
+    let Some(state) = app.try_state::<Arc<crate::services::kbrain_backend::KBrainBackendState>>()
+    else {
+        return;
+    };
+    let mut changes = state.subscribe_connection();
+    let gateway = Arc::clone(gateway);
+    tauri::async_runtime::spawn(async move {
+        while changes.changed().await.is_ok() {
+            let gateway = Arc::clone(&gateway);
+            let result =
+                tauri::async_runtime::spawn_blocking(move || gateway.refresh_image_backend()).await;
+            if let Ok(Err(error)) = result {
+                eprintln!("failed to rebind the local gateway to K-Brain: {error}");
+            }
+        }
+    });
+}
+
+impl GatewayController {
+    pub fn new(
+        app_handle: tauri::AppHandle,
+        automation_store: Arc<AutomationStore>,
+        provider_usage_service: Arc<ProviderUsageService>,
+        terminal_registry: Arc<TerminalSessionRegistry>,
+        sftp_registry: Arc<SftpSessionRegistry>,
+        managed_process_registry: Arc<ManagedProcessRegistry>,
+        git_clone_task_registry: Arc<GitCloneTaskRegistry>,
+    ) -> Self {
+        let initial_config = RemoteSettingsPayload::default();
+        let (config_tx, _) = watch::channel(initial_config);
+        let tunnel_store = TunnelStore::new(app_handle.clone());
+        let workspace_watch = Arc::new(WorkspaceWatchService::new(app_handle.clone()));
+        let chat_ingress = ChatIngressMirror::spawn(app_handle.clone());
+        let local_gateway = Arc::new(crate::services::local_gateway::LocalGatewayManager::new());
+        follow_kbrain_for_images(&app_handle, &local_gateway);
+        Self {
+            app_handle,
+            automation_store,
+            provider_usage_service,
+            terminal_registry,
+            sftp_registry,
+            managed_process_registry,
+            git_clone_task_registry,
+            config_tx,
+            local_gateway,
+            runner_task: Mutex::new(None),
+            status: Mutex::new(GatewayStatusSnapshot {
+                online: false,
+                enabled: false,
+                configured: false,
+                gateway_url: String::new(),
+                agent_id: String::new(),
+                session_id: None,
+                connected_since: None,
+                last_heartbeat: None,
+                last_error: None,
+                protocol: None,
+            }),
+            outbound_tx: Mutex::new(None),
+            outbound_control_tx: Mutex::new(None),
+            terminal_stream_tx: Mutex::new(None),
+            settings_snapshot: Mutex::new(SettingsSnapshotCache::default()),
+            applied_settings_client_seqs: Mutex::new(AppliedClientSeqs::default()),
+            remote_chat_inbox: Mutex::new(HashMap::new()),
+            chat_run_ledger: Mutex::new(ChatRunLedger::new()),
+            runtime_status_republish: Mutex::new(None),
+            last_connection_nudge: Mutex::new(None),
+            tunnel_store,
+            tunnel_proxy: TunnelProxy::new(),
+            workspace_watch,
+            pending_chat_queue_requests: Mutex::new(HashMap::new()),
+            pending_clarify_turns: Mutex::new(HashMap::new()),
+            pending_composer_actions: Mutex::new(HashMap::new()),
+            chat_ingress,
+            chat_ingress_flush_lock: tokio::sync::Mutex::new(()),
+            terminal_forwarder_once: Once::new(),
+            terminal_stream_forwarder_once: Once::new(),
+            sftp_forwarder_once: Once::new(),
+            remote_chat_inbox_sweeper_once: Once::new(),
+            runtime_status_republisher_once: Once::new(),
+            tunnel_store_once: Once::new(),
+        }
+    }
+
+    pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        self.workspace_watch.attach_gateway(Arc::downgrade(self));
+        self.start_terminal_forwarder();
+        self.start_terminal_stream_forwarder();
+        self.start_sftp_forwarder();
+        self.start_remote_chat_inbox_sweeper();
+        self.start_runtime_status_republisher();
+        self.start_tunnel_store();
+        self.ensure_runner()
+    }
+
+    pub(crate) fn start_terminal_forwarder(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        self.terminal_forwarder_once.call_once(move || {
+            let (receiver, guard) = controller.terminal_registry.subscribe();
+            thread::spawn(move || {
+                let _guard = guard;
+                while let Ok(event) = receiver.recv() {
+                    let envelope = build_terminal_event_envelope(event.payload);
+                    let Ok(sender) = controller.current_outbound_sender() else {
+                        continue;
+                    };
+                    if let Err(error) = sender.blocking_send(envelope) {
+                        eprintln!("send gateway terminal event failed: {error}");
+                    }
+                }
+            });
+        });
+    }
+
+    pub(crate) fn start_terminal_stream_forwarder(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        self.terminal_stream_forwarder_once.call_once(move || {
+            let (receiver, guard) = controller.terminal_registry.subscribe_stream();
+            thread::spawn(move || {
+                let _guard = guard;
+                while let Ok(event) = receiver.recv() {
+                    let frame = build_terminal_stream_output_frame(event.payload);
+                    let Ok(sender) = controller.current_terminal_stream_sender() else {
+                        continue;
+                    };
+                    if let Err(error) = sender.blocking_send(frame) {
+                        eprintln!("send gateway terminal stream frame failed: {error}");
+                    }
+                }
+            });
+        });
+    }
+
+    pub(crate) fn start_sftp_forwarder(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        self.sftp_forwarder_once.call_once(move || {
+            let (receiver, guard) = controller.sftp_registry.subscribe();
+            thread::spawn(move || {
+                let _guard = guard;
+                while let Ok(event) = receiver.recv() {
+                    let envelope = build_sftp_event_envelope(event.payload);
+                    let Ok(sender) = controller.current_outbound_sender() else {
+                        continue;
+                    };
+                    if let Err(error) = sender.blocking_send(envelope) {
+                        eprintln!("send gateway SFTP event failed: {error}");
+                    }
+                }
+            });
+        });
+    }
+
+    pub(crate) fn start_remote_chat_inbox_sweeper(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        self.remote_chat_inbox_sweeper_once.call_once(move || {
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(GATEWAY_CHAT_LEASE_SWEEP_INTERVAL).await;
+                    // 未连上网关时这些 tick 什么也做不成（inbox 只有远端会写、
+                    // 租约只服务远端会话），但每条都要抢锁扫一遍。这条循环在未配置
+                    // 网关的机器上也常驻，所以先按 online 收敛。
+                    if !controller.status().online {
+                        continue;
+                    }
+                    if let Err(error) = controller.expire_remote_chat_leases().await {
+                        eprintln!("expire gateway remote chat leases failed: {error}");
+                    }
+                    if let Err(error) = controller.sweep_chat_run_ledger() {
+                        eprintln!("sweep gateway chat run ledger failed: {error}");
+                    }
+                }
+            });
+        });
+    }
+
+    // Echoes the webview's last runtime status so the gateway's 15s
+    // chat-runtime TTL stays satisfied while the desktop window is hidden or
+    // occluded and the webview's own 2s heartbeat interval is throttled.
+    pub(crate) fn start_runtime_status_republisher(self: &Arc<Self>) {
+        let controller = Arc::clone(self);
+        self.runtime_status_republisher_once.call_once(move || {
+            tauri::async_runtime::spawn(async move {
+                loop {
+                    tokio::time::sleep(GATEWAY_RUNTIME_STATUS_REPUBLISH_INTERVAL).await;
+                    // 离线时发送本身就是 no-op，但快照构造 + protobuf 编码照旧执行。
+                    // 这条循环同样在未配置网关时常驻，先按 online 收敛掉。
+                    if !controller.status().online {
+                        continue;
+                    }
+                    let Some((worker_id, state, visible, active_run_count)) =
+                        controller.runtime_status_republish_snapshot()
+                    else {
+                        continue;
+                    };
+                    if let Err(error) = controller
+                        .send_chat_runtime_status_envelope(
+                            worker_id,
+                            state,
+                            visible,
+                            active_run_count,
+                        )
+                        .await
+                    {
+                        eprintln!("republish gateway chat runtime status failed: {error}");
+                    }
+                }
+            });
+        });
+    }
+
+    pub(crate) fn spawn_runner(
+        self: &Arc<Self>,
+        runner_task: &mut Option<tauri::async_runtime::JoinHandle<()>>,
+    ) {
+        let receiver = self.config_tx.subscribe();
+        let controller = Arc::clone(self);
+        *runner_task = Some(tauri::async_runtime::spawn(async move {
+            controller.run(receiver).await;
+        }));
+    }
+
+    pub(crate) fn ensure_runner(self: &Arc<Self>) -> Result<(), String> {
+        let mut runner_task = self
+            .runner_task
+            .lock()
+            .map_err(|_| "gateway runner task lock poisoned".to_string())?;
+        let should_spawn = runner_task
+            .as_ref()
+            .map(|task| task.inner().is_finished())
+            .unwrap_or(true);
+        if !should_spawn {
+            return Ok(());
+        }
+
+        self.spawn_runner(&mut runner_task);
+        Ok(())
+    }
+
+    pub fn wake_chat_runtime(&self, reason: &str) -> Result<(), String> {
+        self.app_handle
+            .emit(
+                GATEWAY_CHAT_RUNTIME_WAKE_EVENT,
+                json!({ "reason": reason.trim() }),
+            )
+            .map_err(|error| format!("emit gateway chat runtime wake failed: {error}"))
+    }
+
+    pub fn nudge_connection(
+        self: &Arc<Self>,
+        reason: &str,
+        force_reconnect: bool,
+    ) -> Result<bool, String> {
+        let config = self.config_tx.borrow().clone();
+        if !config.enabled || !is_remote_configured(&config.effective_gateway_settings()) {
+            return Ok(false);
+        }
+
+        if let Err(error) = self.wake_chat_runtime(reason) {
+            eprintln!("wake gateway chat runtime during connection nudge failed: {error}");
+        }
+
+        let status = self.status();
+        if !force_reconnect
+            && !gateway_connection_needs_restart(
+                &status,
+                &config.effective_gateway_settings(),
+                now_unix_seconds(),
+            )
+        {
+            return Ok(false);
+        }
+
+        let now = Instant::now();
+        {
+            let mut last_nudge = self
+                .last_connection_nudge
+                .lock()
+                .map_err(|_| "gateway connection nudge lock poisoned".to_string())?;
+            if last_nudge
+                .map(|previous| {
+                    now.saturating_duration_since(previous) < GATEWAY_CONNECTION_NUDGE_COOLDOWN
+                })
+                .unwrap_or(false)
+            {
+                return Ok(false);
+            }
+            *last_nudge = Some(now);
+        }
+
+        // Wake the existing supervisor, including a pending child startup. Never
+        // abort a spawn_blocking task: its owned process still needs collecting.
+        self.local_gateway.cancel_start();
+        self.config_tx.send_modify(|_| {});
+        self.ensure_runner()?;
+        Ok(true)
+    }
+
+    pub async fn reload_from_db(self: &Arc<Self>) -> Result<(), String> {
+        let config = tauri::async_runtime::spawn_blocking(move || {
+            let conn = open_db()?;
+            load_remote_settings(&conn)
+        })
+        .await
+        .map_err(|e| format!("reload remote settings join failed: {e}"))??;
+        self.apply_config(config)
+    }
+
+    pub fn apply_config(self: &Arc<Self>, config: RemoteSettingsPayload) -> Result<(), String> {
+        let normalized = normalize_remote_settings_payload(config);
+        let previous = self.config_tx.borrow().clone();
+        let config_changed = previous != normalized;
+        let effective = normalized.effective_gateway_settings();
+        if config_changed {
+            self.local_gateway.cancel_start();
+        }
+        self.config_tx.send_replace(normalized.clone());
+        self.publish_status(|status| {
+            status.enabled = normalized.enabled;
+            status.configured = is_remote_configured(&effective);
+            status.gateway_url = effective.gateway_url.clone();
+            status.agent_id = normalized.agent_id.clone();
+            if !normalized.enabled || config_changed {
+                set_disconnected_status(status, &effective, None);
+            }
+        });
+        self.ensure_runner()?;
+        Ok(())
+    }
+
+    pub fn shutdown_local_gateway(&self) {
+        if let Err(error) = self.local_gateway.shutdown() {
+            eprintln!("failed to stop local gateway: {error}");
+        }
+    }
+
+    pub fn disconnect_runtime(self: &Arc<Self>) -> Result<(), String> {
+        let mut config = self.config_tx.borrow().clone();
+        config.enabled = false;
+        self.apply_config(config)
+    }
+
+    /// Current (normalized) Remote settings.
+    pub fn remote_settings(&self) -> RemoteSettingsPayload {
+        self.config_tx.borrow().clone()
+    }
+
+    /// Follows Remote settings changes (`apply_config`).
+    pub fn subscribe_remote_settings(&self) -> watch::Receiver<RemoteSettingsPayload> {
+        self.config_tx.subscribe()
+    }
+
+    pub fn status(&self) -> GatewayStatusSnapshot {
+        self.status
+            .lock()
+            .map(|status| status.clone())
+            .unwrap_or(GatewayStatusSnapshot {
+                online: false,
+                enabled: false,
+                configured: false,
+                gateway_url: String::new(),
+                agent_id: String::new(),
+                session_id: None,
+                connected_since: None,
+                last_heartbeat: None,
+                last_error: Some("gateway status lock poisoned".to_string()),
+                protocol: None,
+            })
+    }
+
+    pub async fn publish_history_sync(&self, event: GatewayHistorySyncEvent) {
+        if let Err(error) = self.app_handle.emit(CHAT_HISTORY_SYNC_EVENT, event.clone()) {
+            eprintln!("emit chat history sync failed: {error}");
+        }
+
+        if !self.status().online {
+            return;
+        }
+
+        let envelope = match build_history_sync_envelope(event) {
+            Ok(envelope) => envelope,
+            Err(error) => {
+                eprintln!("build gateway history sync envelope failed: {error}");
+                return;
+            }
+        };
+
+        if let Err(error) = self.send_agent_envelope(envelope).await {
+            eprintln!("send gateway history sync event failed: {error}");
+        }
+    }
+
+    pub async fn publish_history_sync_v2(
+        &self,
+        input: GatewayHistorySyncPublishInput,
+    ) -> Result<GatewayHistorySyncPublishResult, String> {
+        let envelope = build_history_sync_v2_envelope(input)?;
+        if !self.status().online {
+            return Ok(GatewayHistorySyncPublishResult {
+                accepted: false,
+                needs_resync: true,
+            });
+        }
+        match tokio::time::timeout(Duration::from_secs(5), self.send_agent_envelope(envelope)).await {
+            Ok(Ok(())) => Ok(GatewayHistorySyncPublishResult {
+                accepted: true,
+                needs_resync: false,
+            }),
+            Ok(Err(_)) | Err(_) => Ok(GatewayHistorySyncPublishResult {
+                accepted: false,
+                needs_resync: true,
+            }),
+        }
+    }
+
+    /// Publishes a snapshot the desktop frontend just built from its live settings,
+    /// recording its acks together with it, so the ack and the snapshot that
+    /// reflects it reach the WebUI together.
+    pub async fn publish_settings_sync_with_acks(
+        &self,
+        payload: Value,
+        acks: &[SettingsSyncAck],
+    ) -> Result<(), String> {
+        let (stored, stamp) = self.store_settings_snapshot_with_acks(payload, acks)?;
+        self.publish_settings_sync(stored, stamp).await
+    }
+
+    /// Publishes a snapshot already stored in (or read from) the cache, with its stamp.
+    pub(crate) async fn publish_settings_sync(
+        &self,
+        stored: Value,
+        stamp: SettingsSyncStamp,
+    ) -> Result<(), String> {
+        let snapshot = attach_settings_sync_stamp(stored, &stamp);
+
+        if !self.status().online {
+            return Ok(());
+        }
+
+        // The cached/browser-visible snapshot remains redacted. Only the
+        // authenticated desktop-to-Gateway envelope receives the raw STT
+        // sidecar, which Gateway consumes before broadcasting the snapshot.
+        let outbound = attach_current_stt_secret_sync(snapshot).await?;
+        let envelope = build_settings_sync_envelope(outbound)?;
+        self.send_agent_envelope(envelope).await
+    }
+}

@@ -1,0 +1,194 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+function readSource(relativePath) {
+  return readFileSync(new URL(relativePath, import.meta.url), "utf8");
+}
+
+const paneChromeSource = readSource(
+  "../../../agent-ui/src/components/workbench/PaneChrome.tsx",
+);
+const paneFrameSource = readSource("../../../agent-ui/src/components/workbench/PaneFrame.tsx");
+const paneSurfaceLayerSource = readSource(
+  "../../../agent-ui/src/components/workbench/PaneSurfaceLayer.tsx",
+);
+const dividerLayerSource = readSource(
+  "../../../agent-ui/src/components/workbench/DividerLayer.tsx",
+);
+const workbenchCanvasSource = readSource(
+  "../../../agent-ui/src/components/workbench/WorkbenchCanvas.tsx",
+);
+const workspaceDropCommitSource = readSource(
+  "../../../agent-ui/src/lib/workbench/workspaceDropCommit.ts",
+);
+const chatPageSource = readSource("../../src/pages/ChatPage.tsx");
+const gatewayViewSource = readSource(
+  "../../../agent-gateway/web/src/app/GatewayAppView.tsx",
+);
+const localTerminalPaneSource = readSource(
+  "../../../agent-ui/src/components/workbench/surfaces/LocalTerminalPaneSurface.tsx",
+);
+
+test("pane chrome never carries the native window drag region", () => {
+  // A pane drag handle marked as a Tauri drag region would turn pane moves
+  // into native window moves.
+  assert.equal(paneChromeSource.includes("data-tauri-drag-region"), false);
+  assert.match(paneChromeSource, /data-workbench-pane-drag-handle/);
+});
+
+test("pane frames are keyed by paneId and positioned with integer rects", () => {
+  assert.match(paneSurfaceLayerSource, /key=\{paneId\}/);
+  // Stable render order independent of tree structure keeps DOM alive on move.
+  assert.match(paneSurfaceLayerSource, /localeCompare/);
+  // Stable state uses left/top/width/height, not transform-based layout.
+  assert.match(paneFrameSource, /left: rect\.left/);
+  assert.equal(paneFrameSource.includes("transform"), false);
+});
+
+test("queue controls preserve pane focus and target their own conversation", () => {
+  const composerSource = readSource("../../../agent-ui/src/pages/chat/ChatComposerBar.tsx");
+  const paneHostSource = readSource(
+    "../../../agent-gateway/web/src/app/workbench/GatewayConversationPaneHost.tsx",
+  );
+  assert.match(composerSource, /data-workbench-preserve-focus=""/);
+  assert.match(paneFrameSource, /closest\("\[data-workbench-preserve-focus\]"\)/);
+  assert.match(paneFrameSource, /onFocusRequest\?\.\(\)/);
+  assert.match(paneHostSource, /onQueuePausedChange=\{handleQueuePausedChange\}/);
+  assert.match(paneHostSource, /api\.chatQueueSetPaused\(\s*conversationId,/);
+});
+
+test("dividers use pointer capture and commit once per gesture", () => {
+  assert.match(dividerLayerSource, /setPointerCapture/);
+  assert.match(dividerLayerSource, /releasePointerCapture/);
+  assert.match(dividerLayerSource, /requestAnimationFrame/);
+  assert.match(dividerLayerSource, /role="separator"/);
+  assert.match(dividerLayerSource, /onResizeCommit/);
+  assert.match(dividerLayerSource, /h-px w-full -translate-y-px/);
+});
+
+test("workbench drags capture the pointer so dock-to-canvas gestures survive xterm", () => {
+  const dragSessionSource = readSource(
+    "../../../agent-ui/src/lib/workbench/useWorkbenchDragSession.ts",
+  );
+  assert.match(dragSessionSource, /setPointerCapture\(event\.pointerId\)/);
+  assert.match(dragSessionSource, /releasePointerCapture\(capture\.pointerId\)/);
+  assert.match(dragSessionSource, /currentTarget/);
+});
+
+test("dock terminal grip extracts onto the canvas instead of only reordering tabs", () => {
+  const tabStripSource = readSource(
+    "../../../agent-ui/src/components/project-tools/RightDockTabStrip.tsx",
+  );
+  assert.match(tabStripSource, /tab\.dragProps\?\.onPointerDown\(event\)/);
+  assert.match(tabStripSource, /currentTarget: event\.currentTarget/);
+});
+
+test("workbench canvas separates preview geometry from committed geometry", () => {
+  assert.match(workbenchCanvasSource, /committedGeometry/);
+  assert.match(workbenchCanvasSource, /ResizeObserver/);
+});
+
+test("workbench DOM access flows through the canvas ref", () => {
+  const dragSessionSource = readSource(
+    "../../../agent-ui/src/lib/workbench/useWorkbenchDragSession.ts",
+  );
+  assert.match(workbenchCanvasSource, /canvasRef/);
+  assert.match(dragSessionSource, /canvasRef\.current/);
+  assert.doesNotMatch(dragSessionSource, /document\.querySelector/);
+  assert.doesNotMatch(chatPageSource, /querySelector\(\"\[data-workbench-canvas\]\"\)/);
+  assert.doesNotMatch(gatewayViewSource, /querySelector\(\"\[data-workbench-canvas\]\"\)/);
+});
+
+test("chat page keeps the legacy single-pane path behind the feature flag", () => {
+  assert.match(chatPageSource, /sessionWorkbench\.enabled\s*\?/);
+  // Legacy path keeps the stable root pane id; the workbench path owns pane
+  // ids through useWindowWorkbench.
+  assert.match(chatPageSource, /root-conversation-pane/);
+  assert.match(chatPageSource, /useWindowWorkbench\(/);
+  assert.match(chatPageSource, /WorkbenchCanvas/);
+});
+
+test("workbench drops route through a revision-checked commit", () => {
+  // Stale layout revision cancels the transaction instead of replaying it.
+  assert.match(chatPageSource, /commit\.revision !== workbench\.layoutRef\.current\.revision/);
+  // Focusing a pane selects its conversation through the legacy pipeline.
+  assert.match(chatPageSource, /handleSelectConversation\(conversationId\)/);
+});
+
+test("workspace drops create the conversation before the pane, verified by workdir", () => {
+  // Directory check remains in the legacy pipeline, which returns the exact
+  // draft id to the shared atomic drop coordinator.
+  assert.match(chatPageSource, /pendingWorkspaceDropRef/);
+  assert.match(chatPageSource, /commitWorkspaceDropConversation\(\{/);
+  assert.match(chatPageSource, /handleNewConversationForProject\(project\)/);
+  assert.match(chatPageSource, /shouldDeferWorkspaceDropConversationSync\(/);
+  assert.match(workspaceDropCommitSource, /params\.onConversationCreated\?\.\(conversationId\)/);
+  assert.match(workspaceDropCommitSource, /if \(exactId\) return exactId === currentId/);
+  assert.match(
+    workspaceDropCommitSource,
+    /currentProjectPathKey\.trim\(\) === pending\.projectPathKey\.trim\(\)/,
+  );
+});
+
+test("desktop exposes the same unavailable-drop feedback path as Web", () => {
+  assert.match(chatPageSource, /onUnavailable:/);
+  assert.match(chatPageSource, /reason === "geometry-unavailable"/);
+  assert.match(chatPageSource, /workbench\.conversationAlreadyOpen/);
+});
+
+test("Desktop and Web render the same shared canvas, pane chrome, and drag ghost styling", () => {
+  for (const source of [chatPageSource, gatewayViewSource]) {
+    assert.match(source, /<WorkbenchCanvas/);
+    assert.match(source, /<PaneChrome/);
+  }
+  const dragGhostClass =
+    /className="(layer-popover pointer-events-none fixed max-w-220px[^"]+)"/;
+  assert.equal(chatPageSource.match(dragGhostClass)?.[1], gatewayViewSource.match(dragGhostClass)?.[1]);
+
+  const blockedBannerClass =
+    /className="(flex shrink-0 items-center gap-2 border-b border-amber-500\/30[^"]+)"/;
+  const gatewayPaneHostSource = readSource(
+    "../../../agent-gateway/web/src/app/workbench/GatewayConversationPaneHost.tsx",
+  );
+  assert.equal(
+    chatPageSource.match(blockedBannerClass)?.[1],
+    gatewayPaneHostSource.match(blockedBannerClass)?.[1],
+  );
+});
+
+test("archived and missing workspaces block panes and never rebind the dock", () => {
+  assert.match(chatPageSource, /workbench\.projectArchived/);
+  assert.match(chatPageSource, /workbench\.projectMissing/);
+  // archived/missing 判定收敛在 resolveWorkbenchPaneProject 内(模型测试见
+  // workbench-pane-project-context.test.mjs);ChatPage 只经解析器激活。
+  assert.match(chatPageSource, /resolveWorkbenchPaneProject\(projectPathKey, \{/);
+});
+
+test("native file drags focus the hovered pane so drops land in it", () => {
+  assert.match(chatPageSource, /workbenchNativeDropHoverRef/);
+  assert.match(chatPageSource, /onDropPositionChange/);
+});
+
+test("single pane renders chromeless and frames draw no border ring", () => {
+  const paneSurfaceLayerSource = readSource(
+    "../../../agent-ui/src/components/workbench/PaneSurfaceLayer.tsx",
+  );
+  assert.match(paneSurfaceLayerSource, /chromeless=\{paneCount < 2\}/);
+  const paneFrameSource = readSource("../../../agent-ui/src/components/workbench/PaneFrame.tsx");
+  assert.equal(paneFrameSource.includes("ring-"), false);
+});
+
+test("pane chrome is a minimal strip: grab pill plus close, no title text or border", () => {
+  // The strip renders no visible title/path and no border; the title only
+  // survives as tooltip/aria metadata on the grab pill.
+  assert.equal(paneChromeSource.includes("border-"), false);
+  assert.equal(paneChromeSource.includes("{title}"), false);
+  assert.match(paneChromeSource, /data-workbench-pane-close/);
+  assert.match(paneChromeSource, /rounded-full/);
+});
+
+test("terminal panes do not overlay a text termination control", () => {
+  assert.equal(localTerminalPaneSource.includes("data-terminal-pane-kill"), false);
+  assert.equal(localTerminalPaneSource.includes("workbench.terminalKill"), false);
+});

@@ -1,0 +1,212 @@
+#[tauri::command]
+pub async fn settings_load_all() -> Result<SettingsLoadResponse, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let conn = open_db()?;
+        let default_workdir = default_project_workdir()?;
+        Ok(SettingsLoadResponse {
+            providers: load_providers(&conn)?,
+            system: Some(load_system_with_defaults(&conn, &default_workdir)?),
+            mcp: load_mcp(&conn)?,
+            agents: load_agents(&conn)?,
+            ssh: load_ssh(&conn)?,
+            remote: load_remote(&conn)?,
+            stt: load_stt_redacted(&conn)?,
+            memory: load_memory(&conn)?,
+            model_failover: load_model_failover(&conn)?,
+            default_workdir,
+        })
+    })
+    .await
+    .map_err(|e| format!("settings_load_all join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_providers(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_providers(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_providers join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_system(
+    payload: Value,
+    automation_scheduler: tauri::State<'_, Arc<AutomationScheduler>>,
+    kbrain_backend: tauri::State<'_, Arc<crate::services::kbrain_backend::KBrainBackendState>>,
+) -> Result<(), String> {
+    let kbrain_backend = Arc::clone(kbrain_backend.inner());
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_system(&mut conn, payload)?;
+        // 保存成功后刷新全局代理状态，让 shell env 注入与出网代理即时生效。
+        let proxy_revision = crate::services::system_proxy::revision();
+        refresh_system_proxy_state(&conn)?;
+        // 代理真实变化时推给运行中的 K-brain（best effort，失败只记日志）。
+        if crate::services::system_proxy::revision() != proxy_revision {
+            kbrain_backend.push_proxy_setting();
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|e| format!("settings_save_system join 失败：{e}"))??;
+    // Bash cron tasks execute in the system workdir; reschedule so the new
+    // workdir takes effect without an app restart.
+    // 默认时区可能已变:先让缓存失效,记忆等高频调用方立即读到新时区。
+    invalidate_default_tz_cache();
+    automation_scheduler.request_reload();
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn settings_save_mcp(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_mcp(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_mcp join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_remote(
+    payload: Value,
+    gateway_controller: tauri::State<'_, Arc<GatewayController>>,
+) -> Result<(), String> {
+    let normalized = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_remote(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_remote join 失败：{e}"))??;
+    gateway_controller.apply_config(normalized)
+}
+
+#[tauri::command]
+pub async fn settings_save_memory(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_memory(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_memory join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_model_failover(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_model_failover(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_model_failover join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_stt(
+    payload: Value,
+    gateway_controller: tauri::State<'_, Arc<GatewayController>>,
+) -> Result<Value, String> {
+    let saved = tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_stt(&mut conn, payload)?;
+        load_stt_redacted(&conn).map(|value| value.unwrap_or_else(|| json!({})))
+    })
+    .await
+    .map_err(|e| format!("settings_save_stt join failed: {e}"))??;
+    if let Err(error) = gateway_controller.publish_current_settings_sync().await {
+        eprintln!("publish STT settings sync failed: {error}");
+    }
+    Ok(saved)
+}
+
+#[tauri::command]
+pub async fn settings_reveal_stt_secret(
+    provider: String,
+    field: String,
+) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let conn = open_db()?;
+        load_stt_secret(&conn, &provider, &field)
+    })
+    .await
+    .map_err(|e| format!("settings_reveal_stt_secret join failed: {e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_agents(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_agents(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_agents join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_save_ssh(payload: Value) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        save_ssh(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_save_ssh join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_apply_ssh_patch(payload: Value) -> Result<SshPatchApplyResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let mut conn = open_db()?;
+        apply_ssh_patch_with_conn(&mut conn, payload)
+    })
+    .await
+    .map_err(|e| format!("settings_apply_ssh_patch join 失败：{e}"))?
+}
+
+#[tauri::command]
+pub async fn settings_reset_ssh_known_host(
+    host: String,
+    port: u16,
+) -> Result<SshKnownHostResetResponse, String> {
+    tauri::async_runtime::spawn_blocking(move || reset_ssh_known_host_everywhere(&host, port))
+        .await
+        .map_err(|e| format!("settings_reset_ssh_known_host join 失败：{e}"))?
+}
+
+/// Forgets a host key in the desktop terminal's known hosts and in K-brain's known_hosts
+/// (SSHManager), so the next connection from either asks again.
+pub(crate) fn reset_ssh_known_host_everywhere(
+    host: &str,
+    port: u16,
+) -> Result<SshKnownHostResetResponse, String> {
+    let deleted = reset_runtime_ssh_known_host(host, port)?;
+    let kbrain_removed = match crate::services::kbrain_ssh_sync::forget_host_keys(host, port) {
+        Ok(removed) => removed,
+        Err(error) => {
+            eprintln!("forget K-brain SSH host keys failed: {error}");
+            0
+        }
+    };
+    Ok(SshKnownHostResetResponse {
+        deleted: deleted + kbrain_removed,
+        kbrain_removed,
+    })
+}
+
+/// K-brain's view of Settings > SSH after pushing the desktop's hosts: each host's
+/// credential state and the host keys SSHManager saved. Never starts K-brain.
+#[tauri::command]
+pub async fn settings_kbrain_ssh_state() -> Result<Value, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        let Some(connection) = crate::services::kbrain_ssh_sync::running_connection() else {
+            return crate::services::kbrain_ssh_sync::public_state(Ok(Default::default()), false);
+        };
+        crate::services::kbrain_ssh_sync::public_state(
+            crate::services::kbrain_ssh_sync::sync_running(&connection),
+            true,
+        )
+    })
+    .await
+    .map_err(|e| format!("settings_kbrain_ssh_state join failed: {e}"))
+}

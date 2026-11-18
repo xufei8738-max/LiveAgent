@@ -1,0 +1,1787 @@
+syntax = "proto3";
+
+package liveagent.gateway.v2;
+
+option go_package = "github.com/liveagent/agent-gateway/internal/proto/v2;gatewayv2";
+
+// 三端共享的 v2 业务消息单一事实源。WebSocket 帧壳见 gateway_ws.proto；
+// 已发布消息的字段编号只增不改。
+
+message GatewayEnvelope {
+  string request_id = 1;
+  int64 timestamp = 2;
+
+  oneof payload {
+    ChatCommandRequest chat_command = 10;
+    CronManageRequest cron_manage = 20;
+    HistoryListRequest history_list = 30;
+    HistoryGetRequest history_get = 31;
+    HistoryRenameRequest history_rename = 32;
+    HistoryDeleteRequest history_delete = 33;
+    HistoryPrefixRequest history_prefix = 34;
+    HistoryPinRequest history_pin = 35;
+    HistoryShareGetRequest history_share_get = 36;
+    HistoryShareSetRequest history_share_set = 37;
+    HistoryShareResolveRequest history_share_resolve = 38;
+    HistoryWorkdirsRequest history_workdirs = 39;
+    ProviderListRequest provider_list = 40;
+    SettingsGetRequest settings_get = 41;
+    SettingsUpdateRequest settings_update = 42;
+    SkillFilesListRequest skill_files_list = 43;
+    SkillMetadataReadRequest skill_metadata_read = 44;
+    SkillTextReadRequest skill_text_read = 45;
+    FileMentionListRequest file_mention_list = 46;
+    UploadReadableFilesRequest upload_readable_files = 47;
+    FsRootsRequest fs_roots = 48;
+    FsListDirsRequest fs_list_dirs = 49;
+    PingRequest ping = 50;
+    UploadedImagePreviewRequest uploaded_image_preview = 51;
+    MemoryManageRequest memory_manage = 52;
+    SkillManageRequest skill_manage = 53;
+    FsCreateProjectFolderRequest fs_create_project_folder = 54;
+    TerminalRequest terminal_request = 55;
+    FsListRequest fs_list = 56;
+    FsWriteTextRequest fs_write_text = 57;
+    FsCreateDirRequest fs_create_dir = 58;
+    FsRenameRequest fs_rename = 59;
+    FsDeleteRequest fs_delete = 60;
+    GitRequest git_request = 61;
+    FsReadEditableTextRequest fs_read_editable_text = 62;
+    FsReadWorkspaceImageRequest fs_read_workspace_image = 63;
+    SftpRequest sftp_request = 64;
+    ProviderModelsRequest provider_models = 65;
+    SettingsResetSshKnownHostRequest settings_reset_ssh_known_host = 72;
+    ChatQueueRequest chat_queue = 73;
+    ChatIngressAck chat_ingress_ack = 75;
+    TunnelStateSnapshot tunnel_state = 80;
+    TunnelMutation tunnel_mutation = 81;
+    TunnelFrame tunnel_frame = 82;
+    WorkspaceWatchRequest workspace_watch = 90;
+    ManagedProcessRequest managed_process_request = 91;
+    HistoryBranchRequest history_branch = 92;
+    ProviderUsageRequest provider_usage = 93;
+    ChatFileOpenRequest chat_file_open = 94;
+    HistorySetCwdRequest history_set_cwd = 95;
+    WorkspaceRootGrantsRequest workspace_root_grants = 96;
+    ImportDirectoryRequest import_directory = 97;
+    CheckpointRequest checkpoint = 98;
+    TrajectoryFetchRequest trajectory_fetch = 99;
+    InstalledAppsListRequest installed_apps_list = 100;
+    ClarifyTurnRequest clarify_turn = 101;
+    CuaDriverRequest cua_driver = 102;
+    PlanningRequest planning = 103;
+    PromptTemplateListRequest prompt_template_list = 104;
+    PromptTemplateExpandRequest prompt_template_expand = 105;
+    SlashCommandListRequest slash_command_list = 106;
+    GoalManageRequest goal_manage = 107;
+    LoopManageRequest loop_manage = 108;
+    ProxyDetectRequest proxy_detect = 109;
+    HistoryResyncRequest history_resync = 110;
+    PermissionRulesRequest permission_rules = 111;
+    UsageStatsRequest usage_stats = 112;
+  }
+
+  // Legacy tunnel control/frame payloads (pre-rewrite protocol) and the
+  // never-wired chat event replay request.
+  reserved 67, 68, 69, 74;
+}
+
+message AgentEnvelope {
+  string request_id = 1;
+  int64 timestamp = 2;
+
+  oneof payload {
+    ChatEvent chat_event = 10;
+    CronManageResponse cron_manage_resp = 20;
+    HistoryListResponse history_list_resp = 30;
+    HistoryGetResponse history_get_resp = 31;
+    HistoryRenameResponse history_rename_resp = 32;
+    HistoryDeleteResponse history_delete_resp = 33;
+    HistorySyncEvent history_sync = 34;
+    HistoryPrefixResponse history_prefix_resp = 35;
+    HistoryPinResponse history_pin_resp = 36;
+    HistoryShareGetResponse history_share_get_resp = 37;
+    HistoryShareSetResponse history_share_set_resp = 38;
+    HistoryShareResolveResponse history_share_resolve_resp = 39;
+    HistoryWorkdirsResponse history_workdirs_resp = 56;
+    ProviderListResponse provider_list_resp = 40;
+    SettingsGetResponse settings_get_resp = 41;
+    SettingsUpdateResponse settings_update_resp = 42;
+    SettingsSyncEvent settings_sync = 43;
+    SkillFilesListResponse skill_files_list_resp = 44;
+    SkillMetadataReadResponse skill_metadata_read_resp = 45;
+    SkillTextReadResponse skill_text_read_resp = 46;
+    FileMentionListResponse file_mention_list_resp = 47;
+    UploadReadableFilesResponse upload_readable_files_resp = 48;
+    FsRootsResponse fs_roots_resp = 49;
+    PongResponse pong = 50;
+    FsListDirsResponse fs_list_dirs_resp = 51;
+    UploadedImagePreviewResponse uploaded_image_preview_resp = 52;
+    MemoryManageResponse memory_manage_resp = 53;
+    SkillManageResponse skill_manage_resp = 54;
+    FsCreateProjectFolderResponse fs_create_project_folder_resp = 55;
+    TerminalResponse terminal_response = 57;
+    TerminalEvent terminal_event = 58;
+    FsListResponse fs_list_resp = 59;
+    FsWriteTextResponse fs_write_text_resp = 60;
+    FsCreateDirResponse fs_create_dir_resp = 61;
+    FsRenameResponse fs_rename_resp = 62;
+    FsDeleteResponse fs_delete_resp = 63;
+    GitResponse git_response = 64;
+    FsReadEditableTextResponse fs_read_editable_text_resp = 65;
+    FsReadWorkspaceImageResponse fs_read_workspace_image_resp = 66;
+    SftpResponse sftp_response = 73;
+    SftpEvent sftp_event = 74;
+    ChatQueueResponse chat_queue_resp = 75;
+    ChatQueueEvent chat_queue_event = 76;
+    ChatControlEvent chat_control = 70;
+    RuntimeStatusEvent runtime_status = 71;
+    SettingsResetSshKnownHostResponse settings_reset_ssh_known_host_resp = 72;
+    ChatRuntimeSnapshot chat_runtime_snapshot = 77;
+    ProviderModelsResponse provider_models_resp = 79;
+    TunnelDesiredState tunnel_desired = 80;
+    TunnelMutationResult tunnel_mutation_result = 81;
+    TunnelFrame tunnel_frame = 82;
+    TunnelProbeReport tunnel_probe_report = 83;
+    WorkspaceActivityEvent workspace_activity = 90;
+    ManagedProcessResponse managed_process_response = 91;
+    ManagedProcessSnapshot managed_process_snapshot = 92;
+    HistoryBranchResponse history_branch_resp = 93;
+    ProviderUsageResponse provider_usage_resp = 94;
+    ChatIngressBatch chat_ingress_batch = 95;
+    ChatIngressResume chat_ingress_resume = 96;
+    ChatIngressFragment chat_ingress_fragment = 97;
+    ChatFileOpenResponse chat_file_open_resp = 98;
+    ErrorResponse error = 99;
+    HistorySetCwdResponse history_set_cwd_resp = 100;
+    WorkspaceRootGrantsResponse workspace_root_grants_resp = 101;
+    ImportDirectoryResponse import_directory_resp = 102;
+    CheckpointResponse checkpoint_resp = 103;
+    TrajectoryFetchResponse trajectory_fetch_resp = 104;
+    InstalledAppsListResponse installed_apps_list_resp = 105;
+    ClarifyTurnResponse clarify_turn_resp = 106;
+    CuaDriverResponse cua_driver_resp = 107;
+    ClarifyTurnDelta clarify_turn_delta = 108;
+    PlanningResponse planning_resp = 109;
+    PlanningChanged planning_changed = 110;
+    PromptTemplateListResponse prompt_template_list_resp = 111;
+    PromptTemplateExpandResponse prompt_template_expand_resp = 112;
+    SlashCommandListResponse slash_command_list_resp = 113;
+    GoalManageResponse goal_manage_resp = 114;
+    LoopManageResponse loop_manage_resp = 115;
+    ProxyDetectResponse proxy_detect_resp = 116;
+    HistorySyncStatus history_sync_status = 117;
+    HistorySyncSnapshot history_sync_snapshot = 118;
+    PermissionRulesResponse permission_rules_resp = 119;
+    UsageStatsResponse usage_stats_resp = 120;
+  }
+
+  // Legacy tunnel control/frame payloads (pre-rewrite protocol) and the
+  // never-wired chat event replay response.
+  reserved 67, 68, 69, 78;
+}
+
+message ChatSelectedModel {
+  string custom_provider_id = 1;
+  string model = 2;
+  string provider_type = 3;
+}
+
+message ChatRuntimeControls {
+  bool thinking_enabled = 1;
+  bool native_web_search_enabled = 2;
+  string reasoning = 3;
+  // Plan mode(计划模式):true 表示本轮只注入只读工具 + ExitPlanMode。
+  // 限制性开关,桌面端按"只能收紧"合并(任一来源为 true 即生效);缺省 false
+  // 不得关闭桌面本地已开启的 plan mode。
+  bool plan_mode_enabled = 4;
+}
+
+// 澄清轮次（Web 计划 2）：浏览器经 gateway 转发到桌面 agent 的一次纯文本补全。
+// messages 走 JSON 字符串（ClarifyMessage[]，见 agent-ui clarifyTypes），system
+// 提示词（含工作区上下文）已在 Web 侧拼入 messages，无需单独字段；provider/
+// model/runtime 由 Web 当前选中下发，桌面端按 provider_id 查本地配置构造 runtime。
+message ClarifyTurnRequest {
+  string messages_json = 1;
+  string provider_id = 2;
+  string model = 3;
+  ChatRuntimeControls runtime_controls = 4;
+}
+
+message ClarifyTurnResponse {
+  string final_text = 1;
+  string error_code = 2;
+  string error_message = 3;
+}
+
+// 澄清轮次流式增量。与 ClarifyTurnRequest 共用 request_id，但不结束 unary
+// 等待：gateway 拦截后转给发起该轮的浏览器，最终仍以 clarify_turn_resp 收束。
+message ClarifyTurnDelta {
+  string text = 1;
+}
+
+message ChatUploadedFile {
+  string relative_path = 1;
+  string absolute_path = 2;
+  string file_name = 3;
+  string kind = 4;
+  int64 size_bytes = 5;
+  string dedupe_key = 6;
+}
+
+message UploadReadableFile {
+  string file_name = 1;
+  string mime_type = 2;
+  bytes content = 3;
+}
+
+message UploadReadableFilesRequest {
+  string workdir = 1;
+  repeated UploadReadableFile files = 2;
+}
+
+message UploadReadableFilesResponse {
+  repeated ChatUploadedFile files = 1;
+  repeated string skipped = 2;
+}
+
+// 浏览器拖入的整个文件夹经 HTTP 上传后由网关转发到 Agent 宿主机落盘。
+// target 决定落盘基目录："workspace" 创建为新工作空间目录，
+// "project-root" 创建为待挂载的附属目录。
+message ImportDirectoryFile {
+  string relative_path = 1;  // 文件夹内的相对路径，正斜杠分隔
+  bytes content = 2;
+}
+
+enum ImportDirectoryOperation {
+  IMPORT_DIRECTORY_OPERATION_UNSPECIFIED = 0;
+  IMPORT_DIRECTORY_OPERATION_START = 1;
+  IMPORT_DIRECTORY_OPERATION_WRITE_CHUNK = 2;
+  IMPORT_DIRECTORY_OPERATION_COMMIT = 3;
+  IMPORT_DIRECTORY_OPERATION_ABORT = 4;
+}
+
+message ImportDirectoryRequest {
+  string name = 1;    // START：拖入的文件夹名（单个路径组件）
+  string target = 2;  // START："workspace" | "project-root"
+  // 旧版整目录信封，仅保留兼容；新客户端必须使用下面的分块字段。
+  repeated ImportDirectoryFile files = 3 [deprecated = true];
+  string transfer_id = 4;
+  ImportDirectoryOperation operation = 5;
+  uint32 total_files = 6;  // START：目录文件总数
+  uint64 total_bytes = 7;  // START：目录内容总字节数（不含协议开销）
+  string relative_path = 8;  // WRITE_CHUNK：目录内相对路径
+  uint64 offset = 9;  // WRITE_CHUNK：当前文件内的连续字节偏移
+  bytes chunk = 10;  // WRITE_CHUNK：单块最多 1 MiB
+  bool file_complete = 11;  // WRITE_CHUNK：当前块是该文件最后一块
+}
+
+message ImportDirectoryResponse {
+  string root_path = 1;  // Agent 宿主机上创建的目录绝对路径
+  int32 file_count = 2;
+  repeated string skipped = 3;
+  string transfer_id = 4;
+  uint64 received_bytes = 5;
+}
+
+message UploadedImagePreviewRequest {
+  string workdir = 1;
+  string absolute_path = 2;
+}
+
+message UploadedImagePreviewResponse {
+  string mime_type = 1;
+  string data = 2;
+}
+
+// ---- Tunnel desired state (agent -> gateway) ----
+
+message TunnelSpec {
+  string id = 1;               // agent-generated, stable across restarts
+  string slug_hint = 2;        // last allocated slug; gateway honors when valid and unused
+  string name = 3;
+  string target_url = 4;       // http://localhost:PORT[/base]
+  int64 expires_at = 5;        // unix seconds, 0 = never
+  string project_path_key = 6;
+}
+
+message TunnelDesiredState {
+  repeated TunnelSpec tunnels = 1;
+  uint64 revision = 2;         // agent-side monotonic
+}
+
+// ---- Tunnel runtime snapshot (gateway -> agent, mirrored to /ws JSON) ----
+
+message TunnelHealth {
+  string status = 1;           // "ok" | "failed" | "unknown"
+  uint32 http_status = 2;      // local layer only
+  string error = 3;
+  int64 checked_at = 4;
+  uint32 rtt_ms = 5;           // relay layer only
+}
+
+message TunnelStatus {
+  string id = 1;
+  string slug = 2;
+  string name = 3;
+  string target_url = 4;
+  string public_path = 5;      // "/t/{slug}/"; clients compose the full URL
+  int64 created_at = 6;
+  int64 expires_at = 7;
+  uint32 active_connections = 8;
+  string project_path_key = 9;
+  TunnelHealth local = 10;     // agent -> local service reachability
+}
+
+message TunnelStateSnapshot {
+  repeated TunnelStatus tunnels = 1;
+  uint64 revision = 2;         // gateway-side monotonic
+  bool agent_online = 3;
+  TunnelHealth relay = 4;      // gateway <-> agent frame path
+}
+
+// ---- Tunnel mutations forwarded gateway -> agent (webui-originated) ----
+
+message TunnelMutation {
+  string action = 1;           // "create" | "update" | "close" | "check"
+  string tunnel_id = 2;        // update/close/check
+  string target_url = 3;
+  string name = 4;
+  optional uint32 ttl_seconds = 5; // absent on update = keep current expiry
+  string project_path_key = 6;
+}
+
+message TunnelMutationResult {
+  string tunnel_id = 1;
+  string error_code = 2;       // "" = ok; invalid_target|limit_exceeded|not_found|invalid_ttl
+  string error_message = 3;
+}
+
+// ---- Tunnel local-service probe results (agent -> gateway) ----
+
+message TunnelProbeResult {
+  string tunnel_id = 1;
+  TunnelHealth local = 2;
+}
+
+message TunnelProbeReport {
+  repeated TunnelProbeResult results = 1;
+}
+
+// ---- Tunnel data plane ----
+
+message TunnelHeader {
+  string name = 1;
+  string value = 2;
+}
+
+enum TunnelFrameKind {
+  TUNNEL_FRAME_KIND_UNSPECIFIED = 0;
+  TUNNEL_FRAME_KIND_HTTP_REQUEST_START = 1;
+  TUNNEL_FRAME_KIND_HTTP_REQUEST_BODY = 2;
+  TUNNEL_FRAME_KIND_HTTP_REQUEST_END = 3;
+  TUNNEL_FRAME_KIND_HTTP_RESPONSE_START = 4;
+  TUNNEL_FRAME_KIND_HTTP_RESPONSE_BODY = 5;
+  TUNNEL_FRAME_KIND_HTTP_RESPONSE_END = 6;
+  TUNNEL_FRAME_KIND_WS_DIAL = 7;
+  TUNNEL_FRAME_KIND_WS_DIAL_OK = 8;
+  TUNNEL_FRAME_KIND_WS_DIAL_ERROR = 9;
+  TUNNEL_FRAME_KIND_WS_FRAME = 10;
+  TUNNEL_FRAME_KIND_WS_CLOSE = 11;
+  TUNNEL_FRAME_KIND_ERROR = 12;
+  TUNNEL_FRAME_KIND_CANCEL = 13;
+  TUNNEL_FRAME_KIND_PING = 14;
+  TUNNEL_FRAME_KIND_PONG = 15;
+}
+
+enum TunnelWsMessageType {
+  TUNNEL_WS_MESSAGE_TYPE_UNSPECIFIED = 0;
+  TUNNEL_WS_MESSAGE_TYPE_TEXT = 1;
+  TUNNEL_WS_MESSAGE_TYPE_BINARY = 2;
+}
+
+message TunnelFrame {
+  string stream_id = 1;
+  TunnelFrameKind kind = 2;
+  string target_url = 3;       // set on HTTP_REQUEST_START and WS_DIAL only
+  string method = 4;
+  string path = 5;             // path+query relative to the target base
+  repeated TunnelHeader headers = 6;
+  uint32 status = 7;
+  bytes body = 8;
+  string error = 9;
+  TunnelWsMessageType ws_message_type = 10;
+  string ws_subprotocol = 11;
+  uint32 ws_close_code = 12;
+  string ws_close_reason = 13;
+}
+
+// ---- Workspace activity watch (gateway -> agent declarative full set,
+// ---- agent -> gateway debounced change events) ----
+
+message WorkspaceWatchRequest {
+  repeated string workdirs = 1;  // full desired set; replaces the previous one
+}
+
+message WorkspaceActivityEvent {
+  string workdir = 1;
+  uint64 revision = 2;           // per-workdir monotonic within one agent process
+  bool fs = 3;                   // working-tree content changed
+  bool git = 4;                  // git state (HEAD/refs/index/...) changed
+  repeated string changed_paths = 5;  // relative to workdir, deduped, capped
+  bool truncated = 6;            // changed_paths hit the cap or is unknown
+}
+
+// ---- Managed processes (ManagedProcess tool children on the agent host).
+// ---- Agent broadcasts full-table snapshots; the gateway caches the latest
+// ---- and fans it out to webui subscribers. Panel operations are forwarded
+// ---- gateway -> agent and answered with the same request_id. ----
+
+message ManagedProcessRecord {
+  string id = 1;
+  string label = 2;
+  string command = 3;
+  string cwd = 4;
+  string shell = 5;
+  uint32 pid = 6;
+  string log_path = 7;
+  int64 started_at = 8;             // unix ms
+  optional int64 finished_at = 9;   // unix ms
+  optional int32 exit_code = 10;    // absent for restored/pid-managed entries
+  bool running = 11;
+  bool isolated = 12;               // survives LiveAgent exit
+  bool restored = 13;               // recovered after restart; managed by pid
+}
+
+message ManagedProcessSnapshot {
+  repeated ManagedProcessRecord processes = 1;
+  uint64 revision = 2;              // agent-side monotonic, restart-safe
+}
+
+message ManagedProcessRequest {
+  string action = 1;                // "snapshot" | "stop" | "read_log" | "clear"
+  string process_id = 2;            // stop/read_log; optional for clear
+  uint32 max_bytes = 3;             // read_log only; 0 = default
+}
+
+message ManagedProcessResponse {
+  string action = 1;
+  ManagedProcessSnapshot snapshot = 2;  // set for snapshot/stop/clear
+  string log_content = 3;               // read_log only
+  string log_path = 4;                  // read_log only
+  bool log_truncated = 5;               // read_log only
+  bool stopped = 6;                     // stop only
+}
+
+message MemoryManageRequest {
+  string command = 1;
+  string args_json = 2;
+}
+
+message MemoryManageResponse {
+  string result_json = 1;
+}
+
+message TerminalRequest {
+  string action = 1;
+  // Canonical K-brain run identity for run-owned terminal operations.
+  string conversation_id = 22;
+  string run_id = 23;
+  string session_id = 2;
+  string project_path_key = 3;
+  string cwd = 4;
+  string shell = 5;
+  string title = 6;
+  string data = 7;
+  uint32 cols = 8;
+  uint32 rows = 9;
+  uint32 max_bytes = 10;
+  string ssh_host_id = 11;
+  string prompt_id = 12;
+  string prompt_answer = 13;
+  bool trust_host_key = 14;
+  bool sftp_enabled = 15;
+  string tab_id = 16;
+  string tab_kind = 17;
+  string remote_host = 18;
+  uint32 remote_port = 19;
+  uint32 local_port = 20;
+  string forward_id = 21;
+}
+
+message TerminalSession {
+  string id = 1;
+  string project_path_key = 2;
+  string cwd = 3;
+  string shell = 4;
+  string title = 5;
+  uint32 pid = 6;
+  uint32 cols = 7;
+  uint32 rows = 8;
+  uint64 created_at = 9;
+  uint64 updated_at = 10;
+  uint64 finished_at = 11;
+  int32 exit_code = 12;
+  bool running = 13;
+  string kind = 14;
+  TerminalSshMetadata ssh = 15;
+}
+
+message TerminalSshMetadata {
+  string host_id = 1;
+  string host_name = 2;
+  string username = 3;
+  string host = 4;
+  uint32 port = 5;
+  string auth_type = 6;
+  string status = 7;
+  uint32 reconnect_attempt = 8;
+  uint32 reconnect_max_attempts = 9;
+  bool sftp_enabled = 10;
+}
+
+message SftpRequest {
+  string action = 1;
+  string session_id = 2;
+  string project_path_key = 3;
+  string workdir = 4;
+  string local_path = 5;
+  string remote_path = 6;
+  string from_path = 7;
+  string to_path = 8;
+  string direction = 9;
+  string target_path = 10;
+  bool recursive = 11;
+  bool overwrite = 12;
+  string content = 13;
+  uint64 offset = 14;
+  uint64 max_bytes = 15;
+  bool strict_utf8 = 16;
+  // write_text conflict guard; 0 means "skip the check" (proto3 has no
+  // presence for scalars, an mtime/size of exactly 0 is accepted as-is).
+  uint64 expected_mtime = 17;
+  uint64 expected_size_bytes = 18;
+  bool create_parent_dirs = 19;
+}
+
+message SftpEntry {
+  string path = 1;
+  string name = 2;
+  string kind = 3;
+  uint64 size_bytes = 4;
+  uint64 mtime = 5;
+}
+
+message SftpTransfer {
+  string id = 1;
+  string session_id = 2;
+  string direction = 3;
+  string status = 4;
+  string source_path = 5;
+  string target_path = 6;
+  string current_path = 7;
+  uint64 bytes_done = 8;
+  uint64 bytes_total = 9;
+  uint32 files_done = 10;
+  uint32 files_total = 11;
+  string error = 12;
+}
+
+message SftpResponse {
+  string action = 1;
+  string path = 2;
+  repeated SftpEntry entries = 3;
+  SftpEntry entry = 4;
+  bool exists = 5;
+  SftpTransfer transfer = 6;
+  string content = 7;
+  uint64 offset = 8;
+  uint64 bytes_read = 9;
+  uint64 size_bytes = 10;
+  bool truncated = 11;
+}
+
+message SftpEvent {
+  string kind = 1;
+  SftpTransfer transfer = 2;
+}
+
+message TerminalSshPrompt {
+  string id = 1;
+  string kind = 2;
+  string host_id = 3;
+  string host_name = 4;
+  string host = 5;
+  uint32 port = 6;
+  string message = 7;
+  string fingerprint_sha256 = 8;
+  string key_type = 9;
+  bool answer_echo = 10;
+}
+
+message TerminalShellOption {
+  string id = 1;
+  string label = 2;
+  string command = 3;
+}
+
+message TerminalSshTab {
+  string id = 1;
+  string session_id = 2;
+  string project_path_key = 3;
+  string kind = 4;
+  uint64 created_at = 5;
+  uint64 updated_at = 6;
+}
+
+message TerminalSshTabsSnapshot {
+  reserved 3;
+  string project_path_key = 1;
+  repeated TerminalSshTab tabs = 2;
+  uint64 revision = 4;
+}
+
+message TerminalSshLocalForward {
+  string id = 1;
+  string session_id = 2;
+  string project_path_key = 3;
+  string local_host = 4;
+  uint32 local_port = 5;
+  string address = 6;
+  string remote_host = 7;
+  uint32 remote_port = 8;
+  string status = 9;
+  uint64 created_at = 10;
+  uint64 updated_at = 11;
+  string error = 12;
+}
+
+message TerminalSshLocalForwardsSnapshot {
+  repeated TerminalSshLocalForward forwards = 1;
+  uint64 revision = 2;
+}
+
+message TerminalSshLocalForwardAction {
+  TerminalSshLocalForward forward = 1;
+  uint64 revision = 2;
+  // Only set on events: started | stopped | failed.
+  string kind = 3;
+}
+
+message TerminalResponse {
+  string action = 1;
+  repeated TerminalSession sessions = 2;
+  TerminalSession session = 3;
+  bytes output = 4;
+  bool truncated = 5;
+  repeated TerminalShellOption shell_options = 6;
+  string default_shell = 7;
+  uint64 output_start_offset = 8;
+  uint64 output_end_offset = 9;
+  TerminalSshPrompt ssh_prompt = 10;
+  uint32 latency_ms = 11;
+  TerminalSshTabsSnapshot ssh_tabs = 12;
+  TerminalSshLocalForwardsSnapshot ssh_local_forwards = 13;
+  TerminalSshLocalForwardAction ssh_local_forward = 14;
+  bool ssh_local_forward_port_available = 15;
+}
+
+message TerminalEvent {
+  string kind = 1;
+  string session_id = 2;
+  string project_path_key = 3;
+  TerminalSession session = 4;
+  bytes data = 5;
+  uint64 output_start_offset = 6;
+  uint64 output_end_offset = 7;
+  TerminalSshTabsSnapshot ssh_tabs = 8;
+  TerminalSshLocalForwardAction ssh_local_forward = 9;
+}
+
+message TerminalStreamFrame {
+  string kind = 1;
+  string stream_id = 2;
+  string session_id = 3;
+  string project_path_key = 4;
+  uint64 seq = 5;
+  uint64 start_offset = 6;
+  uint64 end_offset = 7;
+  uint32 cols = 8;
+  uint32 rows = 9;
+  uint32 max_bytes = 10;
+  bool truncated = 11;
+  string error = 12;
+  TerminalSession session = 13;
+  bytes data = 14;
+}
+
+message GitRequest {
+  string action = 1;
+  string workdir = 2;
+  string args_json = 3;
+}
+
+message GitResponse {
+  string action = 1;
+  string result_json = 2;
+}
+
+message ChatRequest {
+  string conversation_id = 1;
+  string message = 2;
+  ChatSelectedModel selected_model = 3;
+  string execution_mode = 4;
+  string workdir = 5;
+  reserved 6;
+  reserved "selected_system_tools";
+  repeated ChatUploadedFile uploaded_files = 7;
+  string client_request_id = 8;
+  ChatRuntimeControls runtime_controls = 9;
+  string queue_policy = 10;
+  // 命令安全模式(ask/auto/sandbox/sandboxOffline)。远端 WebUI 直带,桌面端据此
+  // 覆盖本地 settings.system.commandSafetyMode;空串表示未指定(回落本地设置)。
+  string command_safety_mode = 11;
+  // Structured conversation references selected through the WebUI @ menu.
+  // The desktop runtime binds ReadConversation authorization to this list;
+  // a markdown conversation token is display-only and cannot grant access.
+  repeated ChatConversationReference referenced_conversations = 12;
+  // WebUI 输入框“/”指令带来的单轮语义。goal_action 非空表示经 K-brain 的 goal
+  // 接口开始这一轮（set/resume）；prompt_command 表示 message 是提示词指令，
+  // 由 K-brain 展开后交给模型，历史与界面保留原文。
+  string goal_action = 13;
+  string goal_text = 14;
+  bool prompt_command = 15;
+  // A single /plan task, distinct from ordinary chat with plan mode enabled.
+  bool plan_command = 16;
+  // The project's MCP server choice (Project settings, custom or off). Absent
+  // means the project inherits the global MCP settings; present with no ids
+  // means the run offers no MCP server.
+  ChatMcpServerSelection mcp_servers = 17;
+}
+
+message ChatMcpServerSelection {
+  repeated string server_ids = 1;
+}
+
+message ChatMessageRef {
+  int32 segment_index = 1;
+  int32 message_index = 2;
+  string segment_id = 3;
+  string message_id = 4;
+  string role = 5;
+  string content_hash = 6;
+}
+
+message CancelChatRequest {
+  string conversation_id = 1;
+  // 可选运行 id 提示：v2 浏览器链路用它消除同会话并发运行的歧义；桌面端可忽略。
+  string run_id = 2;
+}
+
+message ChatCommandRequest {
+  string type = 1;
+  ChatRequest request = 2;
+  ChatMessageRef base_message_ref = 3;
+  CancelChatRequest cancel = 4;
+}
+
+message ChatQueueRequest {
+  string action = 1;
+  string conversation_id = 2;
+  string item_id = 3;
+  string direction = 4;
+  uint64 revision = 5;
+  string draft_json = 6;
+  string uploaded_files_json = 7;
+  string request_json = 8;
+}
+
+message ChatQueueResponse {
+  bool accepted = 1;
+  string message = 2;
+  string snapshot_json = 3;
+  string item_json = 4;
+  string error_code = 5;
+  uint64 revision = 6;
+}
+
+message ChatQueueEvent {
+  string conversation_id = 1;
+  string snapshot_json = 2;
+  uint64 revision = 3;
+}
+
+message ChatEvent {
+  ChatEventType type = 1;
+  string conversation_id = 2;
+  string data = 3;
+
+  enum ChatEventType {
+    TOKEN = 0;
+    THINKING = 1;
+    TOOL_CALL = 2;
+    TOOL_RESULT = 3;
+    DONE = 4;
+    ERROR = 5;
+    TOOL_STATUS = 6;
+    HOSTED_SEARCH = 7;
+    USER_MESSAGE = 8;
+    // 轨迹骨架事件；data 是一条紧凑 TrajectoryEvent 的 JSON。分段全文不走这里，
+    // 由 TrajectoryFetchRequest 按需拉取，避免几十 KB 的 payload 撑爆中继窗口。
+    TRAJECTORY = 9;
+  }
+}
+
+message ChatControlEvent {
+  string request_id = 1;
+  string client_request_id = 2;
+  string conversation_id = 3;
+  int64 run_epoch = 4;
+  string type = 5;
+  string state = 6;
+  string error_code = 7;
+  string message = 8;
+  int64 seq = 9;
+}
+
+message ChatRuntimeSnapshot {
+  string conversation_id = 1;
+  string run_id = 2;
+  string client_request_id = 3;
+  string worker_id = 4;
+  string state = 5;
+  string cwd = 6;
+  int64 updated_at = 7;
+  int64 revision = 8;
+  string entries_json = 9;
+  string tool_status = 10;
+  bool tool_status_is_compaction = 11;
+}
+
+message RuntimeStatusEvent {
+  string worker_id = 1;
+  string state = 2;
+  bool visible = 3;
+  uint32 active_run_count = 4;
+  int64 timestamp = 5;
+  repeated ChatRunReport active_runs = 6;
+  repeated ChatRunReport finished_runs = 7;
+}
+
+message ChatRunReport {
+  string run_id = 1;
+  string conversation_id = 2;
+  string state = 3;
+  string error_code = 4;
+  string message = 5;
+  int64 updated_at = 6;
+}
+
+message CronManageRequest {
+  string action = 1;
+  string task_id = 2;
+  string task_json = 3;
+}
+
+message CronManageResponse {
+  string action = 1;
+  string result_json = 2;
+}
+
+message HistoryListRequest {
+  int32 page = 1;
+  int32 page_size = 2;
+  string cwd = 3;
+  bool cwd_empty = 4;
+}
+
+message HistoryListResponse {
+  repeated ConversationSummary conversations = 1;
+  int32 total_count = 2;
+}
+
+message ConversationSummary {
+  string id = 1;
+  string title = 2;
+  int64 created_at = 3;
+  int64 updated_at = 4;
+  int32 message_count = 5;
+  string provider_id = 6;
+  string model = 7;
+  string session_id = 8;
+  string cwd = 9;
+  bool is_pinned = 10;
+  int64 pinned_at = 11;
+  bool is_shared = 12;
+  string selected_model_json = 13;
+}
+
+message HistoryGetRequest {
+  string conversation_id = 1;
+  int32 max_messages = 2;
+}
+
+message HistoryGetResponse {
+  string conversation_id = 1;
+  string messages_json = 2;
+  int32 total_message_count = 3;
+  int32 returned_message_count = 4;
+  bool has_more = 5;
+  ConversationSummary conversation = 6;
+}
+
+// 轨迹按需拉取。这是一次只做一件事的 tagged union，不是可组合查询：
+//   include_subagent_runs=true → 只返回子代理运行，其余字段忽略；
+//   否则 section_ids 非空       → 只返回这些分段全文；
+//   否则                        → 只返回事件窗口。
+// 桌面端 handler 对三种形态互斥短路，组合字段不会得到合并结果 —— 调用方
+// 需要三类数据时必须分开请求。
+//
+// 刻意不把事件挂在 history_get 上：轨迹是偶尔打开的诊断视图，长会话的事件数组
+// 可达 MB 级，随每次开会话白传一遍不划算。分段更是只在展开 SYSTEM 行时才要。
+message TrajectoryFetchRequest {
+  string conversation_id = 1;
+  // 非空 → 本请求只查这些分段全文（与事件窗口互斥）。
+  repeated string section_ids = 2;
+  // 仅事件窗口形态生效：按 segment 逆向分页；0 由 Agent 使用默认窗口。
+  int32 max_segments = 3;
+  optional int32 before_segment_index = 4;
+  // true → 本请求只查子代理运行快照，优先级最高（section_ids 被忽略）。
+  bool include_subagent_runs = 5;
+  // include_subagent_runs=true 时按这些 run id 精确读取；与 prompt section id 分域。
+  repeated string subagent_run_ids = 6;
+}
+
+message TrajectorySectionPayload {
+  string section_id = 1;
+  string slot = 2;
+  string content = 3;
+  int64 bytes = 4;
+}
+
+message TrajectoryFetchResponse {
+  string conversation_id = 1;
+  string events_json = 2;
+  // 有分段损坏或触顶时为 true，UI 据此提示轨迹不完整。
+  bool truncated = 3;
+  repeated TrajectorySectionPayload sections = 4;
+  int32 oldest_segment_index = 5;
+  int32 returned_segment_count = 6;
+  int32 total_segment_count = 7;
+  bool has_more_before = 8;
+  string subagent_runs_json = 9;
+}
+
+message HistoryPrefixRequest {
+  string conversation_id = 1;
+  int32 max_messages = 2;
+  ChatMessageRef base_message_ref = 3;
+}
+
+message HistoryPrefixResponse {
+  string conversation_id = 1;
+  string messages_json = 2;
+  int32 total_message_count = 3;
+  int32 returned_message_count = 4;
+  bool has_more = 5;
+  ConversationSummary conversation = 6;
+}
+
+message HistoryRenameRequest {
+  string conversation_id = 1;
+  string title = 2;
+}
+
+message HistoryRenameResponse {
+  ConversationSummary conversation = 1;
+}
+
+// Copies the conversation prefix up to and including the assistant response
+// that answers the anchored user message (base_message_ref) into a brand-new
+// conversation titled "新分支".
+message HistoryBranchRequest {
+  string conversation_id = 1;
+  ChatMessageRef base_message_ref = 2;
+}
+
+message HistoryBranchResponse {
+  ConversationSummary conversation = 1;
+}
+
+message HistoryPinRequest {
+  string conversation_id = 1;
+  bool is_pinned = 2;
+}
+
+message HistoryPinResponse {
+  ConversationSummary conversation = 1;
+}
+
+message HistoryShareStatus {
+  string conversation_id = 1;
+  bool enabled = 2;
+  string token = 3;
+  int64 created_at = 4;
+  int64 updated_at = 5;
+  bool redact_tool_content = 6;
+}
+
+message HistoryShareGetRequest {
+  string conversation_id = 1;
+}
+
+message HistoryShareGetResponse {
+  HistoryShareStatus share = 1;
+}
+
+message HistoryShareSetRequest {
+  string conversation_id = 1;
+  bool enabled = 2;
+  optional bool redact_tool_content = 3;
+}
+
+message HistoryShareSetResponse {
+  HistoryShareStatus share = 1;
+}
+
+message HistoryShareResolveRequest {
+  string token = 1;
+}
+
+message HistoryShareResolveResponse {
+  string conversation_id = 1;
+  string messages_json = 2;
+  int32 total_message_count = 3;
+  ConversationSummary conversation = 4;
+  bool redact_tool_content = 5;
+}
+
+message HistoryWorkdirsRequest {}
+
+message HistoryWorkdirSummary {
+  string path = 1;
+  int32 conversation_count = 2;
+  int64 updated_at = 3;
+}
+
+message HistoryWorkdirsResponse {
+  repeated HistoryWorkdirSummary workdirs = 1;
+}
+
+message HistoryDeleteRequest {
+  string conversation_id = 1;
+}
+
+message HistoryDeleteResponse {}
+
+message HistorySyncEvent {
+  string kind = 1;
+  ConversationSummary conversation = 2;
+  string conversation_id = 3;
+  string source_id = 4;
+  string generation = 5;
+  uint64 delivery_seq = 6;
+}
+
+// HistorySyncStatus is a producer heartbeat and recovery barrier. A source
+// generation is only healthy after a complete snapshot for that generation
+// has been accepted by the Gateway.
+message HistorySyncStatus {
+  string source_id = 1;
+  string generation = 2;
+  uint64 latest_delivery_seq = 3;
+  bool available = 4;
+  bool needs_resync = 5;
+  string resync_token = 6;
+}
+
+// HistorySyncSnapshot is an immutable LA-id projection captured at
+// cut_delivery_seq. Incremental events after the cut can be replayed safely.
+message HistorySyncSnapshot {
+  string source_id = 1;
+  string generation = 2;
+  uint64 cut_delivery_seq = 3;
+  string resync_token = 4;
+  repeated ConversationSummary conversations = 5;
+  repeated HistoryWorkdirSummary workdirs = 6;
+  uint32 offset = 7;
+  uint32 next_offset = 8;
+  uint32 total_count = 9;
+}
+
+message HistoryResyncRequest {
+  string resync_token = 1;
+  uint32 offset = 2;
+  uint32 limit = 3;
+}
+
+message ProviderListRequest {}
+
+message ProviderListResponse {
+  string providers_json = 1;
+}
+
+message SettingsGetRequest {}
+
+message SettingsGetResponse {
+  string settings_json = 1;
+}
+
+message SettingsUpdateRequest {
+  string settings_json = 1;
+}
+
+message SettingsUpdateResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+message SettingsResetSshKnownHostRequest {
+  string host = 1;
+  uint32 port = 2;
+}
+
+message SettingsResetSshKnownHostResponse {
+  uint32 deleted = 1;
+}
+
+message SettingsSyncEvent {
+  string settings_json = 1;
+}
+
+message SkillFilesListRequest {}
+
+message SkillFilesListResponse {
+  string root_dir = 1;
+  repeated string paths = 2;
+  bool truncated = 3;
+}
+
+// Markdown 提示词模板（输入框“/”指令）：桌面端转调 K-brain 的
+// GET /v1/prompts?workdir= 与 POST /v1/prompts/templates/{name}/expand。
+// 项目级模板是否生效由 K-brain 按项目信任状态决定。
+message PromptTemplateListRequest {
+  string workdir = 1;
+}
+
+message PromptTemplateSummary {
+  string name = 1;
+  string description = 2;
+  string argument_hint = 3;
+}
+
+message PromptTemplateListResponse {
+  repeated PromptTemplateSummary templates = 1;
+}
+
+message PromptTemplateExpandRequest {
+  string name = 1;
+  // 指令名之后的原始参数文本，由 K-brain 按命令行规则切分。
+  string text = 2;
+  string workdir = 3;
+}
+
+message PromptTemplateExpandResponse {
+  string name = 1;
+  string text = 2;
+}
+
+// 会话目标的非运行动作：get、pause、update 与 clear。set/resume 会开始一轮运行，走
+// ChatRequest 的 goal_action，复用聊天的流式与镜像链路。
+message GoalManageRequest {
+  string conversation_id = 1;
+  string action = 2;
+  // update 的新目标正文；其余动作为空。
+  string goal = 3;
+}
+
+message GoalManageResponse {
+  string conversation_id = 1;
+  string goal = 2;
+  // none、active、continuing、met、paused 或 cleared。
+  string status = 3;
+  int32 round = 4;
+  int32 max_rounds = 5;
+  string reason = 6;
+  // 目标设定或最近一次恢复的时间（RFC3339），目标栏据此显示已运行时长。
+  string started_at = 7;
+}
+
+// 桌面端“/”指令目录：动作由客户端按名称处理，prompt 由 K-brain 展开。
+message SlashCommandListRequest {
+  string workdir = 1;
+}
+
+message SlashCommandSummary {
+  string name = 1;
+  string description = 2;
+  string argument_hint = 3;
+  // action 或 prompt。
+  string kind = 4;
+  string source = 5;
+}
+
+message SlashCommandListResponse {
+  repeated SlashCommandSummary commands = 1;
+}
+
+// 会话内按间隔重复的提示词，落在 K-brain 的 cron 上。
+message LoopManageRequest {
+  string conversation_id = 1;
+  // create、list 或 cancel。
+  string action = 2;
+  string cron = 3;
+  string interval = 4;
+  string prompt = 5;
+  string reasoning = 6;
+  string loop_id = 7;
+}
+
+message LoopSummary {
+  string id = 1;
+  string interval = 2;
+  string cron = 3;
+  string prompt = 4;
+  bool enabled = 5;
+}
+
+message LoopManageResponse {
+  repeated LoopSummary loops = 1;
+}
+
+message SkillMetadataReadRequest {
+  string path = 1;
+}
+
+message SkillMetadataReadResponse {
+  string name = 1;
+  string description = 2;
+}
+
+message SkillTextReadRequest {
+  string path = 1;
+  uint32 offset = 2;
+  uint32 length = 3;
+}
+
+message SkillTextReadResponse {
+  string content = 1;
+  bool truncated = 2;
+}
+
+message SkillManageRequest {
+  string payload_json = 1;
+}
+
+message SkillManageResponse {
+  string result_json = 1;
+}
+
+message FileMentionListRequest {
+  string workdir = 1;
+  uint32 max_results = 2;
+  string query = 3;
+  optional bool show_hidden = 4;
+}
+
+message FileMentionEntry {
+  string path = 1;
+  string kind = 2;
+  bool hidden = 3;
+}
+
+message FileMentionListResponse {
+  repeated FileMentionEntry entries = 1;
+  bool truncated = 2;
+}
+
+// 桌面宿主的已安装应用（computer use 操作目标），供 WebUI 的 @ 弹层展示
+// 应用分组。Gateway 只直通转发，不自己枚举；字段对齐桌面 InstalledApp
+// 的序列化契约（services/cua_driver/installed_apps.rs）。
+message InstalledAppsListRequest {}
+
+message InstalledAppEntry {
+  string name = 1;
+  // macOS bundle id；Windows 等无 bundle id 的平台留空，身份以 path 兜底。
+  string bundle_id = 2;
+  string path = 3;
+  // `data:image/png;base64,…` 应用图标；取不到时留空。
+  string icon_data_url = 4;
+}
+
+message InstalledAppsListResponse {
+  repeated InstalledAppEntry apps = 1;
+}
+
+// Computer Use（CUA）驱动的只读引导状态，供 WebUI 的 Computer Use 设置页
+// 展示桌面宿主上装没装 cua-driver、macOS 的 TCC 授权给了没有。Gateway 只
+// 直通转发，不自己探测。
+//
+// 安装与授权**有意不在这条通道上**：安装是在宿主上联网下载并执行 shell
+// 脚本，授权会在宿主屏幕上弹 macOS 系统对话框——浏览器这端的人既确认不了
+// 前者的命令全文，也点不到后者的弹窗，只能在桌面端做。
+message CuaDriverRequest {
+  // "probe" | "permissions_status"。写动作不走这里，网关侧亦按白名单拒绝。
+  string action = 1;
+}
+
+message CuaDriverResponse {
+  string action = 1;
+  // 与桌面 invoke 同一份序列化：services/cua_driver 的 CuaDriverProbe /
+  // CuaDriverPermissions（camelCase）。走 JSON 而不是在 proto 里再刻一份
+  // 结构化镜像，是为了让两端拿到的就是同一个对象，不会各自漂移。
+  string result_json = 2;
+}
+
+// 应用代理设置里的「检测到的代理服务」：检测与测速都在桌面宿主上执行，
+// 检测的是运行 LiveAgent 的那台电脑，不是浏览器所在的设备。Gateway 只按
+// action 白名单直通转发。
+message ProxyDetectRequest {
+  // "detect" | "test"。
+  string action = 1;
+  // test 的参数 {"type":"http"|"socks5","host":...,"port":...}；detect 为空。
+  // 桌面端只接受本进程检测到过的代理，不会替请求方连任意地址。
+  string input_json = 2;
+}
+
+message ProxyDetectResponse {
+  string action = 1;
+  // 与桌面 invoke 同一份序列化：services/proxy_detect 的 ProxyDetectResult /
+  // ProxyTestResult（camelCase），不含任何凭据。
+  string result_json = 2;
+}
+
+// 设置 → 权限：查看、添加、删除 K-brain 记住的权限规则（/v1/permissions/rules）。
+// 桌面端或直连 K-brain 的网关只转发设置页需要的字段，会话规则不经这里。
+message PermissionRulesRequest {
+  // "list" | "add" | "delete"。
+  string action = 1;
+  // list: {"workspace"?}；add: {"rule","effect":"allow"|"deny","scope":"project"|"user","workspace"?}；
+  // delete: {"id","scope":"project"|"user","workspace"?}。project 作用域必须带 workspace。
+  string input_json = 2;
+}
+
+message PermissionRulesResponse {
+  // K-brain 的应答 JSON 原样返回：list 为 {project_root?, rules[]}，add 为新规则，delete 为 {ok}。
+  string result_json = 1;
+}
+
+// 设置 → 用量统计：K-brain 跨会话的 token 用量（GET /v1/usage/stats，capability usage_stats）。
+// 只读；桌面端或直连 K-brain 的网关只转发 days 和 tz 两个查询参数。
+message UsageStatsRequest {
+  // 统计最近多少天（含今天），1-1100（与 K-brain 一致）；0 取默认 371。
+  int32 days = 1;
+  // IANA 时区名（浏览器的 resolvedOptions().timeZone），按它划分日期；空串由 K-brain 用本机时区。
+  string timezone = 2;
+}
+
+message UsageStatsResponse {
+  // K-brain 的应答 JSON 原样返回（generatedAt/timezone/days/totals/summary/daily/models）。
+  // unsupported 为 true 时为空：K-brain 没有 capabilities.usage_stats，设置页显示“需更新”。
+  string result_json = 1;
+  bool unsupported = 2;
+}
+
+message FsRoot {
+  string id = 1;
+  string path = 2;
+  string kind = 3;
+  string label = 4;
+}
+
+message FsRootsRequest {}
+
+message FsRootsResponse { repeated FsRoot roots = 1; }
+
+message FsListDirsRequest {
+  string path = 1;
+  uint32 max_results = 2;
+}
+
+message FsDirEntry {
+  string path = 1;
+  string name = 2;
+}
+
+message FsListDirsResponse {
+  string path = 1;
+  repeated FsDirEntry entries = 2;
+  bool truncated = 3;
+}
+
+message FsCreateProjectFolderRequest {
+  string parent = 1;
+  string name = 2;
+}
+
+message FsCreateProjectFolderResponse {
+  string path = 1;
+}
+
+message FsListRequest {
+  string workdir = 1;
+  string path = 2;
+  uint32 depth = 3;
+  uint32 offset = 4;
+  uint32 max_results = 5;
+  optional bool show_hidden = 6;
+}
+
+message FsListEntry {
+  string path = 1;
+  string kind = 2;
+  bool hidden = 3;
+}
+
+message FsListResponse {
+  string path = 1;
+  bool has_path = 2;
+  uint32 depth = 3;
+  uint32 offset = 4;
+  uint32 max_results = 5;
+  uint32 total = 6;
+  bool has_more = 7;
+  repeated FsListEntry entries = 8;
+}
+
+message FsReadEditableTextRequest {
+  string workdir = 1;
+  string path = 2;
+}
+
+message FsReadEditableTextResponse {
+  string path = 1;
+  string content = 2;
+  uint64 mtime_ms = 3;
+  string content_hash = 4;
+  uint64 size_bytes = 5;
+  uint64 total_lines = 6;
+}
+
+message FsReadWorkspaceImageRequest {
+  string workdir = 1;
+  string path = 2;
+}
+
+message FsReadWorkspaceImageResponse {
+  string path = 1;
+  string mime_type = 2;
+  string data = 3;
+  uint64 size_bytes = 4;
+  uint64 mtime_ms = 5;
+  string content_hash = 6;
+}
+
+message ChatFileOpenRequest {
+  string conversation_id = 1;
+  string workdir = 2;
+  string path = 3;
+  string source = 4;
+  optional uint32 line = 5;
+  optional uint32 end_line = 6;
+  optional uint32 column = 7;
+  bool open_in_file_manager = 8;
+}
+
+message ChatFileOpenResponse {
+  string action = 1;
+  string kind = 2;
+  string workdir = 3;
+  string path = 4;
+  optional uint32 line = 5;
+  optional uint32 end_line = 6;
+  optional uint32 column = 7;
+  bool outside_workspace = 8;
+}
+
+message FsWriteTextRequest {
+  string workdir = 1;
+  string path = 2;
+  string content = 3;
+  string mode = 4;
+  uint64 expected_mtime_ms = 5;
+  string expected_content_hash = 6;
+  bool has_expected_mtime_ms = 7;
+  bool has_expected_content_hash = 8;
+}
+
+message FsWriteTextResponse {
+  string path = 1;
+  string mode = 2;
+  bool existed_before = 3;
+  uint64 bytes_written = 4;
+  uint64 mtime_ms = 5;
+  string content_hash = 6;
+  uint64 total_lines = 7;
+}
+
+message FsCreateDirRequest {
+  string workdir = 1;
+  string path = 2;
+}
+
+message FsCreateDirResponse {
+  string path = 1;
+  string kind = 2;
+}
+
+message FsRenameRequest {
+  string workdir = 1;
+  string from_path = 2;
+  string to_path = 3;
+}
+
+message FsRenameResponse {
+  string from_path = 1;
+  string path = 2;
+  string kind = 3;
+}
+
+message FsDeleteRequest {
+  string workdir = 1;
+  string path = 2;
+}
+
+message FsDeleteResponse {
+  string path = 1;
+  string kind = 2;
+}
+
+message PingRequest {
+  int64 timestamp = 1;
+}
+
+message PongResponse {
+  int64 timestamp = 1;
+}
+
+message ErrorResponse {
+  int32 code = 1;
+  string message = 2;
+}
+
+message ProviderCustomHeader {
+  string name = 1;
+  string value = 2;
+}
+
+// 包一层 message 只为拿到字段存在性：repeated 无法区分「草稿没带」与「草稿把头
+// 清空了」，而这两种情况在已保存供应商分支上的处理相反（前者沿用落库的头，
+// 后者按空集发请求）。与 is_full_url 的 optional 同一套三态语义。
+message ProviderCustomHeaders {
+  repeated ProviderCustomHeader headers = 1;
+}
+
+message ProviderModelsRequest {
+  string provider_type = 1;
+  string base_url = 2;
+  string api_key = 3;
+  bool use_system_proxy = 4;
+  // 可选的模型列表完整地址；非空时跳过基于 base_url 的端点推导。
+  string models_url = 5;
+  // WebUI 编辑已保存供应商时用于让桌面端复用本地密钥；密钥不返回浏览器。
+  string provider_id = 6;
+  // 当前草稿是否把 base_url 作为完整聊天端点解释；未提供时沿用已保存配置。
+  optional bool is_full_url = 7;
+  // 用户在供应商设置里显式配置的自定义请求头；未提供时沿用已保存配置。
+  // 鉴权头与 host/content-length 等仍由落地侧的保留头名单兜底，不可被覆盖。
+  ProviderCustomHeaders custom_headers = 8;
+  // 供应商请求格式由 K-brain 统一执行；保存 codex/custom provider 时保留该选择。
+  string request_format = 9;
+}
+
+message ProviderModelsResponse {
+  string models_json = 1;
+}
+
+message ProviderUsageRequest {
+  string provider_id = 1;
+  bool refresh = 2;
+  // 非空时为「按草稿测试」:桌面端按此 JSON 配置(UsageQueryConfig 形状)执行
+  // 一次查询——忽略启用开关、不落库、不读写缓存;空串为常规查询。
+  string config_json = 3;
+}
+
+message ProviderUsageResponse {
+  string result_json = 1;
+}
+
+// ---- Reliable chat ingress (desktop -> gateway) ----
+
+// ChatIngressBatch carries contiguous logical records for one run. Each record
+// occupies exactly one sequence number beginning at first_seq.
+message ChatIngressBatch {
+  string run_id = 1;
+  string conversation_id = 2;
+  uint64 first_seq = 3;
+  repeated ChatIngressRecord records = 4;
+}
+
+message ChatIngressRecord {
+  oneof payload {
+    ChatIngressDelta delta = 1;
+    ChatIngressCheckpoint checkpoint = 2;
+    ChatIngressTerminal terminal = 3;
+    ChatIngressHeartbeat heartbeat = 4;
+  }
+}
+
+message ChatIngressDelta {
+  string event_json = 1;
+  string worker_id = 2;
+}
+
+message ChatIngressHeartbeat {
+  // Unix milliseconds.
+  int64 updated_at = 1;
+}
+
+message ChatIngressCheckpoint {
+  uint64 covers_through_seq = 1;
+  uint64 revision = 2;
+  bytes compressed_projection = 3;
+  uint64 uncompressed_bytes = 4;
+  string sha256 = 5;
+  bool content_complete = 6;
+  bool history_required = 7;
+}
+
+message ChatIngressTerminal {
+  uint64 covers_through_seq = 1;
+  uint64 revision = 2;
+  bytes compressed_projection = 3;
+  uint64 uncompressed_bytes = 4;
+  string sha256 = 5;
+  bool content_complete = 6;
+  bool history_required = 7;
+  string state = 8;
+  string error_code = 9;
+  string error_message = 10;
+}
+
+// ChatIngressResume declares the replay window retained by the desktop after a
+// reconnect. The gateway answers each run with ChatIngressAck.
+message ChatIngressResume {
+  repeated ChatIngressRunResume runs = 1;
+}
+
+message ChatIngressRunResume {
+  string run_id = 1;
+  string conversation_id = 2;
+  uint64 replay_from_seq = 3;
+  uint64 replay_through_seq = 4;
+  uint64 next_seq = 5;
+  uint64 latest_checkpoint_seq = 6;
+  uint64 terminal_seq = 7;
+  bool terminal_pending = 8;
+}
+
+// ChatIngressFragment transports one encoded ChatIngressRecord that exceeds a
+// normal batch frame. Fragments do not consume additional logical sequence
+// numbers; source_seq is the sequence of the reconstructed record.
+message ChatIngressFragment {
+  string run_id = 1;
+  string conversation_id = 2;
+  uint64 source_seq = 3;
+  uint32 fragment_index = 4;
+  uint32 fragment_count = 5;
+  bytes encoded_record_chunk = 6;
+  uint64 encoded_record_bytes = 7;
+  string sha256 = 8;
+}
+
+message ChatIngressAck {
+  string run_id = 1;
+  string conversation_id = 2;
+  uint64 committed_through = 3;
+  uint64 expected_next = 4;
+  Action action = 5;
+  bool terminal_committed = 6;
+  string error_code = 7;
+  string error_message = 8;
+
+  enum Action {
+    ACTION_UNSPECIFIED = 0;
+    CONTINUE = 1;
+    REPLAY_FROM_EXPECTED = 2;
+    SEND_CHECKPOINT = 3;
+    REJECTED = 4;
+  }
+}
+
+message HistorySetCwdRequest {
+  string conversation_id = 1;
+  string cwd = 2;
+}
+
+message HistorySetCwdResponse {
+  ConversationSummary conversation = 1;
+}
+
+message WorkspaceRootGrantDraft {
+  optional string id = 1;
+  string alias = 2;
+  string display_path = 3;
+  string access = 4;
+}
+
+message WorkspaceRootGrant {
+  string id = 1;
+  string project_id = 2;
+  string project_path_key = 3;
+  string alias = 4;
+  string display_path = 5;
+  string canonical_path = 6;
+  string access = 7;
+  string state = 8;
+  int64 created_at = 9;
+  int64 updated_at = 10;
+}
+
+message WorkspaceRootGrantsRequest {
+  string action = 1;
+  string project_id = 2;
+  string project_path = 3;
+  repeated WorkspaceRootGrantDraft grants = 4;
+}
+
+message WorkspaceRootGrantsResponse {
+  repeated WorkspaceRootGrant grants = 1;
+}
+
+message CheckpointExpectedEntry {
+  string key = 1;
+  string current_hash = 2;
+}
+
+message CheckpointRequest {
+  string action = 1; // "list" | "diff" | "rewind"
+  string conversation_id = 2;
+  uint64 turn_seq = 3;
+  repeated string authorized_roots = 4;
+  repeated CheckpointExpectedEntry expected = 5;
+}
+
+message CheckpointResponse {
+  string action = 1;
+  string result_json = 2;
+}
+
+message ChatConversationReference {
+  string id = 1;
+  string title = 2;
+  string cwd = 3;
+  int64 updated_at = 4;
+}
+
+// Planning payloads use the validated Rust/TypeScript domain contract.
+message PlanningRequest {
+  string action = 1;
+  string input_json = 2;
+}
+message PlanningResponse {
+  string result_json = 1;
+}
+message PlanningChanged {
+  uint64 seq = 1;
+}

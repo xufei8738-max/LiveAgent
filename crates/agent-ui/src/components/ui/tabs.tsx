@@ -1,0 +1,87 @@
+import { Tabs as TabsPrimitive } from "@base-ui/react";
+import { cva, type VariantProps } from "class-variance-authority";
+import * as React from "react";
+
+import { cn } from "../../lib/shared/utils";
+
+export const Tabs = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Root>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Root ref={ref} data-slot="tabs" className={cn(className)} {...props} />
+));
+Tabs.displayName = "Tabs";
+
+const tabsListVariants = cva(
+  "inline-flex h-8 items-center justify-center rounded-lg bg-muted p-1 text-muted-foreground",
+  {
+    variants: {
+      variant: {
+        default: "",
+        plain: "",
+        segmented: "h-9 gap-0.5 rounded-xl bg-segmented-track p-1 ring-1 ring-foreground/5",
+        filter:
+          "flex h-auto max-w-full flex-nowrap justify-start gap-1 overflow-x-auto rounded-none bg-transparent p-0 pb-0.5 [scrollbar-width:none] [&::-webkit-scrollbar]:hidden",
+      },
+    },
+    defaultVariants: { variant: "default" },
+  },
+);
+
+export const TabsList = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.List> & VariantProps<typeof tabsListVariants>
+>(({ className, variant, ...props }, ref) => (
+  <TabsPrimitive.List
+    ref={ref}
+    data-slot="tabs-list"
+    className={cn(variant !== "plain" && tabsListVariants({ variant }), className)}
+    {...props}
+  />
+));
+TabsList.displayName = "TabsList";
+
+export const TabsTrigger = React.forwardRef<
+  HTMLElement,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Tab> & {
+    variant?: "default" | "plain" | "segmented";
+  }
+>(({ className, variant = "default", ...props }, ref) => (
+  <TabsPrimitive.Tab
+    ref={ref}
+    data-slot="tabs-trigger"
+    className={cn(
+      variant !== "plain" && [
+        "inline-flex min-h-6 items-center justify-center whitespace-nowrap rounded-md px-3 py-1",
+        "text-sm font-medium transition-colors",
+        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:pointer-events-none disabled:opacity-50 data-[active]:bg-background data-[active]:text-foreground data-[active]:shadow-sm",
+      ],
+      variant === "segmented" && [
+        "h-7 min-w-9 rounded-lg px-2.5 py-0 text-xs font-normal text-muted-foreground",
+        "hover:bg-control-surface hover:text-foreground",
+        "data-[active]:bg-segmented-selected data-[active]:font-medium data-[active]:text-foreground",
+        "dark:data-[active]:[&_.text-muted-foreground]:text-foreground/75",
+        "data-[active]:shadow-none",
+      ],
+      className,
+    )}
+    {...props}
+  />
+));
+TabsTrigger.displayName = "TabsTrigger";
+
+export const TabsContent = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof TabsPrimitive.Panel>
+>(({ className, ...props }, ref) => (
+  <TabsPrimitive.Panel
+    ref={ref}
+    data-slot="tabs-content"
+    className={cn(
+      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring data-[hidden]:hidden",
+      className,
+    )}
+    {...props}
+  />
+));
+TabsContent.displayName = "TabsContent";

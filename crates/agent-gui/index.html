@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="light dark" />
+    <script>
+      (() => {
+        let theme = "system";
+        try {
+          const saved = JSON.parse(localStorage.getItem("liveagent.ui-settings.v1") || "null");
+          if (saved?.theme === "light" || saved?.theme === "dark" || saved?.theme === "system") {
+            theme = saved.theme;
+          }
+        } catch {}
+        const media = window.matchMedia("(prefers-color-scheme: dark)");
+        const apply = () => {
+          const dark = theme === "dark" || (theme === "system" && media.matches);
+          document.documentElement.classList.toggle("dark", dark);
+        };
+        apply();
+        // Follow OS theme changes while the boot screen is visible; once React
+        // mounts, App.tsx owns the `.dark` class and this listener is removed.
+        if (theme === "system") {
+          media.addEventListener?.("change", apply);
+          window.__liveagentBootThemeCleanup = () => media.removeEventListener?.("change", apply);
+        }
+      })();
+    </script>
+    <style>
+      /* Keep --background / --foreground in sync with
+         crates/agent-ui/src/styles/tokens.css so the boot screen matches the
+         main UI; the stylesheet redefines the same tokens once it loads. */
+      :root {
+        color-scheme: light;
+        --background: 0 0% 100%;
+        --foreground: 222.2 84% 4.9%;
+      }
+      html.dark {
+        color-scheme: dark;
+        --background: 0 0% 9.4%;
+        --foreground: 0 0% 98%;
+      }
+      html,
+      body,
+      #root {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        background: hsl(var(--background));
+      }
+      body {
+        overflow: hidden;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      }
+      .app-boot-screen {
+        display: flex;
+        width: 100%;
+        height: 100%;
+        align-items: center;
+        justify-content: center;
+        overflow: hidden;
+        background: hsl(var(--background));
+      }
+      .app-boot-content {
+        display: flex;
+        width: min(480px, calc(100vw - 48px));
+        text-align: center;
+        color: hsl(var(--foreground));
+        flex-direction: column;
+        align-items: center;
+        gap: 24px;
+      }
+      .app-boot-icon {
+        display: block;
+        width: 76px;
+        height: 76px;
+        filter: drop-shadow(0 10px 22px rgba(7, 45, 78, 0.14));
+      }
+      .app-boot-progress {
+        width: 128px;
+        height: 3px;
+        overflow: hidden;
+        border-radius: 999px;
+        background: hsl(var(--foreground) / 0.08);
+      }
+      .app-boot-progress > span {
+        display: block;
+        width: 40%;
+        height: 100%;
+        border-radius: inherit;
+        background: hsl(var(--foreground) / 0.45);
+        animation: app-boot-progress 1.1s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+      }
+      @keyframes app-boot-progress {
+        0% {
+          transform: translateX(-120%);
+        }
+        100% {
+          transform: translateX(320%);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .app-boot-progress > span {
+          animation: none;
+          width: 100%;
+          opacity: 0.55;
+        }
+      }
+      .app-boot-title { margin: 0; font-size: 18px; font-weight: 600; }
+      .app-boot-detail, .app-boot-counts, .app-boot-source, .app-boot-time, .app-boot-waiting { margin: 0; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+      .app-boot-detail { min-height: 42px; opacity: .7; }
+      .app-boot-statistics { width: 100%; min-height: 96px; display: grid; gap: 4px; }
+      .app-boot-source, .app-boot-time { opacity: .6; }
+      .app-boot-time { font-variant-numeric: tabular-nums; }
+      .app-boot-waiting { min-height: 42px; opacity: .75; }
+      .app-boot-retry { font: inherit; color: inherit; background: transparent; border: 1px solid hsl(var(--foreground) / .25); border-radius: 8px; padding: 8px 24px; cursor: pointer; }
+      .app-boot-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; }
+      .app-boot-retry[hidden] { display: none; }
+      .app-boot-retry:disabled { cursor: default; opacity: .5; }
+      [data-boot-failed] .app-boot-progress > span { animation: none; opacity: .35; }
+    </style>
+    <link rel="icon" type="image/svg+xml" href="/favicon.svg" />
+    <title>LiveAgent</title>
+  </head>
+
+  <body>
+    <div id="root">
+      <div class="app-boot-screen" data-static-boot-shell="" aria-label="正在加载 LiveAgent" aria-busy="true">
+        <div class="app-boot-content">
+          <img class="app-boot-icon" src="/src-tauri/icons/icon-simple.png" alt="" />
+          <div class="app-boot-progress" aria-hidden="true"><span></span></div>
+          <h1 class="app-boot-title" data-boot-title="" aria-live="polite">正在启动 LiveAgent</h1>
+          <p class="app-boot-detail" data-boot-detail="">正在准备启动环境…</p>
+          <div class="app-boot-statistics">
+            <p class="app-boot-counts" data-boot-counts=""></p>
+            <p class="app-boot-source" data-boot-legacy=""></p>
+            <p class="app-boot-source" data-boot-pi=""></p>
+          </div>
+          <p class="app-boot-time" data-boot-elapsed="" aria-live="off"></p>
+          <p class="app-boot-waiting" data-boot-waiting="" aria-live="polite"></p>
+          <div class="app-boot-actions">
+            <button class="app-boot-retry" data-boot-retry="" type="button" hidden>重试</button>
+            <button class="app-boot-retry" data-boot-skip="" type="button" hidden>跳过，进入应用</button>
+          </div>
+        </div>
+      </div>
+    </div>
+    <script>
+      (() => {
+        try {
+          const locale = JSON.parse(localStorage.getItem("liveagent.ui-settings.v1") || "null")?.locale;
+          if (locale === "en" || locale === "en-US") {
+            document.documentElement.lang = "en";
+            document.querySelector("[data-boot-title]").textContent = "Starting LiveAgent";
+            document.querySelector("[data-boot-detail]").textContent = "Preparing your startup environment…";
+            document.querySelector("[data-static-boot-shell]").setAttribute("aria-label", "LiveAgent startup progress");
+          }
+        } catch {}
+        performance.mark?.("liveagent:static-shell-ready");
+        const reveal = (attempt = 0) => {
+          const invoke = window.__TAURI_INTERNALS__?.invoke;
+          if (typeof invoke !== "function") {
+            if (attempt < 80) window.setTimeout(() => reveal(attempt + 1), 25);
+            return;
+          }
+          invoke("app_frontend_ready").catch(() => {
+            if (attempt < 80) window.setTimeout(() => reveal(attempt + 1), 25);
+          });
+        };
+        void document.documentElement.offsetHeight;
+        let revealed = false;
+        const revealOnce = () => {
+          if (revealed) return;
+          revealed = true;
+          performance.mark?.("liveagent:first-paint-ready");
+          reveal();
+        };
+        const revealFallback = window.setTimeout(revealOnce, 250);
+        window.requestAnimationFrame(() => {
+          window.requestAnimationFrame(() => {
+            window.clearTimeout(revealFallback);
+            revealOnce();
+          });
+        });
+      })();
+    </script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

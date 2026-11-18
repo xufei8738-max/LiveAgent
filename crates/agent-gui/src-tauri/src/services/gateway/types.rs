@@ -1,0 +1,230 @@
+use serde::{Deserialize, Serialize};
+
+use super::*;
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayStatusSnapshot {
+    pub online: bool,
+    pub enabled: bool,
+    pub configured: bool,
+    pub gateway_url: String,
+    pub agent_id: String,
+    pub session_id: Option<String>,
+    pub connected_since: Option<i64>,
+    pub last_heartbeat: Option<i64>,
+    pub last_error: Option<String>,
+    /// 协议链路；当前连接固定为 "v2"（WebSocket+Protobuf），未连接时为 None。
+    pub protocol: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewaySelectedModelEvent {
+    pub custom_provider_id: String,
+    pub model: String,
+    pub provider_type: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatRuntimeControlsEvent {
+    pub thinking_enabled: bool,
+    pub native_web_search_enabled: bool,
+    pub reasoning: String,
+    pub plan_mode_enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayUploadedFileEvent {
+    pub relative_path: String,
+    pub absolute_path: String,
+    pub file_name: String,
+    pub kind: String,
+    pub size_bytes: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatMessageRefEvent {
+    pub segment_index: i32,
+    pub message_index: i32,
+    pub segment_id: String,
+    pub message_id: String,
+    pub role: String,
+    pub content_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayConversationReferenceEvent {
+    pub id: String,
+    pub title: String,
+    pub cwd: String,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatRequestEvent {
+    pub request_id: String,
+    pub conversation_id: String,
+    pub client_request_id: String,
+    pub message: String,
+    pub rebased: bool,
+    pub base_message_ref: Option<GatewayChatMessageRefEvent>,
+    pub selected_model: Option<GatewaySelectedModelEvent>,
+    pub runtime_controls: Option<GatewayChatRuntimeControlsEvent>,
+    pub execution_mode: String,
+    pub workdir: String,
+    /// 远端 WebUI 直带的命令安全模式(ask/auto/sandbox/sandboxOffline);空串表示
+    /// 未指定,桌面端回落到本地 settings.system.commandSafetyMode。
+    pub command_safety_mode: String,
+    pub uploaded_files: Vec<GatewayUploadedFileEvent>,
+    pub referenced_conversations: Vec<GatewayConversationReferenceEvent>,
+    pub queue_policy: String,
+    /// WebUI 输入框“/”指令：goal 动作（set/resume）、目标正文，以及本条
+    /// message 是否为提示词指令（由 K-brain 展开，历史保留原文）。
+    pub goal_action: String,
+    pub goal_text: String,
+    pub prompt_command: bool,
+    pub plan_command: bool,
+}
+
+pub(crate) fn is_complete_user_chat_message_ref(ref_value: &proto::ChatMessageRef) -> bool {
+    ref_value.segment_index >= 0
+        && ref_value.message_index >= 0
+        && !ref_value.segment_id.trim().is_empty()
+        && !ref_value.message_id.trim().is_empty()
+        && ref_value.role.trim() == "user"
+        && !ref_value.content_hash.trim().is_empty()
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct GatewayChatCancelEvent {
+    pub(crate) request_id: String,
+    pub(crate) conversation_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatQueueRequestEvent {
+    pub request_id: String,
+    pub action: String,
+    pub conversation_id: String,
+    pub item_id: String,
+    pub direction: String,
+    pub revision: u64,
+    pub draft_json: String,
+    pub uploaded_files_json: String,
+    pub request_json: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatQueueResponseInput {
+    pub request_id: String,
+    #[serde(default)]
+    pub accepted: bool,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub snapshot_json: String,
+    #[serde(default)]
+    pub item_json: String,
+    #[serde(default)]
+    pub error_code: String,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatQueueEventInput {
+    pub conversation_id: String,
+    pub snapshot_json: String,
+    #[serde(default)]
+    pub revision: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayChatClaimedRequest {
+    pub request_id: String,
+    pub client_request_id: String,
+    pub conversation_id: String,
+    pub state: String,
+    pub attempt: u32,
+    pub lease_ms: u64,
+    pub request: GatewayChatRequestEvent,
+}
+
+pub const CHAT_HISTORY_SYNC_EVENT: &str = "chat-history:changed";
+pub const GATEWAY_SETTINGS_SYNC_EVENT: &str = "gateway:settings-sync";
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncConversation {
+    pub id: String,
+    pub title: String,
+    pub provider_id: Option<String>,
+    pub model: Option<String>,
+    pub session_id: Option<String>,
+    pub cwd: Option<String>,
+    pub selected_model_json: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub message_count: i64,
+    pub is_pinned: bool,
+    pub pinned_at: Option<i64>,
+    pub is_shared: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncEvent {
+    pub kind: String,
+    pub conversation_id: String,
+    pub conversation: Option<GatewayHistorySyncConversation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncWorkdir {
+    pub path: String,
+    pub conversation_count: i32,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncEventInput {
+    pub kind: String,
+    pub conversation_id: String,
+    pub conversation: Option<GatewayHistorySyncConversation>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncPublishInput {
+    pub kind: String,
+    pub source_id: String,
+    pub generation: String,
+    pub delivery_seq: u64,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub conversations: Vec<GatewayHistorySyncConversation>,
+    #[serde(default)]
+    pub workdirs: Vec<GatewayHistorySyncWorkdir>,
+    pub event: Option<GatewayHistorySyncEventInput>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayHistorySyncPublishResult {
+    pub accepted: bool,
+    pub needs_resync: bool,
+}

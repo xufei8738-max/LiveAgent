@@ -1,0 +1,136 @@
+import {
+  GenerationStoppedNotice,
+  isStoppedReply,
+} from "@liveagent/ui/components/chat/AssistantStatus";
+import { ChangedFilesCard } from "@liveagent/ui/components/chat/ChangedFilesCard";
+import { collectChangedFiles } from "@liveagent/ui/lib/chat/changedFiles";
+import type { ChatFileLink } from "@liveagent/ui/lib/chat/chatFileLinks";
+import type { ConversationMentionReference } from "@liveagent/ui/lib/chat/mentionReferences";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import { memo, useMemo } from "react";
+import type { HistoryMessageRef } from "../../../lib/chat/conversation/conversationState";
+import type { RetryAttemptRecord } from "../../../lib/chat/conversation/liveTranscriptStore";
+import { AssistantBubbleUnit } from "../components/AssistantBubble";
+import { AssistantRowFooter } from "./RowActions";
+import { useReplyHovered } from "./rowInteraction";
+import type { AssistantFooterRenderUnit, AssistantUnitRow } from "./rowModel";
+
+export type AssistantRenderUnitProps = {
+  row: AssistantUnitRow;
+  showUsage?: boolean;
+  usageContextWindow?: number;
+  isCompactionRunning: boolean;
+  awaitingDecision?: boolean;
+  toolStatus: string | null;
+  retryAttempts?: RetryAttemptRecord[];
+  workdir?: string;
+  onOpenFileLink?: (link: ChatFileLink) => void;
+  onResendFromEdit: (
+    messageRef: HistoryMessageRef,
+    text: string,
+    attachments: PendingUploadedFile[],
+    referencedConversations: ConversationMentionReference[],
+  ) => void;
+  onBranchConversation?: (messageRef: HistoryMessageRef) => void;
+};
+
+const AssistantFooterUnit = memo(function AssistantFooterUnit(props: {
+  unit: AssistantFooterRenderUnit;
+  replyKey: string;
+  compacted: boolean;
+  showUsage?: boolean;
+  usageContextWindow?: number;
+  onResendFromEdit: AssistantRenderUnitProps["onResendFromEdit"];
+  onBranchConversation?: AssistantRenderUnitProps["onBranchConversation"];
+}) {
+  const { unit, compacted, showUsage, usageContextWindow, onResendFromEdit, onBranchConversation } =
+    props;
+  const actionsVisible = useReplyHovered(props.replyKey);
+  const changedFiles = useMemo(
+    () => (unit.hasChangedFilesCandidate ? collectChangedFiles(unit.rounds) : null),
+    [unit.hasChangedFilesCandidate, unit.rounds],
+  );
+  const usageEntries = useMemo(
+    () =>
+      showUsage
+        ? unit.rounds.flatMap((round) =>
+            round.meta?.usage ? [{ key: round.key, usage: round.meta.usage }] : [],
+          )
+        : undefined,
+    [showUsage, unit.rounds],
+  );
+
+  return (
+    <div
+      data-actions-visible={actionsVisible ? "true" : undefined}
+      data-assistant-row
+      className={cn("group/assistant w-full max-w-full", compacted && "opacity-70")}
+    >
+      {isStoppedReply(unit.rounds) ? <GenerationStoppedNotice className="mb-1" /> : null}
+      {changedFiles ? (
+        <div className="w-full max-w-full">
+          <div className="min-w-0">
+            <ChangedFilesCard summary={changedFiles} />
+          </div>
+        </div>
+      ) : null}
+      <AssistantRowFooter
+        timestamp={unit.timestamp}
+        replyText={unit.replyText}
+        usageEntries={usageEntries}
+        usageContextWindow={showUsage ? usageContextWindow : undefined}
+        retryTarget={unit.retryTarget}
+        onResendFromEdit={onResendFromEdit}
+        onBranchConversation={onBranchConversation}
+      />
+    </div>
+  );
+});
+
+export const AssistantRenderUnit = memo(function AssistantRenderUnit(
+  props: AssistantRenderUnitProps,
+) {
+  const {
+    row,
+    showUsage,
+    usageContextWindow,
+    isCompactionRunning,
+    awaitingDecision,
+    toolStatus,
+    retryAttempts,
+    workdir,
+    onOpenFileLink,
+    onResendFromEdit,
+    onBranchConversation,
+  } = props;
+  const compactedClass = row.compacted ? "opacity-70" : "";
+
+  if (row.unit.kind === "footer") {
+    return (
+      <AssistantFooterUnit
+        unit={row.unit}
+        compacted={row.compacted}
+        showUsage={showUsage}
+        usageContextWindow={usageContextWindow}
+        replyKey={row.replyKey}
+        onResendFromEdit={onResendFromEdit}
+        onBranchConversation={onBranchConversation}
+      />
+    );
+  }
+
+  return (
+    <div className={cn("group/assistant w-full max-w-full", compactedClass)} data-assistant-row>
+      <AssistantBubbleUnit
+        row={row}
+        isCompactionRunning={isCompactionRunning}
+        awaitingDecision={awaitingDecision}
+        toolStatus={toolStatus}
+        retryAttempts={retryAttempts}
+        workdir={workdir}
+        onOpenFileLink={onOpenFileLink}
+      />
+    </div>
+  );
+});

@@ -1,0 +1,201 @@
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Map, Number, Value};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
+    time::{Duration, SystemTime, UNIX_EPOCH},
+};
+use uuid::Uuid;
+
+use crate::runtime::project_path::project_path_key as normalize_project_path_key;
+use crate::services::automation::AutomationScheduler;
+use crate::services::gateway::GatewayController;
+
+const DB_FILENAME: &str = "config.sqlite";
+const DEFAULT_PROJECT_DIRNAME: &str = "default-project";
+const PROVIDER_SETTINGS_TABLE: &str = "provider_settings";
+const SYSTEM_SETTINGS_TABLE: &str = "system_settings";
+const MCP_SETTINGS_TABLE: &str = "mcp_settings";
+const AGENT_PROMPT_TEMPLATES_TABLE: &str = "agent_prompt_templates";
+const SSH_SETTINGS_TABLE: &str = "ssh_settings";
+const SSH_PROJECT_HOST_ASSOCIATIONS_TABLE: &str = "ssh_project_host_associations";
+const SSH_KNOWN_HOSTS_TABLE: &str = "ssh_known_hosts";
+const REMOTE_SETTINGS_TABLE: &str = "remote_settings";
+const MEMORY_SETTINGS_TABLE: &str = "memory_settings";
+const MODEL_FAILOVER_SETTINGS_TABLE: &str = "model_failover_settings";
+const STT_SETTINGS_TABLE: &str = "stt_settings";
+// WebDAV 同步配置。刻意独立成表而不寄居 system_settings —— 后者的 save_system
+// 会 DELETE 整表再按固定白名单重建，任何不在白名单的 key 都会被静默抹掉。
+// 独立表还顺带保证它不被 load_system 采进配置快照，避免 A 机器的凭据同步覆盖 B 机器。
+const BACKUP_SYNC_SETTINGS_TABLE: &str = "backup_sync_settings";
+
+const SYSTEM_EXECUTION_MODE_KEY: &str = "executionMode";
+const SYSTEM_WORKDIR_KEY: &str = "workdir";
+// 工具审批策略(按工具名/`group:`/`server:` 键 → allow/ask/deny)。此前未纳入
+// 保存白名单,导致重启后设置丢失;补入本键持久化。
+const SYSTEM_TOOL_POLICIES_KEY: &str = "toolPolicies";
+// 命令执行方式与前端
+// SystemSettings.commandSafetyMode 对齐;sandbox* 由执行层映射为 OS 沙箱参数。
+const SYSTEM_COMMAND_SAFETY_MODE_KEY: &str = "commandSafetyMode";
+// 浏览器接入模式("auto"/"userProfile"/"isolated"),与前端
+// SystemSettings.browserAutomationMode 对齐;Browser 工具按调用透传给
+// BrowserManager,决定走扩展桥接(用户浏览器)还是独立 profile。
+const SYSTEM_BROWSER_AUTOMATION_MODE_KEY: &str = "browserAutomationMode";
+const SYSTEM_WORKSPACE_PROJECTS_KEY: &str = "workspaceProjects";
+const SYSTEM_WORKSPACE_PROJECT_GROUPS_KEY: &str = "workspaceProjectGroups";
+const SYSTEM_WORKSPACE_PROJECT_ORDER_KEY: &str = "workspaceProjectOrder";
+const SYSTEM_SIDEBAR_PINNED_ORDER_KEY: &str = "sidebarPinnedOrder";
+const SYSTEM_ACTIVE_WORKSPACE_PROJECT_ID_KEY: &str = "activeWorkspaceProjectId";
+const SYSTEM_HIDDEN_WORKSPACE_PROJECT_PATHS_KEY: &str = "hiddenWorkspaceProjectPaths";
+const SYSTEM_MISSING_WORKSPACE_PROJECT_PATHS_KEY: &str = "missingWorkspaceProjectPaths";
+const SYSTEM_ARCHIVED_WORKSPACE_PROJECT_PATHS_KEY: &str = "archivedWorkspaceProjectPaths";
+const SYSTEM_WORKSPACE_RESOURCE_SETTINGS_KEY: &str = "workspaceResourceSettings";
+const SYSTEM_SYSTEM_PROXY_KEY: &str = "systemProxy";
+// CUA 自指开关。默认 false —— cua-driver 的工具默认看不到、也点不到
+// LiveAgent 自己的窗口：让模型操作宿主界面等于让它能点掉自己的审批弹窗、
+// 改自己的设置、关掉自己。置 true 才解除（用 LiveAgent 自动化测试
+// LiveAgent 这类场景需要）。
+const SYSTEM_CUA_ALLOW_SELF_TARGETING_KEY: &str = "cuaAllowSelfTargeting";
+// 全局默认时区(IANA 名,"" = 自动跟随桌面端 OS 时区)。日程快照、Cron 调度与
+// 记忆后台日期计算统一经 `load_runtime_default_time_zone` 解析。
+const SYSTEM_DEFAULT_TIME_ZONE_KEY: &str = "defaultTimeZone";
+// 只读派生值:load 时注入「自动」档解析到的桌面 OS 时区,供前端(含 WebUI)展示与
+// 回退;不进保存白名单。
+const SYSTEM_RESOLVED_TIME_ZONE_KEY: &str = "resolvedTimeZone";
+const DEFAULT_WORKSPACE_PROJECT_ID: &str = "default-project";
+const DEFAULT_WORKSPACE_PROJECT_NAME: &str = "Default Project";
+pub(crate) const PROVIDER_API_KEY_UPDATES_FIELD: &str = "providerApiKeyUpdates";
+pub(crate) const PROVIDER_USAGE_QUERY_SECRET_UPDATES_FIELD: &str =
+    "providerUsageQuerySecretUpdates";
+pub(crate) const SYSTEM_PROXY_PASSWORD_UPDATE_FIELD: &str = "systemProxyPasswordUpdate";
+pub(crate) const SSH_SECRET_UPDATES_FIELD: &str = "sshSecretUpdates";
+pub(crate) const SSH_PATCH_FIELD: &str = "sshPatch";
+/// 仅用于已认证桌面 Agent → Gateway 的后端同步；Gateway 必须在任何 Web 广播前移除。
+pub(crate) const STT_SECRET_SYNC_FIELD: &str = "sttSecretSync";
+pub(crate) const STT_SECRET_UPDATE_FIELD: &str = "sttSecretUpdate";
+
+const PROVIDER_SETTINGS_SELECT_SQL: &str = "
+    SELECT provider_id, payload_json
+    FROM provider_settings
+    ORDER BY sort_index ASC, provider_id ASC
+";
+const PROVIDER_SETTINGS_INSERT_SQL: &str = "
+    INSERT INTO provider_settings (provider_id, payload_json, sort_index, updated_at)
+    VALUES (?1, ?2, ?3, ?4)
+";
+const PROVIDER_SETTINGS_DELETE_SQL: &str = "DELETE FROM provider_settings";
+
+const SYSTEM_SETTINGS_SELECT_SQL: &str = "
+    SELECT setting_key, payload_json
+    FROM system_settings
+";
+const SYSTEM_SETTINGS_INSERT_SQL: &str = "
+    INSERT INTO system_settings (setting_key, payload_json, updated_at)
+    VALUES (?1, ?2, ?3)
+";
+const SYSTEM_SETTINGS_DELETE_SQL: &str = "DELETE FROM system_settings";
+
+const MCP_SETTINGS_SELECT_SQL: &str = "
+    SELECT server_id, payload_json
+    FROM mcp_settings
+    ORDER BY sort_index ASC, server_id ASC
+";
+const MCP_SETTINGS_INSERT_SQL: &str = "
+    INSERT INTO mcp_settings (server_id, payload_json, sort_index, updated_at)
+    VALUES (?1, ?2, ?3, ?4)
+";
+const MCP_SETTINGS_DELETE_SQL: &str = "DELETE FROM mcp_settings";
+
+const AGENT_PROMPT_TEMPLATES_SELECT_SQL: &str = "
+    SELECT template_id, name, description, prompt, enabled
+    FROM agent_prompt_templates
+    ORDER BY sort_index ASC, template_id ASC
+";
+const AGENT_PROMPT_TEMPLATES_INSERT_SQL: &str = "
+    INSERT INTO agent_prompt_templates
+        (template_id, name, description, prompt, enabled, sort_index, updated_at)
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+";
+const AGENT_PROMPT_TEMPLATES_DELETE_SQL: &str = "DELETE FROM agent_prompt_templates";
+
+const SSH_SETTINGS_SELECT_SQL: &str = "
+    SELECT
+        host_id,
+        name,
+        description,
+        host,
+        port,
+        username,
+        auth_type,
+        password,
+        password_configured,
+        private_key,
+        private_key_path,
+        private_key_configured,
+        private_key_passphrase,
+        private_key_passphrase_configured,
+        proxy_json
+    FROM ssh_settings
+    ORDER BY sort_index ASC, host_id ASC
+";
+const SSH_SETTINGS_INSERT_SQL: &str = "
+    INSERT INTO ssh_settings (
+        host_id,
+        name,
+        description,
+        host,
+        port,
+        username,
+        auth_type,
+        password,
+        password_configured,
+        private_key,
+        private_key_path,
+        private_key_configured,
+        private_key_passphrase,
+        private_key_passphrase_configured,
+        proxy_json,
+        sort_index,
+        updated_at
+    )
+    VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+";
+const SSH_SETTINGS_DELETE_SQL: &str = "DELETE FROM ssh_settings";
+const SSH_PROJECT_HOST_ASSOCIATIONS_SELECT_SQL: &str = "
+    SELECT project_path_key, host_ids_json
+    FROM ssh_project_host_associations
+    ORDER BY project_path_key ASC
+";
+const SSH_PROJECT_HOST_ASSOCIATIONS_INSERT_SQL: &str = "
+    INSERT INTO ssh_project_host_associations (project_path_key, host_ids_json, updated_at)
+    VALUES (?1, ?2, ?3)
+";
+const SSH_PROJECT_HOST_ASSOCIATIONS_DELETE_SQL: &str = "DELETE FROM ssh_project_host_associations";
+const SSH_KNOWN_HOSTS_DELETE_SQL: &str = "
+    DELETE FROM ssh_known_hosts
+    WHERE host = ?1 AND port = ?2
+";
+
+include!("types.rs");
+include!("remote.rs");
+include!("db.rs");
+include!("json.rs");
+include!("providers.rs");
+include!("ccs_import.rs");
+include!("cherry_import.rs");
+include!("agents.rs");
+include!("system.rs");
+include!("mcp.rs");
+include!("memory_settings.rs");
+include!("model_failover.rs");
+include!("stt.rs");
+include!("gateway_sync.rs");
+include!("backup_snapshot.rs");
+include!("backup_io.rs");
+include!("webdav_sync.rs");
+include!("ssh/mod.rs");
+include!("commands.rs");
+include!("tests.rs");

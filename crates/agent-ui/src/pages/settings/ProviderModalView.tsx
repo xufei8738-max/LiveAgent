@@ -1,0 +1,2105 @@
+import { getUsagePlanDisplay } from "@liveagent/app/lib/providers/usageQuery";
+import {
+  CODEX_REQUEST_FORMAT_LABELS,
+  type CodexRequestFormat,
+  PROMPT_CACHE_HINT_MODES,
+  type PromptCacheHintMode,
+  type UsageQueryMode,
+} from "@liveagent/app/lib/settings";
+import {
+  AudioLines,
+  ChevronDown,
+  ClipboardPaste,
+  ExternalLink,
+  Eye,
+  EyeOff,
+  FileText,
+  Fingerprint,
+  ImageIcon,
+  Key,
+  Link2,
+  List,
+  Plus,
+  RefreshCw,
+  Search,
+  Settings,
+  Trash2,
+  Video,
+  X,
+} from "@liveagent/ui/components/IconSet";
+import {
+  FormField,
+  FormFieldDescription,
+  FormFieldLabel,
+} from "@liveagent/ui/components/settings/FormField";
+import { SettingsHint } from "@liveagent/ui/components/settings/SettingsPanel";
+import {
+  SettingsToggleGroup,
+  SettingsToggleGroupItem,
+} from "@liveagent/ui/components/settings/SettingsToggleGroup";
+import { Button, RefreshButton } from "@liveagent/ui/components/ui/button";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@liveagent/ui/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@liveagent/ui/components/ui/dropdown-menu";
+import { Input } from "@liveagent/ui/components/ui/input";
+import { Label } from "@liveagent/ui/components/ui/label";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@liveagent/ui/components/ui/select";
+import { Switch } from "@liveagent/ui/components/ui/switch";
+import { Textarea } from "@liveagent/ui/components/ui/textarea";
+import { VerticalReorderList } from "@liveagent/ui/components/ui/VerticalReorderList";
+import {
+  type CatalogInputModality,
+  resolveModelInputModalities,
+} from "@liveagent/ui/lib/models/modelCatalog";
+import {
+  CLI_IDENTITY_USER_AGENTS,
+  isCliIdentityProviderId,
+  listCliIdentityProviderIds,
+} from "@liveagent/ui/lib/providers/customHeaders";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import {
+  applyUsageQueryModePreset,
+  formatTokenCount,
+  modelIsImage,
+  setUsageQueryScript,
+  USAGE_QUERY_CODING_PLAN_PROVIDERS,
+} from "@liveagent/ui/pages/settings/providerUtils";
+import { ProviderHeaderNameInput } from "./ProviderHeaderNameInput";
+import type { ProviderModalViewModel } from "./ProviderModal";
+import {
+  customHeaderIssueMessage,
+  DialogSwitch,
+  getCustomHeaderIssue,
+  getProviderLabel,
+  PROMPT_CACHE_HINT_LABEL_KEYS,
+  PROVIDER_TABS,
+  ProviderBrandIcon,
+  USAGE_QUERY_SCRIPT_HELP_EXAMPLE,
+  UsagePlanLine,
+} from "./ProviderPresentation";
+
+// 模型行右侧的输入模态图标：text 是所有模型的公共能力不单独标注，只展示
+// 额外的模态（图片/音频/视频/PDF），按目录的规范顺序排列。
+const MODEL_MODALITY_ICONS = [
+  { modality: "image", Icon: ImageIcon, labelKey: "settings.modelModalityImage" },
+  { modality: "audio", Icon: AudioLines, labelKey: "settings.modelModalityAudio" },
+  { modality: "video", Icon: Video, labelKey: "settings.modelModalityVideo" },
+  { modality: "pdf", Icon: FileText, labelKey: "settings.modelModalityPdf" },
+] as const;
+
+export function ProviderModalView({ viewModel }: { viewModel: ProviderModalViewModel }) {
+  const {
+    activeCodingPlanProvider,
+    activeModels,
+    activePanel,
+    setProviderType,
+    addCustomHeader,
+    addingModel,
+    allVisibleModelsActive,
+    apiKey,
+    apiKeyForRequest,
+    apiKeyIsRedactedDisplay,
+    applyCliIdentityHeaders,
+    baseUrl,
+    canOverrideModelInputModalities,
+    canToggleEditingModelImage,
+    canSaveEditingModel,
+    cancelCustomHeaderImport,
+    commitUsageTimeoutInput,
+    customHeaders,
+    editingModel,
+    editingModelContextWindow,
+    editingModelImageMode,
+    editingModelInputModalitiesMode,
+    editingModelMaxOutputToken,
+    fetchError,
+    fetchingModels,
+    focusCustomHeader,
+    handleAddModel,
+    handleImportCustomHeaders,
+    handleModelDraggingChange,
+    handleModelReorder,
+    handleRefresh,
+    handleSave,
+    handleTestUsageQuery,
+    headerImportErrorMessage,
+    headerImportOpen,
+    headerImportSummaryMessage,
+    headerImportText,
+    headerIssueMessage,
+    headerKeyPresets,
+    headerKeyRefs,
+    headerValidationSubmitted,
+    headerValueRefs,
+    baseUrlInvalid,
+    dialogOpen,
+    isEditing,
+    isFullUrl,
+    isGatewayWebui,
+    matchedBalanceProviders,
+    modelReorderDisabledHint,
+    modelSearch,
+    modelSearchQuery,
+    models,
+    modelsUrl,
+    name,
+    newModelName,
+    newModelPhases,
+    onClose,
+    openModelSettings,
+    persistedUsageQueryProviderId,
+    promptCacheHintMode,
+    promptCacheRetention,
+    promptCachingEnabled,
+    providerType,
+    removeCustomHeader,
+    removeModel,
+    clearVisibleModels,
+    requestClose,
+    requestFormat,
+    saveInlineModelSettings,
+    setActivePanel,
+    setAddingModel,
+    setApiKey,
+    setBaseUrl,
+    setEditingModel,
+    setEditingModelImageMode,
+    setEditingModelInputModalitiesMode,
+    setHeaderImportError,
+    setHeaderImportOpen,
+    setHeaderImportSummary,
+    setHeaderImportText,
+    setIsFullUrl,
+    setModelSearch,
+    setModelsUrl,
+    setName,
+    setNewModelName,
+    setPromptCacheHintMode,
+    setPromptCacheRetention,
+    setPromptCachingEnabled,
+    setRequestFormat,
+    setShowApiKey: _setShowApiKey,
+    toggleShowApiKey,
+    revealingApiKey,
+    revealApiKeyError,
+    setShowUsageVariableApiKey,
+    setStreamRetryCountInput,
+    setStreamRetryMode,
+    setUsageQuery,
+    setUsageTimeoutInput,
+    setUseSystemProxy,
+    showApiKey,
+    showUsageVariableApiKey,
+    streamRetryCountInput,
+    streamRetryMode,
+    commitStreamRetryCountInput,
+    t,
+    toggleModel,
+    toggleVisibleModelsActive,
+    typeLabel,
+    updateCustomHeader,
+    usageQuery,
+    confirmDialog,
+    usageQueryTest,
+    usageTimeoutInput,
+    usageVariableApiKey,
+    usageVariableBaseUrl,
+    useSystemProxy,
+    visibleActiveCount,
+    visibleModels,
+  } = viewModel;
+  const visibleModelById = new Map(visibleModels.map((model) => [model.id, model]));
+  return (
+    <Dialog
+      open={dialogOpen}
+      onOpenChange={(open) => {
+        if (!open) requestClose();
+      }}
+      onOpenChangeComplete={(open) => {
+        if (!open) onClose();
+      }}
+    >
+      <DialogContent
+        className="flex h-[min(900px,calc(100dvh-48px))] max-w-6xl flex-col p-0"
+        closeLabel={t("settings.close")}
+        layout="fullscreen-mobile"
+      >
+        <DialogHeader className="flex-row flex-wrap items-center gap-3 border-0">
+          <div className="flex min-w-0 items-center gap-3">
+            <div className="flex size-9 shrink-0 items-center justify-center text-xl text-foreground">
+              <ProviderBrandIcon type={providerType} />
+            </div>
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <DialogTitle className="text-sm leading-normal">
+                {isEditing ? t("settings.editProvider") : t("settings.addProvider")}
+              </DialogTitle>
+              <span className="rounded-full border bg-muted/60 px-2.5 py-0.5 text-xs text-muted-foreground">
+                {typeLabel} {t("settings.compatible")}
+              </span>
+            </div>
+          </div>
+          <div className="ml-auto flex flex-wrap items-center justify-end gap-2">
+            <div className="mr-auto flex items-center gap-1">
+              <Button variant="ghost" size="sm" onClick={() => setActivePanel("request")}>
+                <Settings className="size-4" />
+                {t("settings.providerAdvancedSettings")}
+              </Button>
+              <Button variant="ghost" size="sm" onClick={() => setActivePanel("usage")}>
+                <Key className="size-4" />
+                {t("settings.providerUsageQuery")}
+              </Button>
+            </div>
+            <DialogActions>
+              <Button
+                variant="outline"
+                onClick={requestClose}
+                className="h-8 max-[720px]:h-10 max-[720px]:flex-1"
+              >
+                {t("settings.cancel")}
+              </Button>
+              <Button
+                onClick={handleSave}
+                disabled={
+                  !name.trim() || !dialogOpen || (Boolean(editingModel) && !canSaveEditingModel)
+                }
+                className="h-8 max-[720px]:h-10 max-[720px]:flex-1"
+              >
+                {t("settings.save")}
+              </Button>
+            </DialogActions>
+          </div>{" "}
+        </DialogHeader>
+
+        <div className="flex min-h-0 flex-1 max-[720px]:flex-col">
+          <DialogBody className="flex min-w-0 flex-col overflow-hidden [overflow-anchor:none] max-[640px]:overflow-y-auto">
+            <section key="general" className="flex min-h-0 flex-1 flex-col max-[640px]:min-h-fit">
+              <div className="shrink-0 space-y-3 pb-3">
+                <FormField>
+                  <FormFieldLabel>{t("settings.providerServiceType")}</FormFieldLabel>
+                  <Select
+                    value={providerType}
+                    onValueChange={(value) => {
+                      const type = PROVIDER_TABS.find((type) => type === value);
+                      if (type && !isEditing) setProviderType(type);
+                    }}
+                    disabled={isEditing}
+                  >
+                    <SelectTrigger
+                      variant="plain"
+                      className="h-10 w-full"
+                      aria-label={t("settings.providerServiceType")}
+                    >
+                      <SelectValue>
+                        {getProviderLabel(providerType)} {t("settings.compatible")}
+                      </SelectValue>
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PROVIDER_TABS.map((type) => (
+                        <SelectItem key={type} value={type}>
+                          {getProviderLabel(type)} {t("settings.compatible")}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </FormField>
+                <div className="grid grid-cols-2 items-start gap-3 max-[640px]:grid-cols-1">
+                  <FormField>
+                    <FormFieldLabel htmlFor="modal-name">
+                      {t("settings.providerName")}
+                    </FormFieldLabel>
+                    <Input
+                      variant="plain"
+                      id="modal-name"
+                      className="h-10 shadow-none"
+                      value={name}
+                      onChange={(event) => setName(event.currentTarget.value)}
+                    />
+                  </FormField>
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center gap-2.5">
+                      <FormFieldLabel htmlFor="modal-baseurl">
+                        {t("settings.baseUrl")}
+                      </FormFieldLabel>
+                      <div className="ml-auto flex items-center gap-1.5">
+                        <Link2
+                          className={cn(
+                            "size-3.5",
+                            isFullUrl ? "text-sky-500" : "text-muted-foreground",
+                          )}
+                        />
+                        <span
+                          className={cn(
+                            "text-xs font-medium",
+                            isFullUrl ? "text-foreground" : "text-muted-foreground",
+                          )}
+                        >
+                          {t("settings.providerFullUrl")}
+                        </span>
+                        <Switch
+                          size="sm"
+                          checked={isFullUrl}
+                          onCheckedChange={setIsFullUrl}
+                          aria-label={t("settings.providerFullUrl")}
+                          title={t("settings.providerFullUrl")}
+                        />
+                      </div>
+                    </div>
+                    <Input
+                      variant="plain"
+                      id="modal-baseurl"
+                      className="h-10 shadow-none"
+                      value={baseUrl}
+                      aria-invalid={baseUrlInvalid ? true : undefined}
+                      aria-describedby={baseUrlInvalid ? "modal-baseurl-error" : undefined}
+                      onChange={(event) => setBaseUrl(event.currentTarget.value)}
+                    />
+                    {baseUrlInvalid ? (
+                      <p
+                        id="modal-baseurl-error"
+                        className="text-xs leading-relaxed text-destructive"
+                        role="alert"
+                      >
+                        {t("settings.providerBaseUrlInvalid")}
+                      </p>
+                    ) : (
+                      <FormFieldDescription
+                        className={cn(!isFullUrl && "invisible")}
+                        aria-hidden={!isFullUrl}
+                      >
+                        {t("settings.providerFullUrlHint")}
+                      </FormFieldDescription>
+                    )}
+                  </div>
+                </div>
+                <div
+                  className={cn(
+                    "grid items-start gap-3",
+                    providerType === "codex" &&
+                      "grid-cols-[minmax(0,1.5fr)_minmax(0,1fr)] max-[640px]:grid-cols-1",
+                  )}
+                >
+                  <div className="space-y-2">
+                    <div className="flex items-center">
+                      <FormFieldLabel htmlFor="modal-apikey">API Key</FormFieldLabel>
+                    </div>
+                    <div className="relative">
+                      <Input
+                        variant="plain"
+                        id="modal-apikey"
+                        type={showApiKey ? "text" : "password"}
+                        value={apiKey}
+                        className="h-10 pr-9 shadow-none"
+                        onChange={(event) => setApiKey(event.currentTarget.value)}
+                        onFocus={(event) => {
+                          if (apiKeyIsRedactedDisplay) event.currentTarget.select();
+                        }}
+                      />
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="icon-sm"
+                        className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:bg-transparent hover:text-foreground"
+                        onClick={() => void toggleShowApiKey()}
+                        disabled={revealingApiKey}
+                        title={showApiKey ? t("settings.hideApiKey") : t("settings.showApiKey")}
+                        aria-label={
+                          showApiKey ? t("settings.hideApiKey") : t("settings.showApiKey")
+                        }
+                      >
+                        {showApiKey ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+                      </Button>
+                    </div>
+                    {revealApiKeyError ? (
+                      <p className="text-xs text-destructive">{revealApiKeyError}</p>
+                    ) : null}
+                  </div>
+                  {providerType === "codex" ? (
+                    <FormField>
+                      <FormFieldLabel>{t("settings.requestFormat")}</FormFieldLabel>
+                      <Select
+                        value={requestFormat}
+                        onValueChange={(value) => setRequestFormat(value as CodexRequestFormat)}
+                      >
+                        <SelectTrigger variant="plain" className="h-10 w-full shadow-none">
+                          <SelectValue>{CODEX_REQUEST_FORMAT_LABELS[requestFormat]}</SelectValue>
+                        </SelectTrigger>
+                        <SelectContent>
+                          {Object.entries(CODEX_REQUEST_FORMAT_LABELS).map(([value, label]) => (
+                            <SelectItem key={value} value={value}>
+                              {label}
+                            </SelectItem>
+                          ))}
+                        </SelectContent>
+                      </Select>
+                    </FormField>
+                  ) : null}
+                </div>
+              </div>
+              <div className="grid min-h-0 flex-1 grid-cols-2 items-stretch gap-3 max-[640px]:min-h-96 max-[640px]:grid-cols-1">
+                <div className="flex min-h-0 min-w-0 flex-col overflow-hidden rounded-xl bg-settings-tile">
+                  <div className="flex items-center gap-2 border-b bg-muted/30 p-2.5 max-[720px]:flex-wrap">
+                    <div className="relative min-w-0 flex-1 max-[720px]:basis-full">
+                      <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-muted-foreground" />
+                      <Input
+                        variant="plain"
+                        value={modelSearch}
+                        className="h-8 pl-9 pr-9 text-xs shadow-none"
+                        placeholder={t("settings.searchModels")}
+                        aria-label={t("settings.searchModels")}
+                        autoComplete="off"
+                        spellCheck={false}
+                        onChange={(event) => setModelSearch(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Escape" && modelSearch) {
+                            event.stopPropagation();
+                            setModelSearch("");
+                          }
+                        }}
+                      />
+                      {modelSearch ? (
+                        <button
+                          type="button"
+                          className={cn(
+                            "absolute right-0 top-0 flex size-8 items-center justify-center",
+                            "rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground",
+                          )}
+                          onClick={() => setModelSearch("")}
+                          title={t("settings.clearModelSearch")}
+                          aria-label={t("settings.clearModelSearch")}
+                        >
+                          <X className="size-3.5" />
+                        </button>
+                      ) : null}
+                    </div>
+                    <RefreshButton
+                      aria-busy={fetchingModels}
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 gap-1.5 max-[720px]:h-10 max-[720px]:min-w-36 max-[720px]:flex-1"
+                      onClick={handleRefresh}
+                      disabled={fetchingModels || !baseUrl.trim()}
+                    >
+                      <RefreshCw
+                        data-refresh-icon
+                        className={cn("size-3.5", fetchingModels && "animate-spin")}
+                      />
+                      {fetchingModels ? t("settings.fetching") : t("settings.refreshModels")}
+                    </RefreshButton>
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      className="h-8 gap-1.5 max-[720px]:h-10 max-[720px]:min-w-36 max-[720px]:flex-1"
+                      onClick={() => setAddingModel(true)}
+                    >
+                      <Plus className="size-3.5" />
+                      {t("settings.manualAddModel")}
+                    </Button>
+                  </div>
+
+                  {visibleModels.length > 0 ? (
+                    <div className="flex items-center gap-2 border-b bg-muted/20 px-3 py-1">
+                      <div className="flex shrink-0 items-center gap-1">
+                        {/* w-5 占位与行内拖拽把手同宽，保证总开关和每行开关纵向对齐。 */}
+                        <span className="w-5 shrink-0" aria-hidden="true" />
+                        <DialogSwitch
+                          checked={allVisibleModelsActive}
+                          onCheckedChange={toggleVisibleModelsActive}
+                          ariaLabel={
+                            allVisibleModelsActive
+                              ? t("settings.disableAllModels")
+                              : t("settings.enableAllModels")
+                          }
+                        />
+                      </div>
+                      <span className="text-xs text-muted-foreground">
+                        {modelSearchQuery
+                          ? t("settings.matchedModelsEnabledCount")
+                              .replace("{enabled}", String(visibleActiveCount))
+                              .replace("{total}", String(visibleModels.length))
+                          : t("settings.modelsEnabledCount")
+                              .replace("{enabled}", String(visibleActiveCount))
+                              .replace("{total}", String(visibleModels.length))}
+                      </span>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="ml-auto shrink-0 gap-1.5 text-muted-foreground hover:bg-destructive/10 hover:text-destructive max-[720px]:h-10"
+                        onClick={() => void clearVisibleModels()}
+                      >
+                        <Trash2 className="size-3.5" />
+                        {modelSearchQuery
+                          ? t("settings.clearMatchedModels")
+                          : t("settings.clearAllModels")}
+                      </Button>
+                    </div>
+                  ) : null}
+
+                  {fetchError ? (
+                    <div className="border-b border-destructive/30 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                      {fetchError}
+                    </div>
+                  ) : null}
+
+                  {addingModel ? (
+                    <div className="settings-inline-form flex gap-2 border-b bg-muted/20 p-2.5 max-[720px]:flex-wrap">
+                      <Input
+                        variant="plain"
+                        autoFocus
+                        value={newModelName}
+                        className="h-8 text-sm shadow-none max-[720px]:h-10 max-[720px]:basis-full"
+                        placeholder={t("settings.modelName")}
+                        aria-label={t("settings.modelName")}
+                        onChange={(event) => setNewModelName(event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter") handleAddModel();
+                          if (event.key === "Escape") {
+                            event.stopPropagation();
+                            setAddingModel(false);
+                          }
+                        }}
+                      />
+                      <Button size="sm" className="h-8 shadow-none" onClick={handleAddModel}>
+                        {t("settings.add")}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        className="h-8 shadow-none"
+                        onClick={() => setAddingModel(false)}
+                      >
+                        {t("settings.cancel")}
+                      </Button>
+                    </div>
+                  ) : null}
+
+                  {visibleModels.length === 0 ? (
+                    <div className="flex min-h-40 flex-1 items-center justify-center px-3 py-8 text-center text-xs text-muted-foreground">
+                      {models.length > 0 && modelSearchQuery
+                        ? t("settings.noMatchingModels")
+                        : baseUrl.trim() && apiKeyForRequest
+                          ? t("settings.fetchFailed")
+                          : t("settings.fetchHint")}
+                    </div>
+                  ) : (
+                    <VerticalReorderList
+                      itemIds={visibleModels.map((model) => model.id)}
+                      canReorder={!modelSearchQuery}
+                      reorderLabel={t("settings.reorderModel")}
+                      reorderHint={t("settings.reorderVerticalHint")}
+                      disabledHint={modelReorderDisabledHint}
+                      onReorder={handleModelReorder}
+                      onDraggingChange={handleModelDraggingChange}
+                      className="min-h-0 flex-1 divide-y overflow-y-auto"
+                    >
+                      {(modelId, _index, { dragging, dragHandle }) => {
+                        const model = visibleModelById.get(modelId);
+                        if (!model) return null;
+                        const isEditingModel = editingModel?.model.id === model.id;
+                        const newModelPhase = newModelPhases.get(model.id);
+                        // 用户覆盖（仅表达 text/image 门控、仅部分供应商生效）优先于
+                        // 目录快照：覆盖存在时图标要跟随覆盖，避免与编辑面板矛盾。
+                        const inputModalities: readonly CatalogInputModality[] | undefined =
+                          (canOverrideModelInputModalities ? model.inputModalities : undefined) ??
+                          resolveModelInputModalities(providerType, model.id);
+                        const modalityIcons = MODEL_MODALITY_ICONS.filter(({ modality }) =>
+                          inputModalities?.includes(modality),
+                        );
+                        return (
+                          <div
+                            className={cn(
+                              "settings-model-row group hover:bg-accent/30",
+                              dragging && "bg-accent shadow-lg",
+                              isEditingModel && "bg-settings-active",
+                              newModelPhase === "visible" && "bg-primary/10 hover:bg-primary/15",
+                              newModelPhase === "fading" && "bg-primary/[0.04]",
+                            )}
+                          >
+                            <div className="flex items-center gap-2 px-3 py-2 max-[720px]:grid max-[720px]:grid-cols-ssh-entry">
+                              <div className="flex shrink-0 items-center gap-1">
+                                {dragHandle}
+                                <DialogSwitch
+                                  checked={activeModels.has(model.id)}
+                                  onCheckedChange={() => toggleModel(model.id)}
+                                  ariaLabel={model.id}
+                                />
+                              </div>
+                              <div className="min-w-0 flex-1 max-[720px]:col-[2/5] max-[720px]:row-start-1">
+                                <div className="flex min-w-0 items-center gap-2">
+                                  <button
+                                    type="button"
+                                    className="min-w-0 truncate text-left text-sm font-medium hover:underline"
+                                    onClick={() => openModelSettings(model.id)}
+                                    aria-pressed={isEditingModel}
+                                    title={model.id}
+                                  >
+                                    {model.id}
+                                  </button>
+                                  {newModelPhase ? (
+                                    <span
+                                      className={cn(
+                                        "shrink-0 rounded-full border border-primary/25 bg-primary/10 px-2 py-0.5",
+                                        "text-tiny font-semibold leading-none tracking-wide text-primary",
+                                        "transition-[opacity,transform] duration-500 max-[420px]:px-1.5",
+                                        newModelPhase === "fading" && "scale-95 opacity-0",
+                                      )}
+                                    >
+                                      {t("settings.newModelBadge")}
+                                    </span>
+                                  ) : null}
+                                </div>
+                              </div>
+                              <div
+                                className={cn(
+                                  "flex shrink-0 items-center whitespace-nowrap text-xs tabular-nums text-muted-foreground",
+                                  "max-[720px]:col-[1/3] max-[720px]:row-start-2 max-[720px]:min-w-0",
+                                )}
+                              >
+                                {modelIsImage(model) ? (
+                                  <span className="mr-1.5 rounded-full border border-border/70 bg-muted/60 px-1.5 py-0.5 text-tiny leading-none">
+                                    {t("settings.modelImageBadge")}
+                                  </span>
+                                ) : null}
+                                {modalityIcons.length > 0 ? (
+                                  <span className="mr-1.5 flex items-center gap-1">
+                                    {modalityIcons.map(({ modality, Icon, labelKey }) => (
+                                      <span
+                                        key={modality}
+                                        role="img"
+                                        title={t(labelKey)}
+                                        aria-label={t(labelKey)}
+                                        className="flex items-center"
+                                      >
+                                        <Icon className="size-3.5" />
+                                      </span>
+                                    ))}
+                                  </span>
+                                ) : null}
+                                <span>
+                                  {formatTokenCount(model.contextWindow)} ctx ·{" "}
+                                  {formatTokenCount(model.maxOutputToken)} out
+                                </span>
+                                {model.limitsSource === "fallback" ? (
+                                  <span
+                                    className={cn(
+                                      "ml-1.5 rounded-full border border-border/70 bg-muted/60 px-1.5 py-0.5",
+                                      "text-tiny font-medium leading-none text-muted-foreground",
+                                    )}
+                                  >
+                                    {t("settings.estimatedLimitsBadge")}
+                                  </span>
+                                ) : null}
+                              </div>
+
+                              <Button
+                                type="button"
+                                variant="ghost"
+                                size="icon-sm"
+                                className="shrink-0 text-muted-foreground hover:bg-destructive/10 hover:text-destructive max-[720px]:col-start-4 max-[720px]:row-start-2"
+                                onClick={(event) => {
+                                  event.stopPropagation();
+                                  removeModel(model.id);
+                                }}
+                                title={t("settings.delete")}
+                                aria-label={t("settings.delete")}
+                              >
+                                <Trash2 className="size-4" />
+                              </Button>
+                            </div>
+                          </div>
+                        );
+                      }}
+                    </VerticalReorderList>
+                  )}
+                </div>
+                <aside
+                  className="flex min-h-0 min-w-0 flex-col overflow-y-auto rounded-xl bg-settings-tile p-4"
+                  aria-label={t("settings.modelSettings")}
+                >
+                  <div className={cn("mb-4 flex flex-col gap-1", !editingModel && "flex-1")}>
+                    <h3 className="text-sm font-semibold">{t("settings.modelSettings")}</h3>
+                    <p
+                      className={cn(
+                        "break-all text-xs text-muted-foreground",
+                        !editingModel && "flex flex-1 items-center justify-center text-center",
+                      )}
+                    >
+                      {editingModel?.model.id ?? t("settings.selectModelToEdit")}
+                    </p>
+                  </div>
+                  {editingModel ? (
+                    <div className="space-y-4">
+                      <div className="grid grid-cols-1 gap-4">
+                        <FormField>
+                          <FormFieldLabel htmlFor="model-context-window">
+                            {t("settings.contextWindow")}
+                          </FormFieldLabel>
+                          <Input
+                            variant="plain"
+                            id="model-context-window"
+                            inputMode="numeric"
+                            aria-invalid={editingModelContextWindow === null ? true : undefined}
+                            className={cn(
+                              "h-8 shadow-none",
+                              editingModelContextWindow === null &&
+                                "ring-1 ring-inset ring-destructive focus-visible:ring-destructive",
+                            )}
+                            value={editingModel.contextWindow}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingModel((prev) =>
+                                prev ? { ...prev, contextWindow: value } : prev,
+                              );
+                            }}
+                          />
+                        </FormField>
+                        <FormField>
+                          <FormFieldLabel htmlFor="model-max-output">
+                            {t("settings.maxOutputToken")}
+                          </FormFieldLabel>
+                          <Input
+                            variant="plain"
+                            id="model-max-output"
+                            inputMode="numeric"
+                            aria-invalid={editingModelMaxOutputToken === null ? true : undefined}
+                            className={cn(
+                              "h-8 shadow-none",
+                              editingModelMaxOutputToken === null &&
+                                "ring-1 ring-inset ring-destructive focus-visible:ring-destructive",
+                            )}
+                            value={editingModel.maxOutputToken}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setEditingModel((prev) =>
+                                prev ? { ...prev, maxOutputToken: value } : prev,
+                              );
+                            }}
+                          />
+                        </FormField>
+                        {canOverrideModelInputModalities ? (
+                          <FormField>
+                            <FormFieldLabel>{t("settings.modelInputModalities")}</FormFieldLabel>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger
+                                render={
+                                  <Button
+                                    variant="ghost"
+                                    className="h-9 w-full justify-between bg-settings-tile-hover px-3"
+                                  />
+                                }
+                                aria-label={t("settings.modelInputModalities")}
+                              >
+                                {t(
+                                  editingModelInputModalitiesMode === "auto"
+                                    ? "settings.modelInputModalitiesAuto"
+                                    : editingModelInputModalitiesMode === "text"
+                                      ? "settings.modelInputModalitiesText"
+                                      : "settings.modelInputModalitiesTextImage",
+                                )}
+                                <ChevronDown className="size-4 text-muted-foreground" />
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent variant="soft">
+                                <DropdownMenuRadioGroup
+                                  value={editingModelInputModalitiesMode}
+                                  onValueChange={(value) => {
+                                    if (
+                                      value === "auto" ||
+                                      value === "text" ||
+                                      value === "text-image"
+                                    )
+                                      setEditingModelInputModalitiesMode(value);
+                                  }}
+                                >
+                                  <DropdownMenuRadioItem value="auto">
+                                    {t("settings.modelInputModalitiesAuto")}
+                                  </DropdownMenuRadioItem>
+                                  <DropdownMenuRadioItem value="text">
+                                    {t("settings.modelInputModalitiesText")}
+                                  </DropdownMenuRadioItem>
+                                  <DropdownMenuRadioItem value="text-image">
+                                    {t("settings.modelInputModalitiesTextImage")}
+                                  </DropdownMenuRadioItem>
+                                </DropdownMenuRadioGroup>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                            <FormFieldDescription>
+                              {t("settings.modelInputModalitiesHint")}
+                            </FormFieldDescription>
+                          </FormField>
+                        ) : null}
+                        {canToggleEditingModelImage ? (
+                          <FormField>
+                            <FormFieldLabel>{t("settings.modelImage")}</FormFieldLabel>
+                            <DropdownMenu>
+                              <DropdownMenuTrigger
+                                render={
+                                  <Button
+                                    variant="ghost"
+                                    className="h-9 w-full justify-between bg-settings-tile-hover px-3"
+                                  />
+                                }
+                                aria-label={t("settings.modelImage")}
+                              >
+                                {t(
+                                  editingModelImageMode === "auto"
+                                    ? "settings.modelImageAuto"
+                                    : editingModelImageMode === "on"
+                                      ? "settings.modelImageOn"
+                                      : "settings.modelImageOff",
+                                )}
+                                <ChevronDown className="size-4 text-muted-foreground" />
+                              </DropdownMenuTrigger>
+                              <DropdownMenuContent variant="soft">
+                                <DropdownMenuRadioGroup
+                                  value={editingModelImageMode}
+                                  onValueChange={(value) => {
+                                    if (value === "auto" || value === "on" || value === "off")
+                                      setEditingModelImageMode(value);
+                                  }}
+                                >
+                                  <DropdownMenuRadioItem value="auto">
+                                    {t("settings.modelImageAuto")}
+                                  </DropdownMenuRadioItem>
+                                  <DropdownMenuRadioItem value="on">
+                                    {t("settings.modelImageOn")}
+                                  </DropdownMenuRadioItem>
+                                  <DropdownMenuRadioItem value="off">
+                                    {t("settings.modelImageOff")}
+                                  </DropdownMenuRadioItem>
+                                </DropdownMenuRadioGroup>
+                              </DropdownMenuContent>
+                            </DropdownMenu>
+                            <FormFieldDescription>
+                              {t("settings.modelImageHint")}
+                            </FormFieldDescription>
+                          </FormField>
+                        ) : null}
+                        {providerType === "codex" ? (
+                          <FormField>
+                            <FormFieldLabel>
+                              {t("settings.promptCacheHintModelOverride")}
+                            </FormFieldLabel>
+                            <Select
+                              value={editingModel.model.promptCacheHintMode ?? "inherit"}
+                              onValueChange={(value) =>
+                                setEditingModel((prev) =>
+                                  prev
+                                    ? {
+                                        ...prev,
+                                        model: {
+                                          ...prev.model,
+                                          promptCacheHintMode:
+                                            value === "inherit"
+                                              ? undefined
+                                              : (value as PromptCacheHintMode),
+                                        },
+                                      }
+                                    : prev,
+                                )
+                              }
+                            >
+                              <SelectTrigger variant="plain" className="h-8 shadow-none">
+                                {/* value≠label：闭合态必须显式渲染本地化标签。 */}
+                                <SelectValue>
+                                  {t(
+                                    editingModel.model.promptCacheHintMode
+                                      ? PROMPT_CACHE_HINT_LABEL_KEYS[
+                                          editingModel.model.promptCacheHintMode
+                                        ]
+                                      : "settings.promptCacheHintMode.inherit",
+                                  )}
+                                </SelectValue>
+                              </SelectTrigger>
+                              <SelectContent>
+                                <SelectItem value="inherit">
+                                  {t("settings.promptCacheHintMode.inherit")}
+                                </SelectItem>
+                                {PROMPT_CACHE_HINT_MODES.map((mode) => (
+                                  <SelectItem key={mode} value={mode}>
+                                    {t(PROMPT_CACHE_HINT_LABEL_KEYS[mode])}
+                                  </SelectItem>
+                                ))}
+                              </SelectContent>
+                            </Select>
+                          </FormField>
+                        ) : null}
+                      </div>
+                      {!canSaveEditingModel ? (
+                        <div
+                          className={cn(
+                            "mt-3 rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2",
+                            "text-xs text-destructive",
+                          )}
+                        >
+                          {t("settings.positiveIntegerRequired")}
+                        </div>
+                      ) : null}
+
+                      <div className="mt-3 flex justify-end gap-2">
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          onClick={() => setEditingModel(null)}
+                        >
+                          {t("settings.cancel")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          disabled={!canSaveEditingModel}
+                          onClick={saveInlineModelSettings}
+                        >
+                          {t("settings.providerModelApply")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                </aside>
+              </div>
+            </section>
+          </DialogBody>
+        </div>
+
+        <Dialog
+          open={activePanel !== "general"}
+          onOpenChange={(open) => {
+            if (!open) {
+              setActivePanel("general");
+            }
+          }}
+        >
+          <DialogContent
+            className="flex max-h-[85dvh] max-w-2xl flex-col"
+            showCloseButton
+            closeLabel={t("settings.close")}
+          >
+            <DialogHeader>
+              <DialogTitle>
+                {activePanel === "usage"
+                  ? t("settings.providerUsageQuery")
+                  : t("settings.providerAdvancedSettings")}
+              </DialogTitle>
+            </DialogHeader>
+            <DialogBody>
+              {activePanel === "request" ? (
+                <section key="request">
+                  {providerType !== "gemini" ? (
+                    <FormField className="mb-5">
+                      <FormFieldLabel htmlFor="modal-models-url">
+                        {t("settings.providerModelsUrl")}
+                      </FormFieldLabel>
+                      <Input
+                        variant="plain"
+                        id="modal-models-url"
+                        className="h-8 shadow-none"
+                        value={modelsUrl}
+                        placeholder={t("settings.providerModelsUrlPlaceholder")}
+                        onChange={(event) => setModelsUrl(event.currentTarget.value)}
+                      />
+                      <FormFieldDescription>
+                        {t("settings.providerModelsUrlHint")}
+                      </FormFieldDescription>
+                    </FormField>
+                  ) : null}
+                  <div className="text-sm font-semibold">{t("settings.providerDialogRequest")}</div>
+                  <div
+                    className={cn(
+                      "mt-3 flex items-center gap-3",
+                      "rounded-xl bg-settings-tile px-4 py-3 transition-colors",
+                    )}
+                  >
+                    <div className="min-w-0 flex-1 text-sm font-medium">
+                      {t("settings.providerUseSystemProxy")}
+                    </div>
+                    <Switch
+                      checked={useSystemProxy}
+                      onCheckedChange={setUseSystemProxy}
+                      aria-label={t("settings.providerUseSystemProxy")}
+                    />
+                  </div>
+                  <div
+                    className={cn("mt-3 rounded-xl bg-settings-tile px-4 py-3 transition-colors")}
+                  >
+                    <div className="flex items-center gap-3">
+                      <div className="min-w-0 flex-1">
+                        <div className="text-sm font-medium">
+                          {t("settings.providerStreamRetry")}
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {t("settings.providerStreamRetryDesc")}
+                        </div>
+                      </div>
+                      <SettingsToggleGroup
+                        value={[streamRetryMode]}
+                        onValueChange={(values) => {
+                          const nextMode = values[0] as typeof streamRetryMode | undefined;
+                          if (nextMode) setStreamRetryMode(nextMode);
+                        }}
+                      >
+                        {(
+                          [
+                            ["default", "settings.providerStreamRetryDefault"],
+                            ["off", "settings.providerStreamRetryOff"],
+                            ["custom", "settings.providerStreamRetryCustom"],
+                          ] as const
+                        ).map(([value, labelKey]) => (
+                          <SettingsToggleGroupItem key={value} value={value}>
+                            {t(labelKey)}
+                          </SettingsToggleGroupItem>
+                        ))}
+                      </SettingsToggleGroup>
+                    </div>
+                    {streamRetryMode === "custom" ? (
+                      <div className="mt-3 flex flex-wrap items-center gap-3 border-t pt-3">
+                        <FormFieldLabel htmlFor="provider-stream-retry-count" size="compact">
+                          {t("settings.providerStreamRetryMaxRetries")}
+                        </FormFieldLabel>
+                        <Input
+                          variant="plain"
+                          id="provider-stream-retry-count"
+                          type="number"
+                          min={1}
+                          max={10}
+                          step={1}
+                          inputMode="numeric"
+                          className="h-8 w-20 text-sm shadow-none"
+                          value={streamRetryCountInput}
+                          onChange={(event) => setStreamRetryCountInput(event.currentTarget.value)}
+                          onBlur={commitStreamRetryCountInput}
+                        />
+                        <span className="text-xs text-muted-foreground">
+                          {t("settings.providerStreamRetryMaxRetriesDesc")}
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
+                  {providerType !== "gemini" &&
+                  providerType !== "xai" &&
+                  providerType !== "deepseek" ? (
+                    <div
+                      className={cn("mt-3 rounded-xl bg-settings-tile px-4 py-3 transition-colors")}
+                    >
+                      <div className="flex items-center gap-3">
+                        <div className="min-w-0 flex-1">
+                          <div className="text-sm font-medium">{t("settings.promptCaching")}</div>
+                          <div className="text-xs text-muted-foreground">
+                            {providerType === "claude_code"
+                              ? t("settings.promptCachingDescClaude")
+                              : t("settings.promptCachingDescCodex")}
+                          </div>
+                        </div>
+                        {providerType === "claude_code" ? (
+                          <Switch
+                            checked={promptCachingEnabled}
+                            onCheckedChange={setPromptCachingEnabled}
+                            aria-label={t("settings.promptCaching")}
+                          />
+                        ) : null}
+                      </div>
+                      {providerType === "codex" ? (
+                        <div className="mt-3 border-t pt-3">
+                          <Select
+                            value={promptCacheHintMode}
+                            onValueChange={(value) =>
+                              setPromptCacheHintMode(value as PromptCacheHintMode)
+                            }
+                          >
+                            <SelectTrigger
+                              variant="plain"
+                              className="h-8 shadow-none"
+                              aria-label={t("settings.promptCacheHintMode")}
+                            >
+                              {/* value≠label：闭合态必须显式渲染本地化标签。 */}
+                              <SelectValue>
+                                {t(PROMPT_CACHE_HINT_LABEL_KEYS[promptCacheHintMode])}
+                              </SelectValue>
+                            </SelectTrigger>
+                            <SelectContent>
+                              {PROMPT_CACHE_HINT_MODES.map((mode) => (
+                                <SelectItem key={mode} value={mode}>
+                                  {t(PROMPT_CACHE_HINT_LABEL_KEYS[mode])}
+                                </SelectItem>
+                              ))}
+                            </SelectContent>
+                          </Select>
+                        </div>
+                      ) : null}
+                      {providerType === "claude_code" && promptCachingEnabled ? (
+                        <div className="mt-3 flex flex-wrap items-center gap-2 border-t pt-3">
+                          <span className="text-xs text-muted-foreground">
+                            {t("settings.promptCacheRetention")}
+                          </span>
+                          <SettingsToggleGroup
+                            value={[promptCacheRetention]}
+                            onValueChange={(values) => {
+                              const nextRetention = values[0] as
+                                | typeof promptCacheRetention
+                                | undefined;
+                              if (nextRetention) setPromptCacheRetention(nextRetention);
+                            }}
+                          >
+                            {(
+                              [
+                                ["short", "settings.promptCacheRetentionShort"],
+                                ["long", "settings.promptCacheRetentionLong"],
+                              ] as const
+                            ).map(([value, labelKey]) => (
+                              <SettingsToggleGroupItem key={value} value={value}>
+                                {t(labelKey)}
+                              </SettingsToggleGroupItem>
+                            ))}
+                          </SettingsToggleGroup>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                  <div className="mt-6 flex flex-wrap items-center justify-between gap-3">
+                    <div className="flex min-w-0 items-center gap-2 max-[720px]:w-full">
+                      <span className="text-sm font-semibold">{t("settings.customHeaders")}</span>
+                      {customHeaders.length > 0 ? (
+                        <span className="rounded-full bg-muted px-2 py-0.5 text-tiny font-medium tabular-nums text-muted-foreground">
+                          {customHeaders.length}
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="flex shrink-0 gap-2 max-[720px]:w-full">
+                      <DropdownMenu>
+                        <DropdownMenuTrigger
+                          render={
+                            <Button
+                              type="button"
+                              variant="outline"
+                              size="sm"
+                              className="h-8 shrink-0 gap-1.5 max-[720px]:h-11 max-[720px]:flex-1"
+                            />
+                          }
+                        >
+                          <Fingerprint className="size-3.5" />
+                          {t("settings.cliIdentityHeaders")}
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent variant="soft" align="end" className="w-64">
+                          <DropdownMenuLabel>
+                            {t("settings.cliIdentityHeadersHint")}
+                          </DropdownMenuLabel>
+                          {listCliIdentityProviderIds(providerType).map((identity) => (
+                            <DropdownMenuItem
+                              key={identity}
+                              className="gap-2"
+                              onSelect={() => applyCliIdentityHeaders(identity)}
+                            >
+                              <span className="shrink-0 whitespace-nowrap font-medium leading-5">
+                                {t(`settings.cliIdentity.${identity}`)}
+                              </span>
+                              {isCliIdentityProviderId(providerType) &&
+                              identity === providerType ? (
+                                <span
+                                  className={cn(
+                                    "shrink-0 whitespace-nowrap rounded bg-primary/10 px-1 py-px",
+                                    "text-tiny font-medium text-primary",
+                                  )}
+                                >
+                                  {t("settings.cliIdentityRecommended")}
+                                </span>
+                              ) : null}
+                              <span className="ml-auto min-w-0 truncate font-mono text-tiny text-muted-foreground">
+                                {CLI_IDENTITY_USER_AGENTS[identity].split(" ")[0]}
+                              </span>
+                            </DropdownMenuItem>
+                          ))}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className={cn(
+                          "h-8 shrink-0 gap-1.5 max-[720px]:h-11 max-[720px]:flex-1",
+                          headerImportOpen && "border-primary/50 bg-primary/10 text-primary",
+                        )}
+                        aria-expanded={headerImportOpen}
+                        onClick={() => {
+                          setHeaderImportOpen((open) => !open);
+                          setHeaderImportError(null);
+                          setHeaderImportSummary(null);
+                        }}
+                      >
+                        <ClipboardPaste className="size-3.5" />
+                        {t("settings.importCustomHeaders")}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="outline"
+                        size="sm"
+                        className="h-8 shrink-0 gap-1.5 max-[720px]:h-11 max-[720px]:flex-1"
+                        /* 导入视图占据了列表位置,此时新增行不可见,禁用避免静默无响应。 */
+                        disabled={headerImportOpen}
+                        onClick={() => addCustomHeader()}
+                      >
+                        <Plus className="size-3.5" />
+                        {t("settings.addCustomHeader")}
+                      </Button>
+                    </div>
+                  </div>
+                  {headerImportOpen ? (
+                    <div className="mt-3 min-w-0 rounded-xl bg-settings-tile p-3">
+                      <Label
+                        htmlFor="provider-custom-header-import"
+                        className="mb-2 block text-xs font-medium"
+                      >
+                        {t("settings.customHeaderImportLabel")}
+                      </Label>
+                      <Textarea
+                        variant="plain"
+                        id="provider-custom-header-import"
+                        value={headerImportText}
+                        className="min-h-120px w-full min-w-0 resize-y font-mono text-xs leading-relaxed"
+                        placeholder={t("settings.customHeaderImportPlaceholder")}
+                        aria-invalid={headerImportErrorMessage ? true : undefined}
+                        aria-describedby={
+                          headerImportErrorMessage
+                            ? "provider-custom-header-import-error"
+                            : undefined
+                        }
+                        spellCheck={false}
+                        autoFocus
+                        onChange={(event) => {
+                          setHeaderImportText(event.currentTarget.value);
+                          setHeaderImportError(null);
+                          setHeaderImportSummary(null);
+                        }}
+                      />
+                      {headerImportErrorMessage ? (
+                        <p
+                          id="provider-custom-header-import-error"
+                          className="mt-2 text-xs text-destructive"
+                          role="alert"
+                        >
+                          {headerImportErrorMessage}
+                        </p>
+                      ) : null}
+                      <div className="mt-3 flex flex-wrap justify-end gap-2 max-[720px]:w-full">
+                        <Button
+                          type="button"
+                          variant="ghost"
+                          size="sm"
+                          className="h-8 max-[720px]:h-11 max-[720px]:flex-1"
+                          onClick={cancelCustomHeaderImport}
+                        >
+                          {t("settings.cancelCustomHeaderImport")}
+                        </Button>
+                        <Button
+                          type="button"
+                          size="sm"
+                          className="h-8 max-[720px]:h-11 max-[720px]:flex-1"
+                          onClick={handleImportCustomHeaders}
+                        >
+                          {t("settings.parseAndImportCustomHeaders")}
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {headerImportSummaryMessage ? (
+                    <p
+                      className="mt-3 rounded-lg border bg-muted/50 px-3 py-2 text-xs text-muted-foreground"
+                      role="status"
+                      aria-live="polite"
+                    >
+                      {headerImportSummaryMessage}
+                    </p>
+                  ) : null}
+                  {/* 导入视图与请求头列表互斥:解析成功后回到列表,直接看到增量导入的结果。 */}
+                  {headerImportOpen ? null : customHeaders.length === 0 ? (
+                    <button
+                      type="button"
+                      className={cn(
+                        "mt-3 flex w-full flex-col items-center gap-1",
+                        "rounded-xl bg-settings-tile px-4 py-4 text-center transition-colors",
+                        "hover:bg-settings-tile-hover",
+                      )}
+                      onClick={() => addCustomHeader()}
+                    >
+                      <List className="size-5 text-muted-foreground/60" />
+                      <span className="mt-1 text-xs font-medium text-muted-foreground">
+                        {t("settings.noCustomHeaders")}
+                      </span>
+                      <span className="text-xs text-muted-foreground/75">
+                        {t("settings.noCustomHeadersHint")}
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="mt-4 space-y-2">
+                      <div className="-m-0.5 max-h-196px space-y-2 overflow-y-auto p-0.5 max-[720px]:max-h-360px">
+                        {customHeaders.map((header, index) => {
+                          const issue = getCustomHeaderIssue(header, headerValidationSubmitted);
+                          const issueTitle = issue ? customHeaderIssueMessage(issue, t) : undefined;
+                          const valueIssue = issue === "invalid-value";
+                          const keyIssue = issue !== null && !valueIssue;
+
+                          return (
+                            <div
+                              // biome-ignore lint/suspicious/noArrayIndexKey: Header rows are an ordered, controlled editor whose mutation API is intentionally index-based; content-derived keys would remount inputs on every keystroke.
+                              key={index}
+                              className={cn(
+                                "group relative flex items-stretch overflow-hidden",
+                                "rounded-lg bg-settings-tile p-1 transition-colors",
+                                "focus-within:border-primary/45 focus-within:ring-2 focus-within:ring-primary/10 hover:border-muted-foreground/30 max-[720px]:flex-wrap",
+                                issue &&
+                                  "border-destructive/60 focus-within:border-destructive focus-within:ring-destructive/10",
+                              )}
+                            >
+                              <ProviderHeaderNameInput
+                                suggestions={headerKeyPresets.filter(
+                                  (preset) =>
+                                    !customHeaders.some(
+                                      (other, otherIndex) =>
+                                        otherIndex !== index &&
+                                        other.key.trim().toLowerCase() === preset.toLowerCase(),
+                                    ),
+                                )}
+                                onValueChange={(value) => updateCustomHeader(index, "key", value)}
+                                onComplete={() => focusCustomHeader(index, "value")}
+                                variant="plain"
+                                ref={(element) => {
+                                  headerKeyRefs.current[index] = element;
+                                }}
+                                value={header.key}
+                                className={cn(
+                                  "h-8 w-210px shrink-0",
+                                  "rounded-none border-0 border-r bg-muted/30 px-3",
+                                  "font-mono text-xs shadow-none",
+                                  "focus-visible:ring-0 max-[720px]:w-full max-[720px]:border-b max-[720px]:border-r-0 max-[720px]:bg-muted/40",
+                                  keyIssue && "text-destructive",
+                                )}
+                                placeholder={t("settings.customHeaderKeyPlaceholder")}
+                                aria-label={t("settings.customHeaderName")}
+                                aria-invalid={keyIssue ? true : undefined}
+                                title={issueTitle}
+                                autoComplete="off"
+                                spellCheck={false}
+                              />
+                              <div className="relative min-w-0 flex-1 max-[720px]:basis-full">
+                                <Input
+                                  variant="plain"
+                                  ref={(element) => {
+                                    headerValueRefs.current[index] = element;
+                                  }}
+                                  type="text"
+                                  value={header.value}
+                                  className={cn(
+                                    "h-8 w-full rounded-none border-0 bg-transparent pl-3 pr-11",
+                                    "font-mono text-xs shadow-none focus-visible:ring-0",
+                                    valueIssue && "text-destructive",
+                                  )}
+                                  placeholder={t("settings.customHeaderValue")}
+                                  aria-label={t("settings.customHeaderValue")}
+                                  aria-invalid={valueIssue ? true : undefined}
+                                  title={valueIssue ? issueTitle : undefined}
+                                  autoComplete="off"
+                                  spellCheck={false}
+                                  onChange={(event) =>
+                                    updateCustomHeader(index, "value", event.currentTarget.value)
+                                  }
+                                  onKeyDown={(event) => {
+                                    if (event.key !== "Enter") return;
+                                    event.preventDefault();
+                                    if (index === customHeaders.length - 1) addCustomHeader();
+                                    else focusCustomHeader(index + 1, "key");
+                                  }}
+                                />
+                                <div
+                                  className={cn(
+                                    "settings-hover-actions absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-0.5",
+                                    "opacity-0 transition-opacity group-focus-within:opacity-100 group-hover:opacity-100 max-[720px]:opacity-100",
+                                  )}
+                                >
+                                  <Button
+                                    type="button"
+                                    variant="ghost"
+                                    size="icon-sm"
+                                    className="rounded-md text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                                    onClick={() => removeCustomHeader(index)}
+                                    title={t("settings.removeCustomHeader")}
+                                    aria-label={t("settings.removeCustomHeader")}
+                                  >
+                                    <Trash2 className="size-3.5" />
+                                  </Button>
+                                </div>
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  )}
+                  {headerIssueMessage && !headerImportOpen ? (
+                    <p className="mt-2 text-xs leading-relaxed text-destructive" role="alert">
+                      {headerIssueMessage}
+                    </p>
+                  ) : null}
+                </section>
+              ) : activePanel === "usage" ? (
+                <section key="usage">
+                  <div className="flex items-center gap-3">
+                    <div className="min-w-0 flex-1">
+                      <div className="text-sm font-semibold">
+                        {t("settings.providerUsageQuery")}
+                      </div>
+                    </div>
+                    <Switch
+                      checked={usageQuery.enabled}
+                      onCheckedChange={(enabled) =>
+                        setUsageQuery((previous) => ({ ...previous, enabled }))
+                      }
+                      aria-label={t("settings.providerUsageEnabled")}
+                    />
+                  </div>
+
+                  {/* 未启用时隐藏全部配置与测试入口,只留开关。 */}
+                  {usageQuery.enabled ? (
+                    <>
+                      {/* 功能出处:居中带字分隔线,项目名是带图标的主色链接。 */}
+                      <div className="mt-3 flex items-center gap-2 text-xs leading-5 text-muted-foreground">
+                        <span aria-hidden="true" className="h-px min-w-0 flex-1 bg-border" />
+                        <span className="shrink-0">{t("settings.providerUsageCredit")}</span>
+                        <a
+                          href="https://github.com/farion1231/cc-switch"
+                          target="_blank"
+                          rel="noreferrer"
+                          className="inline-flex shrink-0 items-center gap-1 font-medium text-primary transition-colors hover:underline"
+                          title={t("settings.providerUsageCreditOpen")}
+                          aria-label={t("settings.providerUsageCreditOpen")}
+                        >
+                          cc-switch
+                          <ExternalLink className="size-3.5" />
+                        </a>
+                        <span aria-hidden="true" className="h-px min-w-0 flex-1 bg-border" />
+                      </div>
+
+                      <FormField className="mt-4">
+                        <FormFieldLabel>{t("settings.providerUsageMode")}</FormFieldLabel>
+                        <Select
+                          value={usageQuery.mode}
+                          onValueChange={(mode) =>
+                            setUsageQuery((previous) =>
+                              applyUsageQueryModePreset(previous, mode as UsageQueryMode),
+                            )
+                          }
+                        >
+                          <SelectTrigger variant="plain" className="h-8 w-full shadow-none">
+                            {/* value≠label:闭合态必须显式渲染本地化标签(coding-plan → codingPlan 键)。 */}
+                            <SelectValue>
+                              {t(
+                                usageQuery.mode === "coding-plan"
+                                  ? "settings.providerUsageMode.codingPlan"
+                                  : `settings.providerUsageMode.${usageQuery.mode}`,
+                              )}
+                            </SelectValue>
+                          </SelectTrigger>
+                          <SelectContent>
+                            <SelectItem value="custom">
+                              {t("settings.providerUsageMode.custom")}
+                            </SelectItem>
+                            <SelectItem value="general">
+                              {t("settings.providerUsageMode.general")}
+                            </SelectItem>
+                            <SelectItem value="newapi">
+                              {t("settings.providerUsageMode.newapi")}
+                            </SelectItem>
+                            <SelectItem value="balance">
+                              {t("settings.providerUsageMode.balance")}
+                            </SelectItem>
+                            <SelectItem value="coding-plan">
+                              {t("settings.providerUsageMode.codingPlan")}
+                            </SelectItem>
+                          </SelectContent>
+                        </Select>
+                      </FormField>
+
+                      {usageQuery.mode !== "custom" ? (
+                        <SettingsHint className="mt-3">
+                          {usageQuery.mode === "general"
+                            ? t("settings.providerUsageTemplate.general")
+                            : usageQuery.mode === "newapi"
+                              ? t("settings.providerUsageTemplate.newapi")
+                              : usageQuery.mode === "balance"
+                                ? t("settings.providerUsageTemplate.balance")
+                                : t("settings.providerUsageTemplate.codingPlan")}
+                        </SettingsHint>
+                      ) : null}
+
+                      {/* 官方余额:按 Base URL 匹配到的供应商徽章。 */}
+                      {usageQuery.mode === "balance" && matchedBalanceProviders.length > 0 ? (
+                        <div className="mt-3 flex flex-wrap gap-2">
+                          {matchedBalanceProviders.map((entry) => (
+                            <span
+                              key={entry.id}
+                              className={cn(
+                                "inline-flex items-center rounded-md bg-primary/10 px-2.5 py-1",
+                                "text-xs font-medium text-primary",
+                              )}
+                            >
+                              {entry.label}
+                            </span>
+                          ))}
+                        </div>
+                      ) : null}
+
+                      {/* 只有通用模板需要用户自行填写 baseUrl / apiKey 覆盖。 */}
+                      {usageQuery.mode === "general" ? (
+                        <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                          <FormField>
+                            <FormFieldLabel htmlFor="usage-query-base-url">
+                              {t("settings.providerUsageBaseUrl")}
+                            </FormFieldLabel>
+                            <Input
+                              variant="plain"
+                              id="usage-query-base-url"
+                              className="h-8 shadow-none"
+                              value={usageQuery.baseUrl}
+                              placeholder={baseUrl.trim() || undefined}
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                setUsageQuery((previous) => ({
+                                  ...previous,
+                                  baseUrl: value,
+                                }));
+                              }}
+                            />
+                          </FormField>
+                          <FormField>
+                            <FormFieldLabel htmlFor="usage-query-api-key">
+                              {t("settings.providerUsageApiKey")}
+                            </FormFieldLabel>
+                            <Input
+                              variant="plain"
+                              id="usage-query-api-key"
+                              className="h-8 shadow-none"
+                              type="password"
+                              value={usageQuery.apiKey}
+                              autoComplete="off"
+                              onFocus={(event) => event.currentTarget.select()}
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                setUsageQuery((previous) => ({
+                                  ...previous,
+                                  apiKey: value,
+                                }));
+                              }}
+                            />
+                          </FormField>
+                        </div>
+                      ) : null}
+
+                      {/* 自定义模式:只读展示变量的实际生效值(对齐 cc-switch 支持的变量区)。 */}
+                      {usageQuery.mode === "custom" ? (
+                        <div className="mt-4 rounded-lg border bg-muted/30 px-3 py-2.5 text-xs leading-5">
+                          <div className="font-medium text-foreground">
+                            {t("settings.providerUsageVariables")}
+                          </div>
+                          <div className="mt-2 flex min-w-0 items-center gap-2">
+                            <code className="shrink-0 font-mono text-emerald-600 dark:text-emerald-400">
+                              {"{{baseUrl}}"}
+                            </code>
+                            <span className="text-muted-foreground/60">=</span>
+                            {usageVariableBaseUrl ? (
+                              <code className="break-all font-mono text-muted-foreground">
+                                {usageVariableBaseUrl}
+                              </code>
+                            ) : (
+                              <span className="text-muted-foreground/60 italic">
+                                {t("settings.providerUsageVariableNotSet")}
+                              </span>
+                            )}
+                          </div>
+                          <div className="mt-1 flex min-w-0 items-center gap-2">
+                            <code className="shrink-0 font-mono text-emerald-600 dark:text-emerald-400">
+                              {"{{apiKey}}"}
+                            </code>
+                            <span className="text-muted-foreground/60">=</span>
+                            {usageVariableApiKey ? (
+                              <>
+                                <code className="break-all font-mono text-muted-foreground">
+                                  {!isGatewayWebui && showUsageVariableApiKey
+                                    ? usageVariableApiKey
+                                    : "••••••••"}
+                                </code>
+                                {/* WebUI 永不下发明文 apiKey,查看按钮只在桌面端提供。 */}
+                                {!isGatewayWebui ? (
+                                  <button
+                                    type="button"
+                                    className="shrink-0 text-muted-foreground transition-colors hover:text-foreground"
+                                    onClick={() =>
+                                      setShowUsageVariableApiKey((previous) => !previous)
+                                    }
+                                    title={
+                                      showUsageVariableApiKey
+                                        ? t("settings.hideApiKey")
+                                        : t("settings.showApiKey")
+                                    }
+                                    aria-label={
+                                      showUsageVariableApiKey
+                                        ? t("settings.hideApiKey")
+                                        : t("settings.showApiKey")
+                                    }
+                                  >
+                                    {showUsageVariableApiKey ? (
+                                      <EyeOff className="size-3" />
+                                    ) : (
+                                      <Eye className="size-3" />
+                                    )}
+                                  </button>
+                                ) : null}
+                              </>
+                            ) : (
+                              <span className="text-muted-foreground/60 italic">
+                                {t("settings.providerUsageVariableNotSet")}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ) : null}
+
+                      {usageQuery.mode === "newapi" ? (
+                        <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                          <FormField>
+                            <FormFieldLabel htmlFor="usage-query-access-token">
+                              {t("settings.providerUsageAccessToken")}
+                            </FormFieldLabel>
+                            <Input
+                              variant="plain"
+                              id="usage-query-access-token"
+                              className="h-8 shadow-none"
+                              type="password"
+                              value={usageQuery.accessToken}
+                              autoComplete="off"
+                              onFocus={(event) => event.currentTarget.select()}
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                setUsageQuery((previous) => ({
+                                  ...previous,
+                                  accessToken: value,
+                                }));
+                              }}
+                            />
+                          </FormField>
+                          <FormField>
+                            <FormFieldLabel htmlFor="usage-query-user-id">
+                              {t("settings.providerUsageUserId")}
+                            </FormFieldLabel>
+                            <Input
+                              variant="plain"
+                              id="usage-query-user-id"
+                              className="h-8 shadow-none"
+                              value={usageQuery.userId}
+                              onChange={(event) => {
+                                const value = event.currentTarget.value;
+                                setUsageQuery((previous) => ({
+                                  ...previous,
+                                  userId: value,
+                                }));
+                              }}
+                            />
+                          </FormField>
+                        </div>
+                      ) : null}
+
+                      {usageQuery.mode === "coding-plan" ? (
+                        <>
+                          {/* 内置供应商选择(一比一复刻 cc-switch Token Plan):
+                            显式选择优先,否则按 Base URL 自动检测高亮。 */}
+                          <div className="mt-4 flex flex-wrap gap-2">
+                            {USAGE_QUERY_CODING_PLAN_PROVIDERS.map((entry) => (
+                              <Button
+                                key={entry.id}
+                                type="button"
+                                size="sm"
+                                variant={
+                                  activeCodingPlanProvider === entry.id ? "default" : "outline"
+                                }
+                                onClick={() =>
+                                  setUsageQuery((previous) => ({
+                                    ...previous,
+                                    codingPlanProvider: entry.id,
+                                  }))
+                                }
+                              >
+                                {entry.label}
+                              </Button>
+                            ))}
+                          </div>
+
+                          {activeCodingPlanProvider === "zenmux" ? (
+                            <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                              <FormField>
+                                <FormFieldLabel htmlFor="usage-query-zenmux-base-url">
+                                  {t("settings.providerUsageBaseUrl")}
+                                </FormFieldLabel>
+                                <Input
+                                  variant="plain"
+                                  id="usage-query-zenmux-base-url"
+                                  className="h-8 shadow-none"
+                                  value={usageQuery.baseUrl}
+                                  placeholder="https://api.zenmux.com/v1/..."
+                                  onChange={(event) => {
+                                    const value = event.currentTarget.value;
+                                    setUsageQuery((previous) => ({
+                                      ...previous,
+                                      baseUrl: value,
+                                    }));
+                                  }}
+                                />
+                              </FormField>
+                              <FormField>
+                                <FormFieldLabel htmlFor="usage-query-zenmux-api-key">
+                                  {t("settings.providerUsageApiKey")}
+                                </FormFieldLabel>
+                                <Input
+                                  variant="plain"
+                                  id="usage-query-zenmux-api-key"
+                                  className="h-8 shadow-none"
+                                  type="password"
+                                  value={usageQuery.apiKey}
+                                  autoComplete="off"
+                                  placeholder="sk-..."
+                                  onFocus={(event) => event.currentTarget.select()}
+                                  onChange={(event) => {
+                                    const value = event.currentTarget.value;
+                                    setUsageQuery((previous) => ({
+                                      ...previous,
+                                      apiKey: value,
+                                    }));
+                                  }}
+                                />
+                              </FormField>
+                            </div>
+                          ) : null}
+
+                          {activeCodingPlanProvider === "zhipu_team" ? (
+                            <>
+                              <SettingsHint className="mt-3">
+                                {t("settings.providerUsageZhipuTeamHint")}{" "}
+                                {t("settings.providerUsageZhipuTeamConsoleLink")}{" "}
+                                <a
+                                  href="https://bigmodel.cn/coding-plan/team/usage-stats"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-primary hover:underline"
+                                >
+                                  bigmodel.cn/coding-plan/team/usage-stats
+                                </a>
+                              </SettingsHint>
+                              <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                                <FormField>
+                                  <FormFieldLabel htmlFor="usage-query-team-organization-id">
+                                    {t("settings.providerUsageOrganizationId")}
+                                  </FormFieldLabel>
+                                  <Input
+                                    variant="plain"
+                                    id="usage-query-team-organization-id"
+                                    className="h-8 shadow-none"
+                                    value={usageQuery.teamOrganizationId}
+                                    placeholder={t(
+                                      "settings.providerUsageOrganizationIdPlaceholder",
+                                    )}
+                                    onChange={(event) => {
+                                      const value = event.currentTarget.value;
+                                      setUsageQuery((previous) => ({
+                                        ...previous,
+                                        teamOrganizationId: value,
+                                      }));
+                                    }}
+                                  />
+                                </FormField>
+                                <FormField>
+                                  <FormFieldLabel htmlFor="usage-query-team-project-id">
+                                    {t("settings.providerUsageProjectId")}
+                                  </FormFieldLabel>
+                                  <Input
+                                    variant="plain"
+                                    id="usage-query-team-project-id"
+                                    className="h-8 shadow-none"
+                                    value={usageQuery.teamProjectId}
+                                    placeholder={t("settings.providerUsageProjectIdPlaceholder")}
+                                    onChange={(event) => {
+                                      const value = event.currentTarget.value;
+                                      setUsageQuery((previous) => ({
+                                        ...previous,
+                                        teamProjectId: value,
+                                      }));
+                                    }}
+                                  />
+                                </FormField>
+                              </div>
+                            </>
+                          ) : null}
+
+                          {activeCodingPlanProvider === "volcengine" ? (
+                            <>
+                              <SettingsHint className="mt-3">
+                                {t("settings.providerUsageVolcengineHint")}{" "}
+                                {t("settings.providerUsageVolcengineConsoleLink")}{" "}
+                                <a
+                                  href="https://console.volcengine.com/iam/keymanage"
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="text-primary hover:underline"
+                                >
+                                  console.volcengine.com/iam/keymanage
+                                </a>
+                              </SettingsHint>
+                              <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                                <FormField>
+                                  <FormFieldLabel htmlFor="usage-query-access-key-id">
+                                    {t("settings.providerUsageAccessKeyId")}
+                                  </FormFieldLabel>
+                                  <Input
+                                    variant="plain"
+                                    id="usage-query-access-key-id"
+                                    className="h-8 shadow-none"
+                                    value={usageQuery.accessKeyId}
+                                    onChange={(event) => {
+                                      const value = event.currentTarget.value;
+                                      setUsageQuery((previous) => ({
+                                        ...previous,
+                                        accessKeyId: value,
+                                      }));
+                                    }}
+                                  />
+                                </FormField>
+                                <FormField>
+                                  <FormFieldLabel htmlFor="usage-query-secret-access-key">
+                                    {t("settings.providerUsageSecretAccessKey")}
+                                  </FormFieldLabel>
+                                  <Input
+                                    variant="plain"
+                                    id="usage-query-secret-access-key"
+                                    className="h-8 shadow-none"
+                                    type="password"
+                                    value={usageQuery.secretAccessKey}
+                                    autoComplete="off"
+                                    onFocus={(event) => event.currentTarget.select()}
+                                    onChange={(event) => {
+                                      const value = event.currentTarget.value;
+                                      setUsageQuery((previous) => ({
+                                        ...previous,
+                                        secretAccessKey: value,
+                                      }));
+                                    }}
+                                  />
+                                </FormField>
+                              </div>
+                            </>
+                          ) : null}
+                        </>
+                      ) : null}
+
+                      <div className="mt-4 grid grid-cols-2 gap-3 max-[720px]:grid-cols-1">
+                        <FormField>
+                          <FormFieldLabel htmlFor="usage-query-timeout">
+                            {t("settings.providerUsageTimeout")}
+                          </FormFieldLabel>
+                          <Input
+                            variant="plain"
+                            id="usage-query-timeout"
+                            className="h-8 shadow-none"
+                            inputMode="numeric"
+                            value={usageTimeoutInput}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              setUsageTimeoutInput(value);
+                            }}
+                            onBlur={commitUsageTimeoutInput}
+                          />
+                          <p className="text-xs text-muted-foreground">
+                            {t("settings.providerUsageTimeoutHint")}
+                          </p>
+                        </FormField>
+                      </div>
+
+                      {usageQuery.mode === "custom" ||
+                      usageQuery.mode === "general" ||
+                      usageQuery.mode === "newapi" ? (
+                        <FormField className="mt-4">
+                          <FormFieldLabel htmlFor="usage-query-script">
+                            {t("settings.providerUsageScript")}
+                          </FormFieldLabel>
+                          <Textarea
+                            variant="plain"
+                            id="usage-query-script"
+                            value={usageQuery.script}
+                            className="min-h-36 font-mono text-xs"
+                            placeholder={t("settings.providerUsageScriptPlaceholder")}
+                            spellCheck={false}
+                            onChange={(event) => {
+                              const value = event.currentTarget.value;
+                              // 同步写入当前模式的独立脚本槽位,切换查询方式互不串扰。
+                              setUsageQuery((previous) => setUsageQueryScript(previous, value));
+                            }}
+                          />
+                        </FormField>
+                      ) : null}
+
+                      {/* 测试查询:独占一行的 card——按钮居左,结果内容就地靠左展示。 */}
+                      <div
+                        className={cn(
+                          "mt-4 flex items-center gap-3",
+                          "rounded-xl border bg-card px-4 py-3",
+                        )}
+                      >
+                        <RefreshButton
+                          aria-busy={usageQueryTest.status === "running"}
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          className="h-8 shrink-0 gap-1.5"
+                          disabled={
+                            !persistedUsageQueryProviderId || usageQueryTest.status === "running"
+                          }
+                          onClick={() => void handleTestUsageQuery()}
+                          title={t("settings.providerUsageTest")}
+                          aria-label={t("settings.providerUsageTest")}
+                        >
+                          <RefreshCw
+                            className={cn(
+                              "size-3.5",
+                              usageQueryTest.status === "running" && "animate-spin",
+                            )}
+                          />
+                          {t("settings.providerUsageTest")}
+                        </RefreshButton>
+                        <div className="min-w-0 flex-1 text-xs" role="status" aria-live="polite">
+                          {usageQueryTest.status === "running" ? (
+                            <span className="text-muted-foreground">
+                              {t("settings.providerUsageTestRunning")}
+                            </span>
+                          ) : null}
+                          {usageQueryTest.status === "error" ? (
+                            <span className="text-destructive">
+                              {t("settings.providerUsageTestFailed")}
+                              {usageQueryTest.error ? `: ${usageQueryTest.error}` : ""}
+                            </span>
+                          ) : null}
+                          {usageQueryTest.status === "success" ? (
+                            usageQueryTest.data.length > 0 ? (
+                              <div className="flex flex-col gap-1">
+                                {usageQueryTest.data.map((plan, index) => (
+                                  <UsagePlanLine
+                                    key={`${plan.planName ?? ""}:${
+                                      // biome-ignore lint/suspicious/noArrayIndexKey: 套餐无稳定 id,索引即位置语义
+                                      index
+                                    }`}
+                                    plan={getUsagePlanDisplay(plan)}
+                                  />
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-muted-foreground">
+                                {t("settings.providerUsageTestEmpty")}
+                              </span>
+                            )
+                          ) : null}
+                          {usageQueryTest.status === "idle" && !persistedUsageQueryProviderId ? (
+                            <span className="text-muted-foreground">
+                              {t("settings.providerUsageTestSavedHint")}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+
+                      {usageQuery.mode === "custom" ||
+                      usageQuery.mode === "general" ||
+                      usageQuery.mode === "newapi" ? (
+                        <div
+                          className={cn(
+                            "mt-4 rounded-lg border bg-muted/30 px-3 py-2.5",
+                            "text-xs leading-5 text-muted-foreground",
+                          )}
+                        >
+                          <div className="font-medium text-foreground">
+                            {t("settings.providerUsageScriptHelp")}
+                          </div>
+                          <div className="mt-2 font-medium">
+                            {t("settings.providerUsageScriptHelpFormat")}
+                          </div>
+                          <pre
+                            className={cn(
+                              "mt-1 overflow-x-auto rounded-md border bg-background/60 p-2",
+                              "font-mono text-xs leading-4",
+                            )}
+                          >
+                            {USAGE_QUERY_SCRIPT_HELP_EXAMPLE}
+                          </pre>
+                          <div className="mt-2 font-medium">
+                            {t("settings.providerUsageScriptHelpExtractor")}
+                          </div>
+                          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                            <li>{t("settings.providerUsageScriptHelpField.planName")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.total")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.used")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.remaining")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.unit")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.isValid")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.invalidMessage")}</li>
+                            <li>{t("settings.providerUsageScriptHelpField.extra")}</li>
+                          </ul>
+                          <div className="mt-2 font-medium">
+                            {t("settings.providerUsageScriptHelpTips")}
+                          </div>
+                          <ul className="mt-1 list-disc space-y-0.5 pl-4">
+                            <li>{t("settings.providerUsageScriptHelpTip.variables")}</li>
+                            <li>{t("settings.providerUsageScriptHelpTip.sandbox")}</li>
+                            <li>{t("settings.providerUsageScriptHelpTip.wrap")}</li>
+                            <li>{t("settings.providerUsageScriptHelpTip.origin")}</li>
+                          </ul>
+                        </div>
+                      ) : null}
+                    </>
+                  ) : null}
+                </section>
+              ) : null}
+            </DialogBody>
+            <DialogFooter>
+              <span className="mr-auto text-xs text-muted-foreground">
+                {t("settings.providerAdvancedDraftHint")}
+              </span>
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setActivePanel("general");
+                }}
+              >
+                {t("settings.close")}
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
+        {confirmDialog}
+      </DialogContent>
+    </Dialog>
+  );
+}

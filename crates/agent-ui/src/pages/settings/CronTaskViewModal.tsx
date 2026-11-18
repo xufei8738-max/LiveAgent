@@ -1,0 +1,1041 @@
+import {
+  AlertTriangle,
+  BrushCleaning,
+  CheckCircle2,
+  ChevronDown,
+  Clock3,
+  Folder,
+  Globe,
+  Loader2,
+  MessageSquare,
+  Play,
+  ScrollText,
+  Square,
+  Terminal,
+  Timer,
+  X,
+  XCircle,
+} from "@liveagent/ui/components/IconSet";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import {
+  type CronRunRecord,
+  type CronTask,
+  type CronTaskType,
+  canCancelCronRun,
+  cancelCronRun,
+  clearCronRuns,
+  DEFAULT_CRON_TIMEOUT_SECONDS,
+  isManualCronRunFinished,
+  listCronRuns,
+  MANUAL_CRON_RUN_POLL_INTERVAL_MS,
+  MANUAL_CRON_RUN_TIMEOUT_MS,
+  PROMPT_PENDING_CLAIM_WINDOW_MS,
+  runCronNow,
+  useAutomation,
+} from "@liveagent/ui/lib/automation/index";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Button } from "../../components/ui/button";
+import { Dialog, DialogClose, DialogContent, DialogTitle } from "../../components/ui/dialog";
+import { ConfirmActionPopover } from "./shared";
+
+type CronTaskViewModalProps = {
+  taskId: string;
+  onClose: () => void;
+};
+
+const TYPE_CONFIG: Record<
+  CronTaskType,
+  {
+    icon: typeof Terminal;
+    label: string;
+    accent: string;
+    accentBg: string;
+    accentBorder: string;
+  }
+> = {
+  bash: {
+    icon: Terminal,
+    label: "settings.cronTypeBash",
+    accent: "text-muted-foreground",
+    accentBg: "bg-settings-tile",
+    accentBorder: "border-transparent",
+  },
+  http: {
+    icon: Globe,
+    label: "settings.cronTypeHttp",
+    accent: "text-muted-foreground",
+    accentBg: "bg-settings-tile",
+    accentBorder: "border-transparent",
+  },
+  prompt: {
+    icon: MessageSquare,
+    label: "settings.cronTypePrompt",
+    accent: "text-muted-foreground",
+    accentBg: "bg-settings-tile",
+    accentBorder: "border-transparent",
+  },
+};
+
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+function formatTimestamp(timestamp: number): string {
+  return new Date(timestamp).toLocaleString();
+}
+
+function stringifyHeaders(headers?: Record<string, string>) {
+  if (!headers || Object.keys(headers).length === 0) return "";
+  return JSON.stringify(headers, null, 2);
+}
+
+function stringifyBody(body?: unknown) {
+  if (body === undefined) return "";
+  return JSON.stringify(body, null, 2);
+}
+
+function SectionLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground/70">
+      {children}
+    </div>
+  );
+}
+
+function EmptyConfig({ t }: { t: (key: string) => string }) {
+  return (
+    <div
+      className={cn(
+        "rounded-xl border border-dashed border-border/50 bg-muted/10 py-6",
+        "text-center text-xs text-muted-foreground/60",
+      )}
+    >
+      {t("settings.cronViewNoConfig")}
+    </div>
+  );
+}
+
+/* ─────────────────────── Left panel ─────────────────────── */
+
+function LeftPanel({
+  task,
+  t,
+  cfg,
+  isRunningNow,
+  runNowError,
+  onRunNow,
+  onCancelRun,
+  canCancelRun,
+  isCancelling,
+}: {
+  task: CronTask;
+  t: (key: string) => string;
+  cfg: (typeof TYPE_CONFIG)[CronTaskType];
+  isRunningNow: boolean;
+  runNowError: string | null;
+  onRunNow: () => void;
+  onCancelRun: () => void;
+  canCancelRun: boolean;
+  isCancelling: boolean;
+}) {
+  const TypeIcon = cfg.icon;
+  const script = task.script?.trim() ?? "";
+  const scriptLineCount = script.split(/\r?\n/).filter((line) => line.trim()).length;
+
+  return (
+    <>
+      {/* ── Fixed hero header ── */}
+      <div className="relative shrink-0 overflow-hidden">
+        <div className="relative px-5 pb-4 pt-5 max-[820px]:pr-14">
+          {/* Type badge + run-now button on the hero's top row, kept out of
+              the meta/content area so pill wrapping never moves the button */}
+          <div className="flex items-center justify-between gap-2">
+            <div
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-full border px-2.5 py-1",
+                "text-xs font-semibold",
+                cfg.accent,
+                cfg.accentBg,
+                cfg.accentBorder,
+              )}
+            >
+              <TypeIcon className="size-3" />
+              {t(cfg.label)}
+            </div>
+            <div className="flex shrink-0 items-center gap-1.5">
+              <button
+                type="button"
+                onClick={isRunningNow && canCancelRun ? onCancelRun : onRunNow}
+                disabled={isCancelling || (isRunningNow && !canCancelRun)}
+                title={
+                  isRunningNow
+                    ? canCancelRun
+                      ? t("settings.cronViewCancelRun")
+                      : t("settings.cronViewRunningNow")
+                    : t("settings.cronViewRunNow")
+                }
+                aria-label={
+                  isRunningNow
+                    ? canCancelRun
+                      ? t("settings.cronViewCancelRun")
+                      : t("settings.cronViewRunningNow")
+                    : t("settings.cronViewRunNow")
+                }
+                className={cn(
+                  "flex size-7 shrink-0 items-center justify-center rounded-lg border transition-colors",
+                  cfg.accent,
+                  cfg.accentBg,
+                  cfg.accentBorder,
+                  "hover:brightness-110 disabled:cursor-wait disabled:opacity-60",
+                )}
+              >
+                {isRunningNow ? (
+                  canCancelRun && !isCancelling ? (
+                    <Square className="size-3.5" />
+                  ) : (
+                    <Loader2 className="size-3.5 animate-spin" />
+                  )
+                ) : (
+                  <Play className="size-3.5" />
+                )}
+              </button>
+            </div>
+          </div>
+
+          {/* Name */}
+          <h2 className="mt-3 text-base font-bold leading-tight text-foreground">{task.name}</h2>
+
+          {/* Description */}
+          <p className="mt-1 text-sm leading-relaxed text-muted-foreground">
+            {task.description || t("settings.cronViewNoDesc")}
+          </p>
+
+          {/* Meta pills */}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <div
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-lg bg-amber-500/10 px-2 py-1",
+                "text-xs font-medium text-amber-600 dark:text-amber-400",
+              )}
+            >
+              <Clock3 className="size-3" />
+              <span className="font-mono">{task.cron}</span>
+            </div>
+            <div
+              className={cn(
+                "inline-flex items-center gap-1.5 rounded-lg px-2 py-1 text-xs font-medium",
+                task.enabled
+                  ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                  : "bg-muted text-muted-foreground",
+              )}
+            >
+              <span
+                className={cn(
+                  "size-1.5 rounded-full",
+                  task.enabled ? "bg-emerald-500" : "bg-muted-foreground/40",
+                )}
+              />
+              {task.enabled
+                ? t("settings.cronViewStatusEnabled")
+                : t("settings.cronViewStatusDisabled")}
+            </div>
+            <div
+              className={cn(
+                "inline-flex items-center gap-1 rounded-lg px-2 py-1 text-xs font-medium",
+                task.remainingExecutions === 0
+                  ? "bg-red-500/10 text-red-600 dark:text-red-400"
+                  : task.remainingExecutions == null
+                    ? "bg-muted text-muted-foreground"
+                    : "bg-sky-500/10 text-sky-600 dark:text-sky-400",
+              )}
+              title={
+                task.remainingExecutions == null
+                  ? t("settings.cronRemainingExecutionsUnlimited")
+                  : `${task.remainingExecutions} ${t("settings.cronRemainingExecutionsUnit")}`
+              }
+            >
+              <span className="tabular-nums">
+                {task.remainingExecutions == null ? "∞" : task.remainingExecutions}
+              </span>
+              {task.remainingExecutions == null ? null : (
+                <span>{t("settings.cronRemainingExecutionsUnitShort")}</span>
+              )}
+            </div>
+            <div
+              className={cn(
+                "inline-flex items-center gap-1 rounded-lg bg-muted px-2 py-1",
+                "text-xs font-medium text-muted-foreground",
+              )}
+              title={t("settings.cronTimeoutSeconds")}
+            >
+              <Timer className="size-3" />
+              <span className="tabular-nums">
+                {task.timeoutSeconds ?? DEFAULT_CRON_TIMEOUT_SECONDS}
+                {t("settings.cronTimeoutSecondsUnitShort")}
+              </span>
+            </div>
+            {task.workdir ? (
+              <div
+                className={cn(
+                  "inline-flex max-w-56 items-center gap-1.5 rounded-lg bg-muted px-2 py-1",
+                  "text-xs font-medium text-muted-foreground",
+                )}
+                title={task.workdir}
+              >
+                <Folder className="size-3 shrink-0" />
+                <span className="truncate">{task.workdir}</span>
+              </div>
+            ) : null}
+          </div>
+
+          {runNowError ? (
+            <div
+              className={cn(
+                "mt-3 flex items-start gap-1.5",
+                "rounded-lg border border-red-500/20 bg-red-500/[0.04] px-2.5 py-2",
+                "text-xs leading-relaxed text-red-700 dark:text-red-300",
+              )}
+            >
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              <span className="min-w-0 break-all">
+                {t("settings.cronViewRunNowFailed")}: {runNowError}
+              </span>
+            </div>
+          ) : null}
+
+          {task.lastError ? (
+            <div
+              className={cn(
+                "mt-3 flex items-start gap-1.5",
+                "rounded-lg border border-red-500/20 bg-red-500/[0.04] px-2.5 py-2",
+                "text-xs leading-relaxed text-red-700 dark:text-red-300",
+              )}
+            >
+              <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+              <span className="min-w-0 break-all">{task.lastError}</span>
+            </div>
+          ) : null}
+        </div>
+      </div>
+
+      {/* ── Scrollable config ── */}
+      <div className="min-h-0 flex-1 overflow-y-auto border-t border-border/30 px-5 py-4">
+        <div className="space-y-2.5">
+          <SectionLabel>{t("settings.cronViewConfig")}</SectionLabel>
+
+          {/* Bash */}
+          {task.type === "bash" ? (
+            script ? (
+              <div className="overflow-hidden rounded-xl border border-border/60 bg-muted/30">
+                <div className="flex items-center gap-1.5 border-b border-border/30 px-3 py-2">
+                  <Terminal className="size-3 text-muted-foreground/60" />
+                  <span className="text-xs font-medium text-muted-foreground/60">
+                    {scriptLineCount} {t("settings.cronCommandsCount")}
+                  </span>
+                </div>
+                <pre className="whitespace-pre-wrap break-all px-3 py-2.5 font-mono text-xs leading-relaxed text-foreground/80">
+                  {script}
+                </pre>
+              </div>
+            ) : (
+              <EmptyConfig t={t} />
+            )
+          ) : null}
+
+          {/* HTTP */}
+          {task.type === "http" ? (
+            (task.requests ?? []).length > 0 ? (
+              <div className="space-y-2.5">
+                {(task.requests ?? []).map((req, i) => {
+                  const headersText = stringifyHeaders(req.headers);
+                  const bodyText = stringifyBody(req.body);
+                  const hasHeaders = headersText.trim().length > 0;
+                  const hasBody = bodyText.trim().length > 0;
+                  return (
+                    <div
+                      key={req.id}
+                      className="overflow-hidden rounded-xl border border-border/60 bg-muted/30"
+                    >
+                      <div className="flex items-center gap-2 border-b border-border/30 px-3 py-2.5">
+                        <span
+                          className={cn(
+                            "flex size-5 shrink-0 items-center justify-center",
+                            "rounded-md bg-emerald-500/10 text-tiny font-bold text-emerald-600 dark:text-emerald-400",
+                          )}
+                        >
+                          {i + 1}
+                        </span>
+                        <span className="rounded-md bg-emerald-500/15 px-1.5 py-0.5 text-xs font-bold text-emerald-600 dark:text-emerald-400">
+                          {req.method}
+                        </span>
+                        <code className="min-w-0 flex-1 truncate font-mono text-xs text-foreground/80">
+                          {req.url || "—"}
+                        </code>
+                      </div>
+                      {hasHeaders || hasBody ? (
+                        <div className="space-y-px bg-border/10">
+                          {hasHeaders ? (
+                            <div className="bg-background/60 p-2.5">
+                              <div className="mb-1 text-tiny font-semibold uppercase tracking-wider text-muted-foreground/60">
+                                {t("settings.cronViewHttpHeaders")}
+                              </div>
+                              <pre className="whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-foreground/70">
+                                {headersText}
+                              </pre>
+                            </div>
+                          ) : null}
+                          {hasBody ? (
+                            <div className="bg-background/60 p-2.5">
+                              <div className="mb-1 text-tiny font-semibold uppercase tracking-wider text-muted-foreground/60">
+                                {t("settings.cronViewHttpBody")}
+                              </div>
+                              <pre className="whitespace-pre-wrap break-all font-mono text-xs leading-relaxed text-foreground/70">
+                                {bodyText}
+                              </pre>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                    </div>
+                  );
+                })}
+              </div>
+            ) : (
+              <EmptyConfig t={t} />
+            )
+          ) : null}
+
+          {/* Prompt */}
+          {task.type === "prompt" ? (
+            <div className="space-y-2.5">
+              {task.selectedModel ? (
+                <div className="overflow-hidden rounded-xl border border-border/60 bg-muted/30">
+                  <div className="flex items-center gap-1.5 border-b border-border/30 px-3 py-2">
+                    <MessageSquare className="size-3 text-muted-foreground/60" />
+                    <span className="text-xs font-medium text-muted-foreground/60">
+                      {t("settings.cronPromptModelLabel")}
+                    </span>
+                  </div>
+                  <div className="px-3.5 py-3">
+                    <div className="text-xs font-medium text-foreground/85">
+                      {task.selectedModel.model}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-foreground/70">
+                      {task.selectedModel.customProviderId}
+                    </div>
+                  </div>
+                </div>
+              ) : null}
+
+              {task.prompt?.trim() ? (
+                <div className="overflow-hidden rounded-xl border border-border/60 bg-muted/30">
+                  <div className="flex items-center gap-1.5 border-b border-border/30 px-3 py-2">
+                    <MessageSquare className="size-3 text-muted-foreground/60" />
+                    <span className="text-xs font-medium text-muted-foreground/60">
+                      {t("settings.cronPromptLabel")}
+                    </span>
+                  </div>
+                  <div className="px-3.5 py-3">
+                    <p className="whitespace-pre-wrap text-sm leading-relaxed text-foreground/80">
+                      {task.prompt}
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <EmptyConfig t={t} />
+              )}
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </>
+  );
+}
+
+/* ─────────────────────── Right panel ─────────────────────── */
+
+function RightPanel({
+  task,
+  t,
+  isRunningNow,
+  refreshKey,
+  onRunsLoaded,
+}: {
+  task: CronTask;
+  t: (key: string) => string;
+  isRunningNow: boolean;
+  refreshKey: number;
+  onRunsLoaded: (taskId: string, runs: CronRunRecord[]) => void;
+}) {
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
+  const [logs, setLogs] = useState<CronRunRecord[]>([]);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [isClearing, setIsClearing] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
+  const requestGenerationRef = useRef(0);
+  const clearInFlightRef = useRef(false);
+
+  // refreshKey 是外部的失效信号：不在 effect 体内读取，仅用于父层保存/删除任务后
+  // 强制重跑一次日志拉取，因此关掉多余依赖告警。
+  // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey is an invalidation signal
+  useEffect(() => {
+    let cancelled = false;
+    const taskId = task.id;
+
+    async function loadLogs() {
+      if (clearInFlightRef.current) return;
+      const requestGeneration = ++requestGenerationRef.current;
+      try {
+        const nextLogs = await listCronRuns(taskId, 100);
+        if (
+          !cancelled &&
+          !clearInFlightRef.current &&
+          requestGeneration === requestGenerationRef.current
+        ) {
+          setLoadError(null);
+          setLogs(Array.isArray(nextLogs) ? nextLogs : []);
+          onRunsLoaded(taskId, Array.isArray(nextLogs) ? nextLogs : []);
+        }
+      } catch (error) {
+        // Keep the last successfully loaded list; a failed fetch must not
+        // masquerade as "no logs".
+        if (
+          !cancelled &&
+          !clearInFlightRef.current &&
+          requestGeneration === requestGenerationRef.current
+        ) {
+          setLoadError(error instanceof Error ? error.message : String(error));
+        }
+      }
+    }
+
+    void loadLogs();
+    const timer = window.setInterval(
+      () => {
+        void loadLogs();
+      },
+      isRunningNow ? MANUAL_CRON_RUN_POLL_INTERVAL_MS : 5_000,
+    );
+
+    return () => {
+      cancelled = true;
+      requestGenerationRef.current += 1;
+      window.clearInterval(timer);
+    };
+  }, [isRunningNow, onRunsLoaded, refreshKey, task.id]);
+
+  const runningCount = logs.filter(
+    (log) => log.state === "pending" || log.state === "leased",
+  ).length;
+  const successCount = logs.filter((log) => log.state === "done" && log.success).length;
+  const failCount = logs.filter(
+    (log) => (log.state === "done" || log.state === "expired") && !log.success,
+  ).length;
+  const clearableCount = successCount + failCount;
+
+  async function handleClearLogs() {
+    if (clearableCount === 0 || isClearing) {
+      return;
+    }
+
+    const clearTaskId = task.id;
+    try {
+      setIsClearing(true);
+      clearInFlightRef.current = true;
+      requestGenerationRef.current += 1;
+      setClearError(null);
+      await clearCronRuns(clearTaskId);
+      setExpandedLogId(null);
+      setLogs((current) =>
+        current.filter((log) => log.state === "pending" || log.state === "leased"),
+      );
+    } catch {
+      setClearError(t("settings.cronViewClearLogsFailed"));
+    } finally {
+      clearInFlightRef.current = false;
+      setIsClearing(false);
+    }
+  }
+
+  return (
+    <>
+      {/* ── Fixed header ── */}
+      <div
+        className={cn("flex shrink-0 items-center gap-2 border-b border-border/30", "px-5 py-3.5")}
+      >
+        <ScrollText className="size-4 text-muted-foreground/50" />
+        <span className="text-sm font-semibold text-foreground">{t("settings.cronViewLogs")}</span>
+        <div className="ml-auto flex items-center gap-2">
+          <ConfirmActionPopover
+            title={t("settings.cronViewClearLogsConfirm")}
+            description={
+              <>
+                {t("settings.cronViewClearLogsConfirmDescBefore")}{" "}
+                <span className="font-medium text-foreground">{task.name}</span>
+                {t("settings.cronViewClearLogsConfirmDescAfter")}
+              </>
+            }
+            confirmLabel={t("settings.cronViewClearLogs")}
+            onConfirm={() => {
+              void handleClearLogs();
+            }}
+          >
+            {(open) => (
+              <button
+                type="button"
+                onClick={open}
+                disabled={clearableCount === 0 || isClearing}
+                title={
+                  isClearing ? t("settings.cronViewClearingLogs") : t("settings.cronViewClearLogs")
+                }
+                aria-label={
+                  isClearing ? t("settings.cronViewClearingLogs") : t("settings.cronViewClearLogs")
+                }
+                className={cn(
+                  "flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors",
+                  "hover:bg-muted/60 hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40",
+                )}
+              >
+                <BrushCleaning className="size-3.5" />
+              </button>
+            )}
+          </ConfirmActionPopover>
+          {logs.length > 0 ? (
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full bg-emerald-500/10 px-1.5 py-0.5",
+                "text-tiny font-semibold leading-none text-emerald-600 dark:text-emerald-400",
+              )}
+            >
+              <CheckCircle2 className="size-2.5" />
+              {successCount}
+            </span>
+          ) : null}
+          {logs.length > 0 && failCount > 0 ? (
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full bg-red-500/10 px-1.5 py-0.5",
+                "text-tiny font-semibold leading-none text-red-600 dark:text-red-400",
+              )}
+            >
+              <XCircle className="size-2.5" />
+              {failCount}
+            </span>
+          ) : null}
+          {runningCount > 0 ? (
+            <span
+              className={cn(
+                "inline-flex items-center gap-1 rounded-full bg-sky-500/10 px-1.5 py-0.5",
+                "text-tiny font-semibold leading-none text-sky-600 dark:text-sky-400",
+              )}
+            >
+              <Loader2 className="size-2.5 animate-spin" />
+              {runningCount}
+            </span>
+          ) : null}
+          <DialogClose
+            aria-label={t("settings.cronViewClose")}
+            title={t("settings.cronViewClose")}
+            render={
+              <Button variant="ghost" size="icon-sm" className="size-7 shrink-0 rounded-lg" />
+            }
+          >
+            <X className="size-3.5" />
+          </DialogClose>
+        </div>
+      </div>
+
+      {/* ── Scrollable log list ── */}
+      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">
+        {loadError ? (
+          <div
+            className={cn(
+              "mb-3 flex items-start gap-1.5",
+              "rounded-lg border border-amber-500/20 bg-amber-500/[0.04] px-3 py-2",
+              "text-xs leading-relaxed text-amber-700 dark:text-amber-300",
+            )}
+          >
+            <AlertTriangle className="mt-0.5 size-3 shrink-0" />
+            <span className="min-w-0 break-all">
+              {t("settings.cronViewLogsLoadFailed")}: {loadError}
+            </span>
+          </div>
+        ) : null}
+        {clearError ? (
+          <div
+            className={cn(
+              "mb-3 rounded-lg border border-red-500/20 bg-red-500/[0.03] px-3 py-2",
+              "text-xs text-red-700 dark:text-red-300",
+            )}
+          >
+            {clearError}
+          </div>
+        ) : null}
+        {logs.length > 0 ? (
+          <div className="space-y-2">
+            {logs.map((log) => {
+              const isExpanded = expandedLogId === log.id;
+              const isCancelled = log.terminationReason === "cancelled";
+              const isExpired = log.state === "expired" && !isCancelled;
+              const isRunning = log.state === "pending" || log.state === "leased";
+
+              return (
+                <div
+                  key={log.id}
+                  className={cn(
+                    "overflow-hidden rounded-xl border transition-colors",
+                    isRunning
+                      ? "border-sky-500/20 bg-sky-500/[0.03]"
+                      : log.success
+                        ? "border-border/50 bg-muted/20"
+                        : "border-red-500/20 bg-red-500/[0.03]",
+                  )}
+                >
+                  {/* Summary — fixed-width columns for vertical alignment */}
+                  <button
+                    type="button"
+                    onClick={() => setExpandedLogId(isExpanded ? null : log.id)}
+                    className="settings-log-row flex w-full items-center gap-2 px-3 py-2.5 text-left"
+                  >
+                    {/* Status icon */}
+                    {isRunning ? (
+                      <Loader2 className="size-3.5 shrink-0 animate-spin text-sky-500" />
+                    ) : log.success ? (
+                      <CheckCircle2 className="size-3.5 shrink-0 text-emerald-500" />
+                    ) : (
+                      <XCircle className="size-3.5 shrink-0 text-red-500" />
+                    )}
+                    {/* Timestamp — fixed width */}
+                    <span className="w-130px shrink-0 font-mono text-xs text-foreground/70">
+                      {formatTimestamp(log.startedAt)}
+                    </span>
+                    {/* Status tag — fixed width for alignment */}
+                    <span
+                      className={cn(
+                        "w-36px shrink-0 text-center rounded-full px-1.5 py-0.5",
+                        "text-tiny font-semibold leading-none",
+                        isRunning
+                          ? "bg-sky-500/10 text-sky-600 dark:text-sky-400"
+                          : log.success
+                            ? "bg-emerald-500/10 text-emerald-600 dark:text-emerald-400"
+                            : "bg-red-500/10 text-red-600 dark:text-red-400",
+                      )}
+                    >
+                      {isRunning
+                        ? t("settings.cronViewLogRunning")
+                        : log.success
+                          ? t("settings.cronViewLogSuccess")
+                          : isCancelled
+                            ? t("settings.cronViewLogCancelled")
+                            : isExpired
+                              ? t("settings.cronViewLogExpired")
+                              : t("settings.cronViewLogFailed")}
+                    </span>
+                    {/* Duration — right-aligned fixed width */}
+                    <span className="ml-auto w-48px shrink-0 text-right text-xs tabular-nums text-muted-foreground/50">
+                      {isRunning ? "—" : formatDuration(log.durationMs)}
+                    </span>
+                    {/* Chevron */}
+                    <ChevronDown
+                      className={cn(
+                        "size-3 shrink-0 text-muted-foreground/40 transition-transform",
+                        isExpanded ? "rotate-0" : "-rotate-90",
+                      )}
+                    />
+                  </button>
+
+                  {/* Detail */}
+                  {isExpanded ? (
+                    <div className="space-y-2 border-t border-border/30 bg-muted/10 px-3 py-2.5">
+                      <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                        <span className="text-muted-foreground/60">
+                          {t("settings.cronViewLogDuration")}:{" "}
+                          <span className="font-medium text-foreground/70">
+                            {formatDuration(log.durationMs)}
+                          </span>
+                        </span>
+                        {log.exitCode !== undefined && log.exitCode !== null ? (
+                          <span className="text-muted-foreground/60">
+                            {t("settings.cronViewLogExit")}:{" "}
+                            <span
+                              className={cn(
+                                "font-mono font-medium",
+                                log.exitCode === 0
+                                  ? "text-emerald-600 dark:text-emerald-400"
+                                  : "text-red-600 dark:text-red-400",
+                              )}
+                            >
+                              {log.exitCode}
+                            </span>
+                          </span>
+                        ) : null}
+                      </div>
+                      {log.output ? (
+                        <div className="space-y-1">
+                          <div className="text-tiny font-semibold uppercase tracking-wider text-muted-foreground/50">
+                            {task.type === "prompt"
+                              ? t("settings.cronViewLogConclusion")
+                              : t("settings.cronViewLogOutput")}
+                          </div>
+                          <pre
+                            className={cn(
+                              "whitespace-pre-wrap break-all rounded-lg border px-2.5 py-2",
+                              "font-mono text-xs leading-relaxed",
+                              log.success
+                                ? "border-border/40 bg-background/60 text-foreground/70"
+                                : "border-red-500/15 bg-red-500/[0.03] text-red-700 dark:text-red-300",
+                            )}
+                          >
+                            {log.output}
+                          </pre>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : null}
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div className="flex h-full flex-col items-center justify-center text-center">
+            <ScrollText className="size-8 text-muted-foreground/15" />
+            <p className="mt-3 text-xs font-medium text-muted-foreground/50">
+              {t("settings.cronViewLogsEmpty")}
+            </p>
+            <p className="mt-0.5 text-xs text-muted-foreground/35">
+              {t("settings.cronViewLogsEmptyHint")}
+            </p>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+/* ─────────────────────── Modal shell ─────────────────────── */
+
+export function CronTaskViewModal({ taskId, onClose }: CronTaskViewModalProps) {
+  const { t } = useLocale();
+  // Live subscription: enable/disable toggles, executor decrements and
+  // scheduler errors show up while the modal is open.
+  const { cron } = useAutomation();
+  const task = cron.tasks.find((item) => item.id === taskId);
+  const [isRunningNow, setIsRunningNow] = useState(false);
+  const [manualRunStartedAt, setManualRunStartedAt] = useState<number | null>(null);
+  const [manualRunExecutionId, setManualRunExecutionId] = useState<string | null>(null);
+  const [runsRefreshKey, setRunsRefreshKey] = useState(0);
+  const [runNowError, setRunNowError] = useState<string | null>(null);
+  const [isCancelling, setIsCancelling] = useState(false);
+  const runNowLockRef = useRef(false);
+  const taskViewGenerationRef = useRef(0);
+  const activeTaskIdRef = useRef(taskId);
+
+  const handleRunsLoaded = useCallback((loadedTaskId: string, runs: CronRunRecord[]) => {
+    if (activeTaskIdRef.current !== loadedTaskId) return;
+    const activeRun = runs.find((run) => run.state === "pending" || run.state === "leased");
+    if (!activeRun) {
+      if (!runNowLockRef.current) setIsRunningNow(false);
+      return;
+    }
+
+    setIsRunningNow(true);
+    if (activeRun.counted !== true && !runNowLockRef.current) {
+      runNowLockRef.current = true;
+      setManualRunStartedAt(activeRun.startedAt);
+      setManualRunExecutionId(activeRun.id);
+    }
+  }, []);
+
+  useEffect(() => {
+    activeTaskIdRef.current = taskId;
+    taskViewGenerationRef.current += 1;
+    runNowLockRef.current = false;
+    setManualRunStartedAt(null);
+    setManualRunExecutionId(null);
+    setIsRunningNow(false);
+    setIsCancelling(false);
+    setRunNowError(null);
+  }, [taskId]);
+  // Manual runs are watched for at least the legacy six-minute window, and
+  // longer when the task timeout exceeds it (plus scheduler/completion
+  // slack). Prompt runs may additionally sit in the pending claim window
+  // before their execution lease starts.
+  const manualRunWatchTimeoutMs = Math.max(
+    MANUAL_CRON_RUN_TIMEOUT_MS,
+    (task?.type === "prompt" ? PROMPT_PENDING_CLAIM_WINDOW_MS : 0) +
+      ((task?.timeoutSeconds ?? DEFAULT_CRON_TIMEOUT_SECONDS) + 60) * 1_000,
+  );
+
+  useEffect(() => {
+    if (!task) {
+      onClose();
+    }
+  }, [task, onClose]);
+
+  useEffect(() => {
+    if (manualRunStartedAt == null) return;
+    const startedAt = manualRunStartedAt;
+    const executionId = manualRunExecutionId;
+
+    let cancelled = false;
+    let requestInFlight = false;
+    const runTaskId = taskId;
+    const runTaskGeneration = taskViewGenerationRef.current;
+
+    async function reconcileManualRun() {
+      if (
+        requestInFlight ||
+        activeTaskIdRef.current !== runTaskId ||
+        taskViewGenerationRef.current !== runTaskGeneration
+      )
+        return;
+      requestInFlight = true;
+      try {
+        const runs = await listCronRuns(taskId, 500);
+        if (
+          !cancelled &&
+          activeTaskIdRef.current === runTaskId &&
+          taskViewGenerationRef.current === runTaskGeneration &&
+          isManualCronRunFinished(runs, startedAt, executionId)
+        ) {
+          cancelled = true;
+          runNowLockRef.current = false;
+          setManualRunStartedAt(null);
+          setManualRunExecutionId(null);
+          setIsRunningNow(false);
+          setIsCancelling(false);
+        }
+      } catch {
+        return;
+      } finally {
+        requestInFlight = false;
+      }
+    }
+
+    void reconcileManualRun();
+    const pollTimer = window.setInterval(
+      () => void reconcileManualRun(),
+      MANUAL_CRON_RUN_POLL_INTERVAL_MS,
+    );
+    const timeoutTimer = window.setTimeout(() => {
+      if (
+        cancelled ||
+        activeTaskIdRef.current !== runTaskId ||
+        taskViewGenerationRef.current !== runTaskGeneration
+      )
+        return;
+      cancelled = true;
+      runNowLockRef.current = false;
+      setManualRunStartedAt(null);
+      setManualRunExecutionId(null);
+      setIsRunningNow(false);
+      setIsCancelling(false);
+      setRunNowError(t("settings.cronViewRunNowTimeout"));
+    }, manualRunWatchTimeoutMs);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(pollTimer);
+      window.clearTimeout(timeoutTimer);
+    };
+  }, [manualRunStartedAt, manualRunExecutionId, taskId, manualRunWatchTimeoutMs, t]);
+
+  if (!task) {
+    return null;
+  }
+  const cfg = TYPE_CONFIG[task.type];
+
+  async function handleRunNow(selectedTaskId: string) {
+    if (runNowLockRef.current) return;
+    const requestGeneration = taskViewGenerationRef.current;
+    runNowLockRef.current = true;
+    try {
+      setIsRunningNow(true);
+      setRunNowError(null);
+      const response = await runCronNow(selectedTaskId);
+      if (
+        activeTaskIdRef.current !== selectedTaskId ||
+        taskViewGenerationRef.current !== requestGeneration
+      )
+        return;
+      setManualRunStartedAt(response.startedAt);
+      setManualRunExecutionId(response.executionId ?? null);
+      setRunsRefreshKey((value) => value + 1);
+    } catch (error) {
+      if (
+        activeTaskIdRef.current !== selectedTaskId ||
+        taskViewGenerationRef.current !== requestGeneration
+      )
+        return;
+      runNowLockRef.current = false;
+      setIsRunningNow(false);
+      setRunNowError(error instanceof Error ? error.message : String(error));
+    }
+  }
+
+  async function handleCancelRun(selectedTaskId: string) {
+    if (isCancelling || !runNowLockRef.current) return;
+    const requestGeneration = taskViewGenerationRef.current;
+    setIsCancelling(true);
+    setRunNowError(null);
+    try {
+      await cancelCronRun(selectedTaskId, manualRunExecutionId ?? undefined);
+    } catch (error) {
+      if (
+        activeTaskIdRef.current !== selectedTaskId ||
+        taskViewGenerationRef.current !== requestGeneration
+      )
+        return;
+      setRunNowError(error instanceof Error ? error.message : String(error));
+      setIsCancelling(false);
+    }
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent className="flex h-80dvh max-w-4xl overflow-hidden p-0 max-[820px]:h-full max-[820px]:flex-col">
+        <DialogTitle className="sr-only">{task.name}</DialogTitle>
+        {/* ── Left: task detail ── */}
+        <div className="flex min-h-0 min-w-0 flex-1 max-[820px]:flex-col">
+          <div
+            className={cn(
+              "flex w-380px shrink-0 flex-col",
+              "border-r border-border/40 bg-background",
+              "max-[820px]:max-h-[55%] max-[820px]:w-full max-[820px]:border-b max-[820px]:border-r-0",
+            )}
+          >
+            <LeftPanel
+              task={task}
+              t={t}
+              cfg={cfg}
+              isRunningNow={isRunningNow}
+              runNowError={runNowError}
+              onRunNow={() => {
+                void handleRunNow(task.id);
+              }}
+              onCancelRun={() => {
+                void handleCancelRun(task.id);
+              }}
+              canCancelRun={canCancelCronRun() && manualRunStartedAt !== null}
+              isCancelling={isCancelling}
+            />
+          </div>
+
+          {/* ── Right: logs ── */}
+          <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-muted/5">
+            <RightPanel
+              key={task.id}
+              task={task}
+              t={t}
+              isRunningNow={isRunningNow}
+              refreshKey={runsRefreshKey}
+              onRunsLoaded={handleRunsLoaded}
+            />
+          </div>
+        </div>
+      </DialogContent>
+    </Dialog>
+  );
+}

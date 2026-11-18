@@ -1,0 +1,377 @@
+@import "./tokens.css";
+@import "./animations.css";
+
+/* shimmer — ejected from shadcn/tailwind.css */
+@property --shimmer-angle {
+  syntax: "<angle>";
+  inherits: true;
+  initial-value: 20deg;
+}
+
+@property --shimmer-image {
+  syntax: "*";
+  inherits: false;
+}
+
+@property --shimmer-text-fill {
+  syntax: "*";
+  inherits: false;
+}
+
+/* scroll-fade — ejected from shadcn/tailwind.css (we have no `shadcn` package
+   dependency). Registered so the scroll timeline can interpolate them. */
+@property --scroll-fade-t-size {
+  syntax: "<length-percentage>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+@property --scroll-fade-b-size {
+  syntax: "<length-percentage>";
+  inherits: false;
+  initial-value: 0px;
+}
+
+/* Zones redefine the core text variables so rem-based utilities inherit the
+   local font scale. Portaled popups receive the same variable from React. */
+@layer components {
+  .zone-font-scale,
+  .layer-popover {
+    font-size: calc(1rem * var(--zone-font-scale, 1));
+    --text-tiny: calc(0.625rem * var(--zone-font-scale, 1));
+    --text-xs: calc(0.75rem * var(--zone-font-scale, 1));
+    --text-sm: calc(0.875rem * var(--zone-font-scale, 1));
+    --text-base: calc(1rem * var(--zone-font-scale, 1));
+    --text-lg: calc(1.125rem * var(--zone-font-scale, 1));
+    --text-xl: calc(1.25rem * var(--zone-font-scale, 1));
+    --text-2xl: calc(1.5rem * var(--zone-font-scale, 1));
+    --text-3xl: calc(1.875rem * var(--zone-font-scale, 1));
+    --text-4xl: calc(2.25rem * var(--zone-font-scale, 1));
+    --text-5xl: calc(3rem * var(--zone-font-scale, 1));
+  }
+}
+
+/* Match settings navigation: one tight text line plus 6px-equivalent padding
+   on each side. Unlike fixed pixel heights, this follows the font scale. */
+@utility sidebar-list-row {
+  height: calc(max(1rem, var(--text-sm) * 1.25) + 0.75rem);
+}
+
+@utility layer-raised {
+  z-index: var(--layer-raised);
+}
+
+@utility layer-panel {
+  z-index: var(--layer-panel);
+}
+
+@utility layer-popover {
+  z-index: var(--layer-popover);
+}
+
+@utility layer-modal {
+  z-index: var(--layer-modal);
+}
+
+@utility layer-toast {
+  z-index: var(--layer-toast);
+}
+
+@utility layer-critical {
+  z-index: var(--layer-critical);
+}
+
+@utility rounded-inherit {
+  border-radius: inherit;
+}
+
+@utility shimmer {
+  --_spread: var(--shimmer-spread, calc(var(--spacing-3ch) + var(--spacing-40px)));
+  --_base: currentColor;
+  --_highlight: var(--shimmer-color, oklch(from currentColor l c h / calc(alpha * 0.2)));
+
+  background-image: var(
+    --shimmer-image,
+    linear-gradient(
+      calc(90deg + var(--shimmer-angle)),
+      var(--_base) calc(50% - var(--_spread)),
+      color-mix(in oklch, var(--_highlight), var(--_base) 50%) calc(50% - var(--_spread) * 0.5),
+      var(--_highlight) 50%,
+      color-mix(in oklch, var(--_highlight), var(--_base) 50%) calc(50% + var(--_spread) * 0.5),
+      var(--_base) calc(50% + var(--_spread))
+    )
+  );
+  background-repeat: no-repeat;
+  background-size: calc(200% + var(--_spread) * 2) 100%;
+  background-position: 0 0;
+  background-clip: text;
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: var(--shimmer-text-fill, transparent);
+  animation: tw-shimmer var(--shimmer-duration, var(--ui-duration-2000ms)) linear infinite;
+
+  @variant dark {
+    --_highlight: var(
+      --shimmer-color,
+      oklch(from currentColor max(0.8, calc(l + 0.4)) c h / calc(alpha + 0.4))
+    );
+  }
+
+  &:where([dir="rtl"], [dir="rtl"] *) {
+    animation-direction: reverse;
+  }
+}
+
+@utility shimmer-once {
+  animation-iteration-count: 1;
+}
+
+@utility shimmer-reverse {
+  animation-direction: reverse;
+}
+
+@utility shimmer-none {
+  --shimmer-image: none;
+  --shimmer-text-fill: currentColor;
+}
+
+@utility shimmer-color-* {
+  --shimmer-color: --value(--color, [color]);
+  --shimmer-color: color-mix(
+    in oklch,
+    --value(--color, [color]) calc(--modifier(integer) * 1%),
+    transparent
+  );
+}
+
+@utility shimmer-duration-* {
+  --shimmer-duration: calc(--value(integer) * var(--ui-duration-1ms));
+}
+
+@utility shimmer-spread-* {
+  --shimmer-spread: calc(var(--spacing) * --value(integer));
+  --shimmer-spread: --value([length], [percentage]);
+}
+
+@utility shimmer-angle-* {
+  --shimmer-angle: calc(--value(integer) * 1deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .shimmer {
+    animation: none;
+    background-image: none;
+    -webkit-text-fill-color: currentColor;
+  }
+}
+
+/*
+ * Fades the scroll container's own box, so the gradient stays pinned to the
+ * viewport edges while content moves under it — no overlay element and no
+ * scroll listener. The mask also eats the scrollbar, so the native bar is
+ * hidden alongside it — but only inside the @supports block where the fade is
+ * actually applied. Engines without scroll-driven animations keep their
+ * scrollbar: with neither fade nor bar there would be no overflow affordance
+ * left at all (WKWebView only gained scroll(self y) in Safari 26).
+ */
+@utility scroll-fade {
+  --_scroll-fade-size: var(--scroll-fade-size, var(--spacing-48px));
+  --_scroll-fade-reveal: var(--scroll-fade-reveal, var(--spacing-24px));
+
+  /* Engines without scroll-driven animations get no mask at all (see the
+     @supports block below, which is where mask-image is applied).
+
+     A static fade was tried here first and is wrong: the mask would be applied
+     unconditionally, so the top band stays faded at scrollTop 0 and even when
+     the content does not overflow. Hiding the scrollbar there too would leave
+     no overflow affordance at all, and the fade conveys nothing because it
+     never changes. The workspace list uses scroll-fade-8 (32px)
+     against 30px rows, so the entire first row would sit inside the band.
+     WKWebView (the desktop shell) only gained scroll(self y) in Safari 26, so
+     this path is live, not hypothetical. */
+  --scroll-fade-t-size: 0px;
+  --scroll-fade-b-size: 0px;
+
+  /* Eased alpha ramp rather than a straight `transparent → black`. A linear
+     mask spends most of its depth in the barely-tinted range and reads as "not
+     doing anything"; front-loading the falloff makes the same depth visibly
+     dissolve the row at the edge. */
+  --_scroll-fade-mask: linear-gradient(
+    to bottom,
+    var(--ui-color-00000000) 0,
+    color-mix(in oklab, var(--color-black) 10%, transparent) calc(var(--scroll-fade-t-size) * 0.28),
+    color-mix(in oklab, var(--color-black) 45%, transparent) calc(var(--scroll-fade-t-size) * 0.55),
+    color-mix(in oklab, var(--color-black) 82%, transparent) calc(var(--scroll-fade-t-size) * 0.8),
+    var(--ui-color-000) var(--scroll-fade-t-size),
+    var(--ui-color-000) calc(100% - var(--scroll-fade-b-size)),
+    color-mix(in oklab, var(--color-black) 82%, transparent)
+      calc(100% - var(--scroll-fade-b-size) * 0.8),
+    color-mix(in oklab, var(--color-black) 45%, transparent)
+      calc(100% - var(--scroll-fade-b-size) * 0.55),
+    color-mix(in oklab, var(--color-black) 10%, transparent)
+      calc(100% - var(--scroll-fade-b-size) * 0.28),
+    var(--ui-color-00000000) 100%
+  );
+  @supports (animation-timeline: scroll(self y)) {
+    /* Both edges start clear and the timeline fills them in. When the timeline
+       is inactive — content that doesn't overflow — the effect isn't applied at
+       all, so the 0px values above stand and nothing fades. That's why the
+       clear state has to be the declared one rather than the animated one, and
+       why the mask is only applied inside this block. */
+    -webkit-mask-image: var(--_scroll-fade-mask);
+    mask-image: var(--_scroll-fade-mask);
+    /* The mask would paint the native scrollbar half-faded on engines that
+       still draw one; the fade is the overflow signal from here on. */
+    scrollbar-width: none;
+    &::-webkit-scrollbar {
+      display: none;
+      width: 0;
+      height: 0;
+    }
+    /* Longhands, not the `animation` shorthand: the shorthand gets expanded
+       with `animation-duration: 0s` (CSS Animations 1's initial value), which
+       collapses a scroll-driven animation into a hard snap at the range start.
+       `auto` is what makes it span the range. */
+    animation-name: tw-scroll-fade-in-top, tw-scroll-fade-out-bottom;
+    animation-duration: auto, auto;
+    animation-timing-function: linear, linear;
+    animation-fill-mode: both, both;
+    animation-timeline: scroll(self y);
+    animation-range:
+      0px var(--_scroll-fade-reveal),
+      calc(100% - var(--_scroll-fade-reveal)) 100%;
+  }
+}
+
+@utility scroll-fade-* {
+  --scroll-fade-size: calc(var(--spacing) * --value(integer));
+  --scroll-fade-size: --value([length], [percentage]);
+}
+
+/* Shared component defaults that are consumed by Tailwind utilities. */
+.project-terminal-viewport {
+  --project-terminal-padding-x: 0.75rem;
+  --project-terminal-padding-y: 0.625rem;
+  --project-terminal-scrollbar-size: var(--spacing-8px);
+  --project-terminal-background: hsl(var(--background));
+}
+
+/* Frozen while the turn waits on the user: still legible as an indicator,
+   but visibly not cycling. */
+
+@layer utilities {
+  .font-chat {
+    font-family: var(--chat-font-family);
+  }
+}
+
+/* Streamdown owns these document-level portals, so no React component can carry the utilities. */
+body > div:has([data-streamdown="table-fullscreen"]):not(#root) {
+  -webkit-transform: translateZ(0);
+  transform: translateZ(0);
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    -webkit-user-select: none;
+    user-select: none;
+  }
+
+  /* Keep Base UI portals above page-local stacking contexts without z-index escalation. */
+  #root {
+    isolation: isolate;
+  }
+
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--app-font-family);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  button,
+  input,
+  select,
+  textarea {
+    font: inherit;
+  }
+
+  input,
+  textarea,
+  [contenteditable="true"],
+  [contenteditable="plaintext-only"] {
+    -webkit-user-select: text;
+    user-select: text;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus,
+  textarea:focus,
+  select:focus,
+  [contenteditable="true"]:focus,
+  [contenteditable="plaintext-only"]:focus,
+  [role="textbox"]:focus {
+    outline: none;
+  }
+
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):focus-visible,
+  textarea:focus-visible,
+  select:focus-visible,
+  [contenteditable="true"]:focus-visible,
+  [contenteditable="plaintext-only"]:focus-visible,
+  [role="textbox"]:focus-visible {
+    --tw-ring-offset-shadow: 0 0 var(--ui-color-00000000);
+    --tw-ring-shadow: 0 0 var(--ui-color-00000000);
+    border-color: hsl(var(--input));
+    box-shadow: var(--tw-shadow, 0 0 var(--ui-color-00000000));
+  }
+
+  ::-webkit-scrollbar {
+    width: var(--spacing-6px);
+    height: var(--spacing-6px);
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted-foreground) / 0.2);
+    border-radius: var(--radius-3px);
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground) / 0.35);
+  }
+}
+
+/* Keep the native transcript rail easy to grab and full-height beside the
+   floating composer. No JS geometry updates on the scroll path. */
+.chat-transcript-scrollbar::-webkit-scrollbar {
+  width: 14px;
+}
+.chat-transcript-scrollbar::-webkit-scrollbar-track {
+  margin-top: 8px;
+  margin-bottom: 8px;
+}
+.chat-transcript-scrollbar::-webkit-scrollbar-thumb {
+  min-height: 36px;
+  border: 4px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+
+/* Find in conversation, painted with the CSS Custom Highlight API (engines
+   without it paint nothing; the find bar still counts and navigates). */
+::highlight(transcript-find-match) {
+  background-color: color-mix(in oklab, var(--color-amber-300) 45%, transparent);
+}
+::highlight(transcript-find-active) {
+  background-color: var(--color-amber-400);
+  color: var(--color-black);
+}

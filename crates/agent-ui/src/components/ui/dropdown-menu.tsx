@@ -1,0 +1,214 @@
+import { Menu } from "@base-ui/react";
+import * as React from "react";
+import { cn } from "../../lib/shared/utils";
+import { floatingSurfaceClassName, menuSurfaceClassName } from "./menu-surface";
+import { useZoneFontScaleStyle } from "./zone-font-scale";
+
+export const DropdownMenu = Menu.Root;
+export const DropdownMenuTrigger = Menu.Trigger;
+export const DropdownMenuSub = Menu.SubmenuRoot;
+
+type MenuVariant = "default" | "soft";
+const MenuVariantContext = React.createContext<MenuVariant>("default");
+const softMenuClassName = cn(menuSurfaceClassName, "p-1.5");
+const softItemClassName =
+  "rounded-lg px-2.5 data-[highlighted]:bg-settings-active data-[highlighted]:text-foreground data-[popup-open]:bg-settings-active";
+
+type DropdownMenuContentProps = React.ComponentPropsWithoutRef<typeof Menu.Popup> & {
+  variant?: MenuVariant;
+  portalContainer?: React.ComponentPropsWithoutRef<typeof Menu.Portal>["container"];
+} & Pick<
+    React.ComponentPropsWithoutRef<typeof Menu.Positioner>,
+    "side" | "align" | "sideOffset" | "collisionPadding" | "anchor" | "positionMethod"
+  >;
+
+export const DropdownMenuContent = React.forwardRef<HTMLDivElement, DropdownMenuContentProps>(
+  (
+    {
+      className,
+      variant = "default",
+      side,
+      align,
+      sideOffset = 4,
+      collisionPadding,
+      portalContainer,
+      anchor,
+      positionMethod,
+      children,
+      ...props
+    },
+    ref,
+  ) => {
+    const zoneStyle = useZoneFontScaleStyle();
+    return (
+      <Menu.Portal container={portalContainer}>
+        <Menu.Positioner
+          anchor={anchor}
+          positionMethod={positionMethod}
+          side={side}
+          align={align}
+          sideOffset={sideOffset}
+          collisionPadding={collisionPadding}
+          className="layer-popover"
+          style={zoneStyle}
+        >
+          <Menu.Popup
+            ref={ref}
+            className={cn(
+              "min-w-48 max-h-select-popup overflow-x-hidden overflow-y-auto",
+              floatingSurfaceClassName,
+              "p-1",
+              "data-[open]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[open]:fade-in-0 data-[closed]:zoom-out-95 data-[open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2",
+              "data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+              variant === "soft" && softMenuClassName,
+              className,
+            )}
+            {...props}
+          >
+            <MenuVariantContext.Provider value={variant}>{children}</MenuVariantContext.Provider>
+          </Menu.Popup>
+        </Menu.Positioner>
+      </Menu.Portal>
+    );
+  },
+);
+DropdownMenuContent.displayName = "DropdownMenuContent";
+
+export const DropdownMenuLabel = React.forwardRef<
+  HTMLDivElement,
+  React.HTMLAttributes<HTMLDivElement>
+>(({ className, ...props }, ref) => (
+  <div ref={ref} className={cn("px-2 py-1.5 text-sm font-semibold", className)} {...props} />
+));
+DropdownMenuLabel.displayName = "DropdownMenuLabel";
+
+export const DropdownMenuSeparator = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof Menu.Separator>
+>(({ className, ...props }, ref) => (
+  <Menu.Separator ref={ref} className={cn("-mx-1 my-1 h-px bg-muted", className)} {...props} />
+));
+DropdownMenuSeparator.displayName = "DropdownMenuSeparator";
+
+type DropdownMenuSubTriggerProps = React.ComponentPropsWithoutRef<typeof Menu.SubmenuTrigger> & {
+  // Menu-button style trigger (e.g. an icon "⋯" button): disables hover-open,
+  // which flips Base UI's click handling from open-only to an open/close
+  // toggle so a second click dismisses the submenu.
+  clickToggle?: boolean;
+};
+
+export const DropdownMenuSubTrigger = React.forwardRef<HTMLElement, DropdownMenuSubTriggerProps>(
+  ({ className, clickToggle, ...props }, ref) => (
+    <Menu.SubmenuTrigger
+      ref={ref}
+      openOnHover={clickToggle ? false : undefined}
+      className={cn(
+        "relative flex cursor-default select-none items-center rounded-xs px-2 py-1.5",
+        "text-sm outline-hidden transition-colors",
+        "data-[disabled]:pointer-events-none data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[popup-open]:bg-accent data-[popup-open]:text-accent-foreground data-[disabled]:opacity-50",
+        React.useContext(MenuVariantContext) === "soft" && softItemClassName,
+        className,
+      )}
+      {...props}
+    />
+  ),
+);
+DropdownMenuSubTrigger.displayName = "DropdownMenuSubTrigger";
+
+export const DropdownMenuSubContent = React.forwardRef<HTMLDivElement, DropdownMenuContentProps>(
+  (
+    {
+      className,
+      variant = "default",
+      children,
+      side = "right",
+      align = "start",
+      sideOffset = 6,
+      collisionPadding,
+      portalContainer,
+      anchor,
+      positionMethod,
+      ...props
+    },
+    ref,
+  ) => {
+    const zoneStyle = useZoneFontScaleStyle();
+    return (
+      <Menu.Portal container={portalContainer}>
+        <Menu.Positioner
+          anchor={anchor}
+          positionMethod={positionMethod}
+          side={side}
+          align={align}
+          sideOffset={sideOffset}
+          collisionPadding={collisionPadding}
+          className="layer-popover"
+          style={zoneStyle}
+        >
+          <Menu.Popup
+            ref={ref}
+            className={cn(
+              "min-w-48 max-h-select-popup overflow-x-hidden overflow-y-auto",
+              floatingSurfaceClassName,
+              "p-1",
+              "data-[open]:animate-in data-[closed]:animate-out data-[closed]:fade-out-0 data-[open]:fade-in-0 data-[closed]:zoom-out-95 data-[open]:zoom-in-95 data-[side=bottom]:slide-in-from-top-2 data-[side=left]:slide-in-from-right-2",
+              "data-[side=right]:slide-in-from-left-2 data-[side=top]:slide-in-from-bottom-2",
+              variant === "soft" && softMenuClassName,
+              className,
+            )}
+            {...props}
+          >
+            <MenuVariantContext.Provider value={variant}>{children}</MenuVariantContext.Provider>
+          </Menu.Popup>
+        </Menu.Positioner>
+      </Menu.Portal>
+    );
+  },
+);
+DropdownMenuSubContent.displayName = "DropdownMenuSubContent";
+
+type DropdownMenuItemProps = React.ComponentPropsWithoutRef<typeof Menu.Item> & {
+  onSelect?: () => void;
+};
+
+export const DropdownMenuItem = React.forwardRef<HTMLDivElement, DropdownMenuItemProps>(
+  ({ className, onSelect, onClick, ...props }, ref) => (
+    <Menu.Item
+      ref={ref}
+      className={cn(
+        "relative flex cursor-default select-none items-center rounded-xs px-2 py-1.5",
+        "text-sm outline-hidden transition-colors",
+        "data-[highlighted]:bg-accent data-[highlighted]:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
+        React.useContext(MenuVariantContext) === "soft" && softItemClassName,
+        className,
+      )}
+      {...props}
+      onClick={(e) => {
+        onSelect?.();
+        onClick?.(e);
+      }}
+    />
+  ),
+);
+DropdownMenuItem.displayName = "DropdownMenuItem";
+
+export const DropdownMenuRadioGroup = Menu.RadioGroup;
+export const DropdownMenuRadioItem = React.forwardRef<
+  HTMLDivElement,
+  React.ComponentPropsWithoutRef<typeof Menu.RadioItem>
+>(({ className, children, ...props }, ref) => (
+  <Menu.RadioItem
+    ref={ref}
+    className={cn(
+      "flex cursor-default items-center justify-between gap-3 rounded-md px-3 py-2",
+      "text-sm outline-none data-[highlighted]:bg-accent data-[disabled]:opacity-50",
+      React.useContext(MenuVariantContext) === "soft" && softItemClassName,
+      className,
+    )}
+    {...props}
+  >
+    {children}
+    <Menu.RadioItemIndicator aria-hidden="true">✓</Menu.RadioItemIndicator>
+  </Menu.RadioItem>
+));
+DropdownMenuRadioItem.displayName = "DropdownMenuRadioItem";

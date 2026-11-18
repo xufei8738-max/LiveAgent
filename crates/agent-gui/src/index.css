@@ -1,0 +1,28 @@
+@import "tailwindcss";
+@import "../../agent-ui/src/styles/base.css";
+@reference "../../agent-ui/src/styles/semantic-colors.css";
+@plugin "@tailwindcss/typography";
+@custom-variant dark (&:is(.dark *));
+@source "../index.html";
+@source "../node_modules/streamdown/dist/*.js";
+@source "../node_modules/@streamdown/code/dist/*.js";
+@source "../node_modules/@streamdown/cjk/dist/*.js";
+@source "../node_modules/@streamdown/math/dist/*.js";
+@source "../node_modules/@streamdown/mermaid/dist/*.js";
+@source "../../agent-ui/src";
+
+@font-face {
+  font-family: "OpenAI Sans Semibold";
+  src: url("../../agent-ui/src/assets/font/OpenAISans-Semibold.woff2") format("woff2");
+  font-style: normal;
+  font-weight: normal;
+  font-display: swap;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    overscroll-behavior: none;
+  }
+}

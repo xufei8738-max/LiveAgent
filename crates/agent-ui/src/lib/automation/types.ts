@@ -1,0 +1,324 @@
+// Wire types for the automation domain (cron tasks + conversation hooks).
+// Mirrors src-tauri/src/services/automation/types.rs — the Rust side is the
+// single source of truth; both frontends consume these shapes verbatim.
+
+export type CronTaskType = "bash" | "http" | "prompt";
+
+export type HookType = "command" | "http";
+
+export type HookEvent =
+  | "agent_start"
+  | "turn_start"
+  | "message_start"
+  | "message_end"
+  | "tool_execution_start"
+  | "tool_execution_end"
+  | "turn_end"
+  | "agent_end";
+
+export type HttpMethod = "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS";
+
+export const HOOK_EVENTS: HookEvent[] = [
+  "agent_start",
+  "turn_start",
+  "message_start",
+  "message_end",
+  "tool_execution_start",
+  "tool_execution_end",
+  "turn_end",
+  "agent_end",
+];
+
+export const HTTP_METHODS: HttpMethod[] = [
+  "GET",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "HEAD",
+  "OPTIONS",
+];
+
+/// Header values are replaced with this sentinel in snapshots that leave the
+/// desktop; sending it back in a patch keeps the stored secret unchanged.
+export const MASKED_HEADER_VALUE = "__liveagent-masked__";
+
+/**
+ * Per-task execution timeout (seconds) applied to bash scripts, each http
+ * request and the prompt run execution lease. Bounds mirror the Rust
+ * validator (`MIN_CRON_TIMEOUT_SECONDS` / `max_cron_timeout_seconds`); the
+ * bash/http max matches the shell runner's hard ten-minute cap, while prompt
+ * runs execute in the frontend and get a higher ceiling. Snapshots from
+ * desktops older than this field omit it — resolve absent values to the
+ * default for display.
+ */
+export const DEFAULT_CRON_TIMEOUT_SECONDS = 300;
+export const MIN_CRON_TIMEOUT_SECONDS = 1;
+export const MAX_BASH_HTTP_CRON_TIMEOUT_SECONDS = 600;
+export const MAX_PROMPT_CRON_TIMEOUT_SECONDS = 3600;
+
+export function maxCronTimeoutSeconds(type: CronTaskType): number {
+  return type === "prompt" ? MAX_PROMPT_CRON_TIMEOUT_SECONDS : MAX_BASH_HTTP_CRON_TIMEOUT_SECONDS;
+}
+
+/**
+ * How long a queued prompt run may wait unclaimed before the Rust sweep
+ * expires it (mirrors `PROMPT_PENDING_CLAIM_WINDOW_MS` in store.rs). The
+ * task's own timeout only starts counting at claim time.
+ */
+export const PROMPT_PENDING_CLAIM_WINDOW_MS = 600_000;
+
+export function canHttpMethodHaveBody(method: HttpMethod): boolean {
+  return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";
+}
+
+export type HttpRequestSpec = {
+  id: string;
+  url: string;
+  method: HttpMethod;
+  headers?: Record<string, string>;
+  body?: unknown;
+};
+
+export type SelectedModelRef = {
+  customProviderId: string;
+  model: string;
+};
+
+export type CronTask = {
+  id: string;
+  name: string;
+  description: string;
+  cron: string;
+  enabled: boolean;
+  remainingExecutions?: number;
+  /** Execution timeout in seconds; absent (pre-field snapshot) = 300. */
+  timeoutSeconds?: number;
+  type: CronTaskType;
+  script?: string;
+  requests?: HttpRequestSpec[];
+  prompt?: string;
+  selectedModel?: SelectedModelRef;
+  /** Thinking level for prompt tasks; absent/empty = runtime default. */
+  reasoning?: string;
+  /** Workspace path pinned for this task; absent/empty = follow the globally
+   * active workspace. Never set on http tasks. */
+  workdir?: string;
+  lastError?: string;
+};
+
+export type HookDef = {
+  id: string;
+  name: string;
+  description: string;
+  event: HookEvent;
+  enabled: boolean;
+  type: HookType;
+  script?: string;
+  requests?: HttpRequestSpec[];
+  timeoutMs?: number;
+};
+
+export type CronSnapshot = {
+  revision: number;
+  tasks: CronTask[];
+};
+
+export type HooksSnapshot = {
+  revision: number;
+  hooks: HookDef[];
+};
+
+export type AutomationSnapshot = {
+  cron: CronSnapshot;
+  hooks: HooksSnapshot;
+};
+
+export type CronRunState = "pending" | "leased" | "done" | "expired";
+export type CronRunTerminationReason = "cancelled" | "timeout" | string;
+
+export type CronRunNowResponse = {
+  executionId?: string;
+  startedAt: number;
+};
+
+export type CronRunRecord = {
+  id: string;
+  taskId: string;
+  sessionId?: string;
+  runId?: string;
+  state: CronRunState;
+  success: boolean;
+  startedAt: number;
+  finishedAt?: number;
+  durationMs: number;
+  exitCode?: number;
+  output: string;
+  /** Scheduler fires are counted; run-now executions are explicitly uncounted. */
+  counted?: boolean;
+  terminationReason?: CronRunTerminationReason;
+};
+
+export const MANUAL_CRON_RUN_POLL_INTERVAL_MS = 1_000;
+export const MANUAL_CRON_RUN_TIMEOUT_MS = 6 * 60_000;
+
+const CONCURRENT_RUN_SKIP_PREFIX = "Skipped: previous run is still in progress.";
+
+export function findManualCronRun(
+  runs: CronRunRecord[],
+  startedAt: number,
+  executionId?: string | null,
+): CronRunRecord | undefined {
+  return runs.reduce<CronRunRecord | undefined>((match, run) => {
+    if (
+      run.startedAt < startedAt ||
+      run.counted === true ||
+      run.output.startsWith(CONCURRENT_RUN_SKIP_PREFIX) ||
+      (executionId != null && run.id !== executionId && run.runId !== executionId)
+    ) {
+      return match;
+    }
+    if (!match || run.startedAt < match.startedAt) {
+      return run;
+    }
+    return match;
+  }, undefined);
+}
+
+export function isManualCronRunFinished(
+  runs: CronRunRecord[],
+  startedAt: number,
+  executionId?: string | null,
+): boolean {
+  const run = findManualCronRun(runs, startedAt, executionId);
+  return run?.state === "done" || run?.state === "expired";
+}
+
+/** Run summary returned by the schedule layer query (output truncated to 300 chars). */
+export type CronRunSummary = {
+  id: string;
+  taskId: string;
+  startedAt: number;
+  finishedAt?: number;
+  state: CronRunState;
+  success: boolean;
+  durationMs: number;
+  exitCode?: number;
+  outputPreview: string;
+};
+
+export type CronOccurrenceTask = {
+  id: string;
+  name: string;
+  cron: string;
+  kind: CronTaskType;
+  remainingExecutions?: number | null;
+  lastRun?: CronRunSummary;
+};
+
+export type CronOccurrence = {
+  taskId: string;
+  at: number;
+};
+
+/** Per task and local day aggregate for high-frequency tasks. */
+export type CronDaySummary = {
+  taskId: string;
+  /** YYYY-MM-DD in the app default time zone. */
+  date: string;
+  planned: number;
+  /** The per-day expansion cap was reached; the real count is higher. */
+  plannedTruncated: boolean;
+  ran: number;
+  failed: number;
+  firstAt: number;
+  lastAt: number;
+};
+
+/** Planned fires (future), real runs (past) and day summaries for [from, to). */
+export type CronOccurrencesResponse = {
+  timeZone: string;
+  now: number;
+  tasks: CronOccurrenceTask[];
+  occurrences: CronOccurrence[];
+  runs: CronRunSummary[];
+  summaries: CronDaySummary[];
+};
+
+export type PromptRunRequest = {
+  executionId: string;
+  taskId: string;
+  taskName: string;
+  prompt: string;
+  providerId: string;
+  model: string;
+  startedAt: number;
+  /** Claim window while pending; re-stamped to claim time + timeoutSeconds
+   * when the runner claims the row, so it always reflects the live deadline. */
+  leaseExpiresAt: number;
+  /** Task timeout snapshot taken at queue time. */
+  timeoutSeconds: number;
+  counted: boolean;
+  /** Resolved at queue time (task pin or global workdir). Empty on rows
+   * queued before this field existed; the runner falls back to the global
+   * workdir then. */
+  workdir: string;
+  /** Task thinking level; empty means the runner's default. */
+  reasoning: string;
+};
+
+export type CompletePromptRunInput = {
+  executionId: string;
+  success: boolean;
+  durationMs: number;
+  output: string;
+};
+
+export type PromptCompletionResponse = {
+  status: "completed" | "already_finished";
+};
+
+export type AutomationOp =
+  | { op: "create"; item: Record<string, unknown> }
+  | { op: "update"; id: string; patch: Record<string, unknown> }
+  | { op: "delete"; id: string }
+  | { op: "reorder"; ids: string[] };
+
+export type AutomationApplyInput = {
+  baseRevision: number;
+  ops: AutomationOp[];
+};
+
+export type ApplyStatus = "ok" | "conflict";
+
+export type CronApplyResponse = {
+  status: ApplyStatus;
+  cron: CronSnapshot;
+};
+
+export type HooksApplyResponse = {
+  status: ApplyStatus;
+  hooks: HooksSnapshot;
+};
+
+export const HOOK_EVENT_TRANSLATION_KEYS: Record<HookEvent, string> = {
+  agent_start: "settings.hooksEventAgentStart",
+  turn_start: "settings.hooksEventTurnStart",
+  message_start: "settings.hooksEventMessageStart",
+  message_end: "settings.hooksEventMessageEnd",
+  tool_execution_start: "settings.hooksEventToolExecutionStart",
+  tool_execution_end: "settings.hooksEventToolExecutionEnd",
+  turn_end: "settings.hooksEventTurnEnd",
+  agent_end: "settings.hooksEventAgentEnd",
+};
+
+export const HOOK_EVENT_DESCRIPTION_TRANSLATION_KEYS: Record<HookEvent, string> = {
+  agent_start: "settings.hooksEventAgentStartDesc",
+  turn_start: "settings.hooksEventTurnStartDesc",
+  message_start: "settings.hooksEventMessageStartDesc",
+  message_end: "settings.hooksEventMessageEndDesc",
+  tool_execution_start: "settings.hooksEventToolExecutionStartDesc",
+  tool_execution_end: "settings.hooksEventToolExecutionEndDesc",
+  turn_end: "settings.hooksEventTurnEndDesc",
+  agent_end: "settings.hooksEventAgentEndDesc",
+};

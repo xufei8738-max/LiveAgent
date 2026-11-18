@@ -1,0 +1,737 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { fileURLToPath } from "node:url";
+
+import { createWebModuleLoader } from "../../test/helpers/load-web-module.mjs";
+
+const loader = createWebModuleLoader({
+  rootDir: fileURLToPath(new URL("../", import.meta.url)),
+});
+
+const { buildRowsFromEntries, buildTurnRows, dedupeRowKeys } = loader.loadModule(
+  "src/lib/chat/transcript/rows.ts",
+);
+const { createTurn, applyEventToTurn } = loader.loadModule(
+  "src/lib/chat/transcript/turnReducer.ts",
+);
+const { alignHistory, groupHistoryEntriesIntoTurns } = loader.loadModule(
+  "src/lib/chat/transcript/historyAlignment.ts",
+);
+const { parseHistoryMessagesJson } = loader.loadModule("src/lib/chatUi.ts");
+
+function rowText(row) {
+  if (row.kind === "assistant") {
+    return row.rounds
+      .map((round) =>
+        round.blocks.flatMap((block) => (block.kind === "text" ? [block.text] : [])).join(""),
+      )
+      .join("\n");
+  }
+  return row.text ?? "";
+}
+
+function ref(messageId, messageIndex = 0) {
+  return {
+    segmentIndex: 0,
+    messageIndex,
+    segmentId: "segment-1",
+    messageId,
+    role: "user",
+    contentHash: `hash-${messageId}`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Row builder
+
+test("meta-only assistant entries never emit an avatar row", () => {
+  const rows = buildRowsFromEntries(
+    [{ id: "a-1", kind: "assistant", text: "", round: 1, meta: { provider: "deepseek" } }],
+    "history",
+  );
+  assert.equal(rows.length, 0, "a content-less round renders nothing");
+});
+
+test("a meta carrier merges into the round that has content", () => {
+  const rows = buildRowsFromEntries(
+    [
+      { id: "a-meta", kind: "assistant", text: "", round: 1, meta: { provider: "deepseek" } },
+      { id: "th-1", kind: "thinking", text: "reasoning", round: 1 },
+      { id: "a-1", kind: "assistant", text: "answer", round: 1 },
+    ],
+    "history",
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, "assistant");
+  assert.equal(rows[0].rounds.length, 1);
+  assert.equal(rows[0].rounds[0].meta?.provider, "deepseek", "meta survives on the visible round");
+});
+
+test("thinking-only rounds count as content", () => {
+  const rows = buildRowsFromEntries(
+    [{ id: "th-1", kind: "thinking", text: "chain of thought", round: 1 }],
+    "stream",
+  );
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, "assistant");
+});
+
+test("a mid-reply checkpoint stitches both halves into one assistant row with a seam round", () => {
+  const rows = buildRowsFromEntries(
+    [
+      { id: "a-1", kind: "assistant", text: "before", round: 1 },
+      {
+        id: "checkpoint-s1",
+        kind: "checkpoint",
+        content: "summary",
+        summaryId: "s1",
+        coveredMessageCount: 3,
+        generatedBy: { providerId: "liveagent", model: "summary" },
+        contextUsageTokens: 1200,
+      },
+      { id: "a-2", kind: "assistant", text: "after", round: 1, timestamp: 42 },
+      { id: "err-1", kind: "error", text: "boom" },
+    ],
+    "history",
+  );
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ["assistant", "error"],
+  );
+  assert.equal(rows[0].key, "ag:a-1", "the leading part keys the stitched row");
+  assert.equal(rows[0].timestamp, 42, "the reply timestamp is the last part's");
+  assert.deepEqual(
+    rows[0].rounds.map((round) => [round.key, round.blocks.length, Boolean(round.checkpoint)]),
+    [
+      ["ag:a-1:r1", 1, false],
+      ["checkpoint-s1", 0, true],
+      ["ag:a-2:r1", 1, false],
+    ],
+  );
+  assert.equal(rows[0].rounds[1].checkpoint.summaryId, "s1");
+  assert.equal(rows[0].rounds[1].checkpoint.contextUsageTokens, 1200);
+  assert.deepEqual(
+    rows[0].rounds.map((round) =>
+      round.blocks.flatMap((block) => (block.kind === "text" ? [block.text] : [])).join(""),
+    ),
+    ["before", "", "after"],
+  );
+});
+
+test("a checkpoint that ends the chain stays a standalone card; errors still flush", () => {
+  const rows = buildRowsFromEntries(
+    [
+      { id: "a-1", kind: "assistant", text: "before", round: 1 },
+      {
+        id: "checkpoint-s1",
+        kind: "checkpoint",
+        content: "summary",
+        summaryId: "s1",
+        coveredMessageCount: 3,
+        generatedBy: { providerId: "liveagent", model: "summary" },
+      },
+      { id: "err-1", kind: "error", text: "boom" },
+      { id: "a-2", kind: "assistant", text: "after", round: 1 },
+    ],
+    "history",
+  );
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ["assistant", "checkpoint", "error", "assistant"],
+  );
+  assert.equal(rowText(rows[0]), "before");
+  assert.equal(rowText(rows[3]), "after");
+});
+
+test("buildTurnRows emits the user bubble before any assistant content, tagged with the turn key", () => {
+  let turn = createTurn({ key: "req:c1", runId: "run-1" });
+  turn = { ...turn, user: { id: "ou:c1", kind: "user", text: "prompt", attachments: [] } };
+  turn = applyEventToTurn(turn, { type: "token", text: "reply", round: 1 });
+  const rows = buildTurnRows(turn);
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ["user", "assistant"],
+  );
+  assert.equal(rows[0].key, "ou:c1");
+  assert.equal(rows[0].origin, "stream");
+  assert.equal(rows[1].turnKey, "req:c1");
+});
+
+test("stream token metadata preserves raw usage and render-only markers", () => {
+  // meta 只携带原始事实：用量环锚点由倒扫从 usage + stopReason 现算，
+  // 事件不再携带任何派生 token 字段。
+  let turn = createTurn({ key: "run:usage", runId: "run-usage" });
+  turn = applyEventToTurn(turn, {
+    type: "token",
+    text: "memory status",
+    round: 2,
+    stopReason: "stop",
+    usage: { input: 9_000, cacheRead: 800, output: 200, totalTokens: 10_000 },
+    contextRelevant: false,
+  });
+  const rows = buildTurnRows(turn);
+
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].kind, "assistant");
+  assert.deepEqual(rows[0].rounds[0].meta.usage, {
+    input: 9_000,
+    cacheRead: 800,
+    cacheWrite: 0,
+    output: 200,
+    totalTokens: 10_000,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  });
+  assert.equal(rows[0].rounds[0].meta.stopReason, "stop");
+  assert.equal(rows[0].rounds[0].meta.contextRelevant, false);
+  assert.equal("contextUsageTokens" in rows[0].rounds[0].meta, false);
+  assert.equal("usageTotalTokens" in rows[0].rounds[0].meta, false);
+});
+
+test("interleaved thinking and tool results keep one assistant row and stable block identities", () => {
+  const prefixEntries = [
+    { id: "think-1", kind: "thinking", text: "reasoning", round: 1 },
+    {
+      id: "tool-call-1",
+      kind: "tool_call",
+      round: 1,
+      toolCall: { type: "toolCall", id: "call-1", name: "Bash", arguments: {} },
+    },
+  ];
+  const prefix = buildRowsFromEntries(prefixEntries, "stream");
+  const complete = buildRowsFromEntries(
+    [
+      ...prefixEntries,
+      {
+        id: "tool-result-1",
+        kind: "tool_result",
+        round: 1,
+        toolResult: {
+          role: "toolResult",
+          toolCallId: "call-1",
+          content: [],
+          isError: false,
+        },
+      },
+      { id: "think-2", kind: "thinking", text: "next reasoning", round: 1 },
+    ],
+    "stream",
+  );
+
+  assert.equal(prefix.length, 1);
+  assert.equal(complete.length, 1);
+  assert.equal(complete[0].key, prefix[0].key);
+  const blockIdentity = (row) =>
+    row.rounds[0].blocks.map((block) =>
+      block.kind === "tool" ? `tool:${block.item.toolCall.id}` : `${block.kind}:${block.id}`,
+    );
+  assert.deepEqual(blockIdentity(complete[0]).slice(0, 2), blockIdentity(prefix[0]));
+  assert.equal(complete[0].rounds[0].blocks.at(-1).id, "thinking-2");
+});
+
+test("out-of-order and duplicate tool results update their first-seen tools in place", () => {
+  let turn = createTurn({ key: "req:out-of-order", runId: "run-out-of-order" });
+  turn = applyEventToTurn(turn, { type: "thinking", text: "before tools", round: 1 });
+  turn = applyEventToTurn(turn, {
+    type: "tool_call",
+    id: "call-a",
+    name: "Bash",
+    arguments: { command: "A" },
+    round: 1,
+  });
+  turn = applyEventToTurn(turn, {
+    type: "tool_call",
+    id: "call-b",
+    name: "Read",
+    arguments: { path: "B" },
+    round: 1,
+  });
+  const prefix = buildTurnRows(turn).find((row) => row.kind === "assistant");
+  assert.ok(prefix);
+  const prefixBlocks = prefix.rounds[0].blocks.map((block) =>
+    block.kind === "tool" ? `tool:${block.item.toolCall.id}` : `${block.kind}:${block.id}`,
+  );
+
+  const resultB = {
+    type: "tool_result",
+    id: "call-b",
+    name: "Read",
+    content: [{ type: "text", text: "B complete" }],
+    isError: false,
+    round: 1,
+  };
+  turn = applyEventToTurn(turn, resultB);
+  const afterFirstB = turn;
+  turn = applyEventToTurn(turn, resultB);
+  assert.deepEqual(turn.entries, afterFirstB.entries, "duplicate result is idempotent");
+  turn = applyEventToTurn(turn, {
+    type: "tool_result",
+    id: "call-a",
+    name: "Bash",
+    content: [{ type: "text", text: "A failed" }],
+    isError: true,
+    round: 1,
+  });
+  turn = applyEventToTurn(turn, { type: "thinking", text: "after tools", round: 1 });
+
+  const complete = buildTurnRows(turn).find((row) => row.kind === "assistant");
+  assert.ok(complete);
+  assert.equal(complete.key, prefix.key);
+  const completeBlocks = complete.rounds[0].blocks;
+  assert.deepEqual(
+    completeBlocks.slice(0, prefixBlocks.length).map((block) =>
+      block.kind === "tool" ? `tool:${block.item.toolCall.id}` : `${block.kind}:${block.id}`,
+    ),
+    prefixBlocks,
+  );
+  const trace = completeBlocks
+    .filter((block) => block.kind === "tool")
+    .map((block) => ({
+      id: block.item.toolCall.id,
+      result: block.item.toolResult?.content?.[0]?.text,
+      isError: block.item.toolResult?.isError,
+    }));
+  assert.deepEqual(trace, [
+    { id: "call-a", result: "A failed", isError: true },
+    { id: "call-b", result: "B complete", isError: false },
+  ]);
+  assert.equal(completeBlocks.at(-1).kind, "thinking");
+});
+
+test("dedupeRowKeys suffixes collisions deterministically without touching unique keys", () => {
+  const rows = [
+    { key: "a", origin: "history", kind: "error", text: "1" },
+    { key: "a", origin: "history", kind: "error", text: "2" },
+    { key: "b", origin: "history", kind: "error", text: "3" },
+  ];
+  const deduped = dedupeRowKeys(rows);
+  assert.deepEqual(
+    deduped.map((row) => row.key),
+    ["a", "a#2", "b"],
+  );
+  const untouched = [
+    { key: "a", origin: "history", kind: "error", text: "1" },
+    { key: "b", origin: "history", kind: "error", text: "2" },
+  ];
+  assert.equal(dedupeRowKeys(untouched), untouched, "no copy when keys are already unique");
+});
+
+test("dedupeRowKeys drops colliding checkpoint rows instead of renaming them", () => {
+  // 检查点 id 是内容身份（checkpoint-<summaryId>）：history 区与手动压缩 turn
+  // 各持一份时是同一张逻辑卡片，改名保留会渲染出重复检查点。
+  const checkpoint = (origin) => ({
+    key: "checkpoint-sum-1",
+    origin,
+    kind: "checkpoint",
+    content: "summary",
+    summaryId: "sum-1",
+    coveredMessageCount: 4,
+    generatedBy: { providerId: "p", model: "m" },
+    timestamp: 1,
+  });
+  const rows = [
+    checkpoint("history"),
+    { key: "a", origin: "history", kind: "error", text: "1" },
+    checkpoint("stream"),
+    { key: "a", origin: "stream", kind: "error", text: "2" },
+  ];
+  const deduped = dedupeRowKeys(rows);
+  assert.deepEqual(
+    deduped.map((row) => `${row.kind}:${row.key}`),
+    ["checkpoint:checkpoint-sum-1", "error:a", "error:a#2"],
+    "checkpoint duplicate dropped (first copy wins), non-checkpoint still renamed",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Deterministic history parse ids
+
+test("parseHistoryMessagesJson yields identical ids across reparses", () => {
+  const raw = JSON.stringify([
+    {
+      role: "user",
+      id: "m1",
+      content: "问题",
+      liveAgentHistoryRef: {
+        segmentIndex: 0,
+        messageIndex: 0,
+        segmentId: "seg-1",
+        messageId: "m1",
+        role: "user",
+        contentHash: "h1",
+      },
+    },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "思考" },
+        { type: "text", text: "回答" },
+      ],
+      provider: "deepseek",
+    },
+    { role: "user", content: "继续" },
+    { role: "user", content: "继续" },
+  ]);
+  const first = parseHistoryMessagesJson(raw);
+  const second = parseHistoryMessagesJson(raw);
+  assert.deepEqual(
+    first.map((entry) => entry.id),
+    second.map((entry) => entry.id),
+    "reparse is id-stable",
+  );
+  assert.equal(first[0].id, "hu:m1", "ref-anchored user id");
+  assert.ok(first[1].id.startsWith("ht:hu:m1>"), "turn-anchored block id");
+  const dupIds = first.filter((entry) => entry.kind === "user" && entry.text === "继续");
+  assert.equal(new Set(dupIds.map((entry) => entry.id)).size, 2, "identical prompts get distinct ids");
+});
+
+test("persisted checkpoints retain the post-compaction context token snapshot", () => {
+  const entries = parseHistoryMessagesJson(
+    JSON.stringify([
+      {
+        role: "summary",
+        id: "summary-1",
+        content: "compacted facts",
+        summaryMeta: {
+          coveredMessageCount: 12,
+          generatedBy: { providerId: "codex", model: "gpt-test" },
+          stats: { sourceMessageCount: 12, contextTokensAfter: 43_210 },
+        },
+      },
+    ]),
+  );
+  assert.equal(entries[0].contextUsageTokens, 43_210);
+  const rows = buildRowsFromEntries(entries, "history");
+  assert.equal(rows[0].contextUsageTokens, 43_210);
+});
+
+test("persisted assistant messages carry raw usage; legacy stamps are dead data", () => {
+  const entries = parseHistoryMessagesJson(
+    JSON.stringify([
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "answer" }],
+        provider: "openai",
+        model: "gpt-test",
+        api: "openai-responses",
+        stopReason: "stop",
+        usage: { input: 9_500, output: 500, totalTokens: 10_000 },
+        // 旧口径印章：读取侧已无任何消费方，锚点从 usage 现算。
+        liveAgentContextUsage: { totalTokens: 150_000, fixedTokens: 25_000 },
+        timestamp: 1,
+      },
+    ]),
+  );
+  const rows = buildRowsFromEntries(entries, "history");
+
+  assert.equal(rows[0].kind, "assistant");
+  assert.equal(rows[0].rounds[0].meta.usage.totalTokens, 10_000);
+  assert.equal(rows[0].rounds[0].meta.stopReason, "stop");
+  assert.equal("contextUsageTokens" in rows[0].rounds[0].meta, false);
+});
+
+test("thinking-first persisted replies emit a meta carrier that rows suppress", () => {
+  const raw = JSON.stringify([
+    { role: "user", id: "m1", content: "查询" },
+    {
+      role: "assistant",
+      content: [
+        { type: "thinking", thinking: "推理" },
+        { type: "text", text: "结论" },
+      ],
+      provider: "deepseek",
+      model: "deepseek-v4",
+    },
+  ]);
+  const entries = parseHistoryMessagesJson(raw);
+  const metaCarrier = entries.find((entry) => entry.kind === "assistant" && entry.text === "");
+  assert.ok(metaCarrier, "parser keeps the meta carrier entry");
+  const rows = buildRowsFromEntries(entries, "history");
+  assert.deepEqual(
+    rows.map((row) => row.kind),
+    ["user", "assistant"],
+    "no avatar-only row from the meta carrier",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// History alignment
+
+function settledTurn(key, runId, userText, replyText, userRef) {
+  let turn = createTurn({ key, runId, phase: "settled" });
+  turn = {
+    ...turn,
+    user: {
+      id: `ou:${key}`,
+      kind: "user",
+      text: userText,
+      attachments: [],
+      ...(userRef ? { messageRef: userRef } : {}),
+    },
+  };
+  if (replyText !== null) {
+    turn = applyEventToTurn(turn, { type: "token", text: replyText, round: 1 });
+  }
+  return { ...turn, phase: "settled" };
+}
+
+test("replace keeps pending/streaming turns and trims their persisted echoes", () => {
+  const base = settledTurn("req:c9", "run-9", "active prompt", null);
+  const streaming = {
+    ...base,
+    user: { ...base.user, messageId: "m9" },
+    phase: "streaming",
+  };
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [streaming],
+    entries: [
+      { id: "hu:m1", kind: "user", text: "old", attachments: [], messageRef: ref("m1") },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "old reply", round: 1 },
+      { id: "hu:m9", kind: "user", text: "active prompt", attachments: [], messageRef: ref("m9", 2) },
+    ],
+    mode: "replace",
+  });
+  assert.equal(result.turns.length, 1, "streaming turn kept");
+  assert.equal(result.turns[0].user.messageRef?.messageId, "m9", "echo's ref adopted");
+  assert.deepEqual(
+    result.historyEntries.map((entry) => entry.id),
+    ["hu:m1", "ht:hu:m1>0"],
+    "persisted echo of the active prompt trimmed",
+  );
+});
+
+test("replace trims a partially persisted reply for the active exchange", () => {
+  const base = settledTurn(
+    "req:c9",
+    "run-9",
+    "active prompt",
+    "persisted partial plus live tail",
+  );
+  const streaming = {
+    ...base,
+    user: { ...base.user, messageId: "m9" },
+    phase: "streaming",
+  };
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [streaming],
+    entries: [
+      { id: "hu:m1", kind: "user", text: "old", attachments: [], messageRef: ref("m1") },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "old reply", round: 1 },
+      {
+        id: "hu:m9",
+        kind: "user",
+        text: "active prompt",
+        attachments: [],
+        messageRef: ref("m9", 2),
+      },
+      { id: "ht:hu:m9>0", kind: "assistant", text: "persisted partial", round: 1 },
+    ],
+    mode: "replace",
+  });
+  assert.equal(result.turns.length, 1, "streaming turn remains authoritative");
+  assert.equal(result.turns[0].user.messageRef?.messageId, "m9");
+  assert.deepEqual(
+    result.historyEntries.map((entry) => entry.id),
+    ["hu:m1", "ht:hu:m1>0"],
+    "the whole persisted copy of the active exchange is trimmed",
+  );
+});
+
+test("replace keeps an older completed exchange when the active prompt repeats its text", () => {
+  const base = settledTurn("req:c9", "run-9", "same prompt", "old completed reply plus new tail");
+  const streaming = {
+    ...base,
+    user: { ...base.user, messageId: "m9" },
+    phase: "streaming",
+  };
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [streaming],
+    entries: [
+      {
+        id: "hu:m1",
+        kind: "user",
+        text: "same prompt",
+        attachments: [],
+        messageRef: ref("m1"),
+      },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "old completed reply", round: 1 },
+    ],
+    mode: "replace",
+  });
+
+  assert.deepEqual(
+    result.historyEntries.map((entry) => entry.id),
+    ["hu:m1", "ht:hu:m1>0"],
+    "matching prompt text alone must not consume the previous exchange",
+  );
+  assert.equal(result.turns[0].user.messageRef, undefined);
+});
+
+test("replace drops settled turns in favor of the parsed history", () => {
+  const settled = settledTurn("req:c1", "run-1", "prompt", "reply");
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [settled],
+    entries: [
+      { id: "hu:m1", kind: "user", text: "prompt", attachments: [], messageRef: ref("m1") },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "reply", round: 1 },
+    ],
+    mode: "replace",
+  });
+  assert.equal(result.turns.length, 0);
+  assert.equal(result.historyEntries.length, 2);
+});
+
+test("enrich pairs the trailing turns and upgrades tool payloads by id", () => {
+  let turn = settledTurn("req:c1", "run-1", "prompt", null, undefined);
+  turn = applyEventToTurn(turn, {
+    type: "tool_call",
+    id: "call-1",
+    name: "Read",
+    arguments: {},
+    round: 1,
+  });
+  turn = { ...turn, phase: "settled" };
+  const entryId = turn.entries[0].id;
+
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [turn],
+    entries: [
+      { id: "hu:m1", kind: "user", text: "prompt", attachments: [], messageRef: ref("m1") },
+      {
+        id: "ht:hu:m1>0",
+        kind: "tool_call",
+        round: 1,
+        toolCall: { type: "toolCall", id: "call-1", name: "Read", arguments: { file: "a.ts" } },
+        summary: "Read a.ts",
+        text: '{"file":"a.ts"}',
+      },
+    ],
+    mode: "enrich",
+  });
+  assert.equal(result.changed, true);
+  const enriched = result.turns[0];
+  assert.equal(enriched.user.messageRef?.messageId, "m1");
+  assert.equal(enriched.entries[0].id, entryId, "tool entry keeps its rendered id");
+  assert.deepEqual(enriched.entries[0].toolCall.arguments, { file: "a.ts" }, "full args adopted");
+});
+
+test("enrich with a partial suffix window leaves the history region untouched", () => {
+  const region = [
+    { id: "hu:m1", kind: "user", text: "old", attachments: [], messageRef: ref("m1") },
+    { id: "ht:hu:m1>0", kind: "assistant", text: "old reply", round: 1 },
+  ];
+  const turn = settledTurn("req:c2", "run-2", "new", "new reply");
+  const result = alignHistory({
+    historyEntries: region,
+    turns: [turn],
+    entries: [
+      { id: "hu:m2", kind: "user", text: "new", attachments: [], messageRef: ref("m2", 2) },
+      { id: "ht:hu:m2>0", kind: "assistant", text: "new reply", round: 1 },
+    ],
+    mode: "enrich",
+  });
+  assert.equal(result.historyEntries, region, "suffix window cannot truncate the region");
+  assert.equal(result.turns[0].user.messageRef?.messageId, "m2", "pairing still enriches");
+});
+
+test("enrich replaces wholesale when history is ahead of the store", () => {
+  const turn = settledTurn("req:c1", "run-1", "known", "known reply");
+  const entries = [
+    { id: "hu:m1", kind: "user", text: "known", attachments: [], messageRef: ref("m1") },
+    { id: "ht:hu:m1>0", kind: "assistant", text: "known reply", round: 1 },
+    { id: "hu:m2", kind: "user", text: "foreign", attachments: [], messageRef: ref("m2", 2) },
+    { id: "ht:hu:m2>0", kind: "assistant", text: "foreign reply", round: 1 },
+  ];
+  const result = alignHistory({ historyEntries: [], turns: [turn], entries, mode: "enrich" });
+  assert.deepEqual(result.turns, [], "stale turns dropped");
+  assert.equal(result.historyEntries, entries, "history becomes authoritative");
+});
+
+test("enrich repaints on a messageRef conflict but never loses unpersisted exchanges", () => {
+  const conflicted = settledTurn("req:c1", "run-1", "prompt", "reply", ref("expected"));
+  const covered = settledTurn("req:c0", "run-0", "known", "known reply", ref("other"));
+  const entries = [
+    { id: "hu:other", kind: "user", text: "known", attachments: [], messageRef: ref("other") },
+    { id: "ht:hu:other>0", kind: "assistant", text: "known reply", round: 1 },
+    { id: "hu:foreign", kind: "user", text: "foreign", attachments: [], messageRef: ref("foreign") },
+    { id: "ht:hu:foreign>0", kind: "assistant", text: "foreign reply", round: 1 },
+  ];
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [covered, conflicted],
+    entries,
+    mode: "enrich",
+  });
+  assert.equal(result.changed, true);
+  assert.equal(result.historyEntries, entries, "history becomes authoritative");
+  assert.deepEqual(
+    result.turns.map((turn) => turn.key),
+    ["req:c1"],
+    "the turn history covers is dropped; the one it cannot know survives",
+  );
+});
+
+test("enrich never replaces streamed text with the persisted shape", () => {
+  const turn = settledTurn("req:c1", "run-1", "as typed", "streamed reply");
+  const result = alignHistory({
+    historyEntries: [],
+    turns: [turn],
+    entries: [
+      {
+        id: "hu:m1",
+        kind: "user",
+        text: "as persisted (expanded mentions)",
+        attachments: [],
+        messageRef: ref("m1"),
+      },
+      { id: "ht:hu:m1>0", kind: "assistant", text: "persisted reply shape", round: 1 },
+    ],
+    mode: "enrich",
+  });
+  const enriched = result.turns[0];
+  assert.equal(enriched.user.text, "as typed", "display text stays the streamed one");
+  assert.equal(enriched.user.messageRef?.messageId, "m1");
+  const replyEntry = enriched.entries.find((entry) => entry.kind === "assistant");
+  assert.equal(replyEntry.text, "streamed reply", "assistant text never replaced");
+});
+
+test("groupHistoryEntriesIntoTurns keeps a headless leading turn", () => {
+  const turns = groupHistoryEntriesIntoTurns([
+    { id: "ht:^>0", kind: "assistant", text: "cut mid-turn", round: 1 },
+    { id: "hu:m1", kind: "user", text: "prompt", attachments: [] },
+    { id: "ht:hu:m1>0", kind: "assistant", text: "reply", round: 1 },
+  ]);
+  assert.equal(turns.length, 2);
+  assert.equal(turns[0].user, null);
+  assert.equal(turns[1].user?.id, "hu:m1");
+});
+
+test("findLiveTurnStartTimestamp only uses the user message that started the live turn", () => {
+  const { findLiveTurnStartTimestamp } = loader.loadModule("src/lib/chat/transcript/rows.ts");
+  const user = (key, timestamp) => ({ key, kind: "user", timestamp });
+  const assistant = (key) => ({ key, kind: "assistant", rounds: [] });
+  const checkpoint = (key) => ({ key, kind: "checkpoint" });
+
+  assert.equal(findLiveTurnStartTimestamp([user("u1", 1_000), assistant("a1")], 1), 1_000);
+  assert.equal(
+    findLiveTurnStartTimestamp([user("u1", 1_000), checkpoint("c1"), assistant("a1")], 2),
+    1_000,
+  );
+  // 回复先于用户消息到达：前面是上一轮回复，不能借用上一轮的用户时间戳。
+  assert.equal(
+    findLiveTurnStartTimestamp([user("u1", 1_000), assistant("a1"), assistant("a2")], 2),
+    undefined,
+  );
+  assert.equal(
+    findLiveTurnStartTimestamp(
+      [user("u1", 1_000), { key: "e1", kind: "error", text: "boom" }, assistant("a2")],
+      2,
+    ),
+    undefined,
+  );
+  assert.equal(findLiveTurnStartTimestamp([assistant("a1")], 0), undefined);
+});

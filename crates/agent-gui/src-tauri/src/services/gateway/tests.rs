@@ -1,0 +1,1245 @@
+use super::{
+    attach_settings_sync_stamp, attach_stt_secret_sync, build_chat_queue_event_envelope,
+    build_gateway_runtime_status_envelope, build_local_settings_update_event_payload,
+    effective_agent_id, gateway_connection_needs_restart, gateway_connection_stale_after,
+    gateway_reconnect_backoff, history_share_resolve_error_code, ignore_gateway_outbound_offline,
+    is_chat_runtime_wake_request_id, merge_settings_sync_snapshot,
+    merge_settings_update_into_snapshot, proto, removed_workspace_project_ids,
+    required_terminal_project_path_key, set_disconnected_status, take_settings_sync_client,
+    with_settings_sync_client, AppliedClientSeqs, GatewayChatQueueEventInput,
+    GatewayChatRequestEvent, GatewayController, GatewayStatusSnapshot, RemoteChatInboxRecord,
+    SettingsSnapshotCache, SettingsSyncAck, SettingsSyncStamp, GATEWAY_CHAT_LEASE_MS,
+    GATEWAY_CHAT_RUNNING_LEASE_MS, GATEWAY_OUTBOUND_OFFLINE_ERROR, GATEWAY_RECONNECT_MAX,
+    GATEWAY_RECONNECT_MIN, GATEWAY_RECONNECT_STABLE_AFTER,
+    GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE, GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW,
+};
+use crate::commands::settings::RemoteSettingsPayload;
+use crate::services::gateway_bridge;
+use crate::services::provider_usage::{ProviderUsageResult, UsageData};
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+#[test]
+fn remote_chat_failure_preserves_actionable_error_for_webui() {
+    let envelope = super::build_gateway_chat_control_event_envelope(
+        "request-1".into(), "conversation-1".into(), "failed",
+        "desktop_runtime_rejected".into(), "Backend request failed".into(),
+    );
+    let Some(proto::agent_envelope::Payload::ChatControl(event)) = envelope.payload else {
+        panic!("missing chat control event");
+    };
+    assert_eq!(event.state, "failed");
+    assert_eq!(event.request_id, "request-1");
+    assert_eq!(event.error_code, "desktop_runtime_rejected");
+    assert_eq!(event.message, "Backend request failed");
+}
+
+#[test]
+fn gateway_mcp_snapshot_uses_backend_instead_of_legacy_sqlite() {
+    let mut snapshot = json!({"mcp": {"servers": [{"id": "legacy"}], "selected": ["legacy"]}});
+    super::apply_kbrain_mcp_settings(&mut snapshot, &json!({
+        "settings": {"servers": [{"id": "backend", "enabled": true, "transport": "stdio", "command": "server"}], "selected": ["backend"]},
+        "statuses": []
+    })).unwrap();
+    assert_eq!(snapshot["mcp"]["servers"][0]["id"], "backend");
+    assert_eq!(snapshot["mcp"]["selected"], json!(["backend"]));
+    super::apply_kbrain_mcp_settings(&mut snapshot, &json!({"settings": {"servers": []}})).unwrap();
+    assert_eq!(snapshot["mcp"], json!({"servers": [], "selected": []}));
+    assert!(super::apply_kbrain_mcp_settings(&mut snapshot, &json!({"settings": {}})).is_err());
+}
+
+#[test]
+fn gateway_model_snapshot_uses_backend_instead_of_legacy_providers() {
+    let mut snapshot = json!({
+        "customProviders": [{"id": "legacy", "activeModels": ["old-model"]}],
+        "selectedModel": {"customProviderId": "legacy", "model": "old-model"},
+        "system": {"workdir": "C:\\Users\\Tester\\workspace"}
+    });
+    super::apply_kbrain_model_settings(&mut snapshot, &json!({
+        "providers": [{"id": "backend", "activeModels": ["new-model"]}],
+        "defaultProvider": "backend", "defaultModel": "new-model"
+    })).unwrap();
+    assert_eq!(snapshot["customProviders"][0]["id"], "backend");
+    assert_eq!(snapshot["selectedModel"]["model"], "new-model");
+    assert_eq!(snapshot["system"]["workdir"], "C:\\Users\\Tester\\workspace");
+    super::apply_kbrain_model_settings(&mut snapshot, &json!({"providers": []})).unwrap();
+    assert_eq!(snapshot["selectedModel"], Value::Null);
+    assert!(super::apply_kbrain_model_settings(&mut snapshot, &json!({})).is_err());
+}
+
+#[test]
+fn provider_usage_response_serializes_only_result_json() {
+    let response = gateway_bridge::provider_usage_response(ProviderUsageResult {
+        data: vec![UsageData {
+            plan_name: Some("Balance".to_string()),
+            remaining: Some(4.2),
+            unit: Some("USD".to_string()),
+            ..UsageData::default()
+        }],
+        queried_at: Some(1_772_000_000_000),
+        error: None,
+        is_stale: false,
+    })
+    .expect("provider usage response should serialize");
+
+    let expected_result_json = concat!(
+        r#"{"data":[{"planName":"Balance","remaining":4.2,"unit":"USD"}],"#,
+        r#""queriedAt":1772000000000,"error":null,"isStale":false}"#,
+    );
+    assert_eq!(response.result_json, expected_result_json);
+
+    let result: Value =
+        serde_json::from_str(&response.result_json).expect("result_json should be valid JSON");
+    assert_eq!(
+        result,
+        json!({
+            "data": [{ "planName": "Balance", "remaining": 4.2, "unit": "USD" }],
+            "queriedAt": 1_772_000_000_000_i64,
+            "error": null,
+            "isStale": false,
+        })
+    );
+    assert!(!response.result_json.contains("apiKey"));
+    assert!(!response.result_json.contains("accessToken"));
+    assert!(!response.result_json.contains("secretAccessKey"));
+
+    let envelope = super::envelope_handler::provider_usage_agent_envelope(
+        "provider-usage-request".to_string(),
+        response,
+    );
+    assert_eq!(envelope.request_id, "provider-usage-request");
+    let Some(proto::agent_envelope::Payload::ProviderUsageResp(response)) = envelope.payload else {
+        panic!("expected provider usage response payload");
+    };
+    assert_eq!(response.result_json, expected_result_json);
+}
+
+fn gateway_chat_request(
+    request_id: &str,
+    client_request_id: &str,
+    conversation_id: &str,
+    message: &str,
+) -> GatewayChatRequestEvent {
+    GatewayChatRequestEvent {
+        request_id: request_id.to_string(),
+        conversation_id: conversation_id.to_string(),
+        client_request_id: client_request_id.to_string(),
+        message: message.to_string(),
+        rebased: false,
+        base_message_ref: None,
+        selected_model: None,
+        runtime_controls: None,
+        execution_mode: String::new(),
+        workdir: String::new(),
+        command_safety_mode: String::new(),
+        uploaded_files: Vec::new(),
+        referenced_conversations: Vec::new(),
+        queue_policy: String::new(),
+        goal_action: String::new(),
+        goal_text: String::new(),
+        prompt_command: false,
+        plan_command: false,
+    }
+}
+
+fn remote_chat_record(
+    request: GatewayChatRequestEvent,
+    state: &str,
+    started: bool,
+    now: Instant,
+) -> RemoteChatInboxRecord {
+    RemoteChatInboxRecord {
+        request,
+        state: state.to_string(),
+        lease_owner: Some("worker-1".to_string()),
+        lease_expires_at: Some(now + Duration::from_secs(30)),
+        attempt: 1,
+        started,
+        last_error: None,
+        created_at: now - Duration::from_secs(10),
+        updated_at: now,
+    }
+}
+
+#[test]
+fn gateway_chat_command_mapping_preserves_rebase_signal() {
+    let request = proto::ChatRequest {
+        conversation_id: "conversation-1".to_string(),
+        client_request_id: "client-1".to_string(),
+        message: "edited".to_string(),
+        execution_mode: "tools".to_string(),
+        workdir: "/workspace".to_string(),
+        command_safety_mode: "sandbox".to_string(),
+        goal_action: String::new(),
+        goal_text: String::new(),
+        prompt_command: false,
+        referenced_conversations: vec![proto::ChatConversationReference {
+            id: "conversation-source".to_string(),
+            title: "Earlier investigation".to_string(),
+            cwd: "/source".to_string(),
+            updated_at: 1_772_000_000_000,
+        }],
+        ..Default::default()
+    };
+
+    let event = GatewayController::build_gateway_chat_request_event(
+        "run-1".to_string(),
+        request,
+        true,
+        Some(proto::ChatMessageRef {
+            segment_index: 2,
+            message_index: 4,
+            segment_id: "segment-c".to_string(),
+            message_id: "user-c".to_string(),
+            role: "user".to_string(),
+            content_hash: "fnv1a32:00000000".to_string(),
+        }),
+    );
+
+    assert_eq!(event.request_id, "run-1");
+    assert_eq!(event.conversation_id, "conversation-1");
+    assert_eq!(event.client_request_id, "client-1");
+    assert_eq!(event.message, "edited");
+    assert!(event.rebased);
+    let base_message_ref = event
+        .base_message_ref
+        .as_ref()
+        .expect("base message ref should be preserved");
+    assert_eq!(base_message_ref.segment_index, 2);
+    assert_eq!(base_message_ref.message_index, 4);
+    assert_eq!(base_message_ref.segment_id, "segment-c");
+    assert_eq!(base_message_ref.message_id, "user-c");
+    assert_eq!(base_message_ref.role, "user");
+    assert_eq!(base_message_ref.content_hash, "fnv1a32:00000000");
+    assert_eq!(event.execution_mode, "tools");
+    assert_eq!(event.workdir, "/workspace");
+    assert_eq!(event.command_safety_mode, "sandbox");
+    assert_eq!(event.referenced_conversations.len(), 1);
+    assert_eq!(event.referenced_conversations[0].id, "conversation-source");
+    assert_eq!(
+        event.referenced_conversations[0].title,
+        "Earlier investigation"
+    );
+    assert_eq!(event.referenced_conversations[0].cwd, "/source");
+    assert_eq!(
+        event.referenced_conversations[0].updated_at,
+        1_772_000_000_000
+    );
+}
+
+#[test]
+fn gateway_chat_command_mapping_normalizes_conversation_reference_boundaries() {
+    let request = proto::ChatRequest {
+        conversation_id: "conversation-current".to_string(),
+        client_request_id: "client-reference-boundaries".to_string(),
+        message: "compare prior work".to_string(),
+        referenced_conversations: vec![
+            proto::ChatConversationReference {
+                id: "conversation-current".to_string(),
+                title: "Self".to_string(),
+                ..Default::default()
+            },
+            proto::ChatConversationReference {
+                id: "conversation\u{85}invalid".to_string(),
+                title: "Control id".to_string(),
+                ..Default::default()
+            },
+            proto::ChatConversationReference {
+                id: "😀".repeat(257),
+                title: "Long id".to_string(),
+                ..Default::default()
+            },
+            proto::ChatConversationReference {
+                id: "conversation-source".to_string(),
+                title: "😀".repeat(241),
+                cwd: " /source ".to_string(),
+                updated_at: 1_772_000_000_000,
+            },
+        ],
+        ..Default::default()
+    };
+
+    let event = GatewayController::build_gateway_chat_request_event(
+        "run-reference-boundaries".to_string(),
+        request,
+        false,
+        None,
+    );
+
+    assert_eq!(event.referenced_conversations.len(), 1);
+    let reference = &event.referenced_conversations[0];
+    assert_eq!(reference.id, "conversation-source");
+    assert_eq!(reference.title.chars().count(), 240);
+    assert_eq!(reference.title, "😀".repeat(240));
+    assert_eq!(reference.cwd, "/source");
+}
+
+#[test]
+fn remote_chat_started_records_use_running_lease() {
+    let now = Instant::now();
+    let queued = remote_chat_record(
+        gateway_chat_request("request-1", "client-1", "conversation-1", "hello"),
+        "queued",
+        false,
+        now,
+    );
+    let running = remote_chat_record(
+        gateway_chat_request("request-2", "client-2", "conversation-2", "hello"),
+        "running",
+        true,
+        now,
+    );
+
+    assert_eq!(
+        GatewayController::remote_chat_record_lease_ms(&queued),
+        GATEWAY_CHAT_LEASE_MS
+    );
+    assert_eq!(
+        GatewayController::remote_chat_record_lease_ms(&running),
+        GATEWAY_CHAT_RUNNING_LEASE_MS
+    );
+    const {
+        assert!(GATEWAY_CHAT_RUNNING_LEASE_MS > GATEWAY_CHAT_LEASE_MS);
+    }
+}
+
+#[test]
+fn duplicate_remote_chat_request_preserves_running_record() {
+    let now = Instant::now();
+    let mut record = remote_chat_record(
+        gateway_chat_request("request-1", "client-1", "conversation-1", "first"),
+        "running",
+        true,
+        now,
+    );
+    let original_lease_owner = record.lease_owner.clone();
+    let original_lease_expires_at = record.lease_expires_at;
+
+    GatewayController::merge_duplicate_remote_chat_request(
+        &mut record,
+        gateway_chat_request("request-2", "client-1", "conversation-2", "replayed"),
+        now + Duration::from_secs(1),
+    );
+
+    assert_eq!(record.request.request_id, "request-1");
+    assert_eq!(record.request.client_request_id, "client-1");
+    assert_eq!(record.request.conversation_id, "conversation-1");
+    assert_eq!(record.request.message, "first");
+    assert_eq!(record.state, "running");
+    assert!(record.started);
+    assert_eq!(record.lease_owner, original_lease_owner);
+    assert_eq!(record.lease_expires_at, original_lease_expires_at);
+    assert_eq!(
+        GatewayController::remote_chat_record_control_type(&record),
+        "started"
+    );
+    assert!(!GatewayController::remote_chat_record_should_wake_runtime(
+        &record,
+        now + Duration::from_secs(1),
+    ));
+}
+
+#[test]
+fn duplicate_queued_remote_chat_request_keeps_canonical_request_id() {
+    let now = Instant::now();
+    let mut record = remote_chat_record(
+        gateway_chat_request("request-1", "client-1", "conversation-1", "first"),
+        "queued",
+        false,
+        now,
+    );
+    record.lease_owner = None;
+    record.lease_expires_at = None;
+
+    GatewayController::merge_duplicate_remote_chat_request(
+        &mut record,
+        gateway_chat_request("request-2", "client-1", "conversation-2", "replayed"),
+        now + Duration::from_secs(1),
+    );
+
+    assert_eq!(record.request.request_id, "request-1");
+    assert_eq!(record.request.client_request_id, "client-1");
+    assert_eq!(record.request.conversation_id, "conversation-2");
+    assert_eq!(record.request.message, "replayed");
+    assert_eq!(record.state, "queued");
+    assert!(!record.started);
+    assert!(GatewayController::remote_chat_record_should_wake_runtime(
+        &record,
+        now + Duration::from_secs(1),
+    ));
+}
+
+#[test]
+fn conversation_cancel_preserves_gui_queued_remote_requests() {
+    let now = Instant::now();
+    let queued_in_gui = remote_chat_record(
+        gateway_chat_request("request-1", "client-1", "conversation-1", "first"),
+        "queued_in_gui",
+        false,
+        now,
+    );
+    let queued = remote_chat_record(
+        gateway_chat_request("request-2", "client-2", "conversation-1", "second"),
+        "queued",
+        false,
+        now,
+    );
+    let claimed = remote_chat_record(
+        gateway_chat_request("request-3", "client-3", "conversation-1", "third"),
+        "claimed",
+        false,
+        now,
+    );
+    let running = remote_chat_record(
+        gateway_chat_request("request-4", "client-4", "conversation-1", "fourth"),
+        "running",
+        true,
+        now,
+    );
+
+    assert!(!GatewayController::remote_chat_record_should_cancel_for_conversation(&queued_in_gui));
+    assert!(!GatewayController::remote_chat_record_should_cancel_for_conversation(&queued));
+    assert!(GatewayController::remote_chat_record_should_cancel_for_conversation(&claimed));
+    assert!(GatewayController::remote_chat_record_should_cancel_for_conversation(&running));
+}
+
+#[test]
+fn history_share_resolve_error_code_maps_public_share_failures() {
+    assert_eq!(history_share_resolve_error_code("分享 token 不能为空"), 400);
+    assert_eq!(
+        history_share_resolve_error_code("分享链接不存在或已关闭"),
+        404
+    );
+    assert_eq!(
+        history_share_resolve_error_code("未找到对应的历史对话"),
+        404
+    );
+    assert_eq!(
+        history_share_resolve_error_code("读取历史对话分享链接失败：db"),
+        500
+    );
+    assert_eq!(history_share_resolve_error_code("share not found"), 404);
+    assert_eq!(
+        history_share_resolve_error_code("share token is required"),
+        400
+    );
+}
+
+#[test]
+fn merge_settings_sync_snapshot_keeps_cached_ui_only_fields() {
+    let db_snapshot = json!({
+        "system": { "executionMode": "agent-dev" },
+        "automationCron": { "revision": 3, "tasks": [{ "id": "cron-a" }] },
+        "theme": "light",
+        "locale": "zh-CN",
+        "skills": {},
+        "chatRuntimeControls": {
+            "thinkingEnabled": true,
+            "nativeWebSearchEnabled": true,
+            "reasoning": "high"
+        },
+        "customSettings": {},
+        "selectedModel": null,
+    });
+    let cached_snapshot = json!({
+        "theme": "dark",
+        "locale": "en-US",
+        "skills": { "enabled": true },
+        "chatRuntimeControls": {
+            "thinkingEnabled": false,
+            "nativeWebSearchEnabled": false,
+            "reasoning": "xhigh"
+        },
+        "customSettings": {
+            "conversationTitleModel": {
+                "customProviderId": "provider-a",
+                "model": "gpt-5-mini"
+            }
+        },
+        "selectedModel": {
+            "customProviderId": "provider-a",
+            "model": "gpt-5.4"
+        },
+    });
+
+    let merged = merge_settings_sync_snapshot(db_snapshot, Some(&cached_snapshot))
+        .expect("merge settings sync snapshot");
+
+    assert_eq!(
+        merged["automationCron"],
+        json!({ "revision": 3, "tasks": [{ "id": "cron-a" }] })
+    );
+    assert_eq!(merged["theme"], json!("dark"));
+    assert_eq!(merged["locale"], json!("en-US"));
+    assert_eq!(merged["skills"], json!({ "enabled": true }));
+    assert_eq!(
+        merged["chatRuntimeControls"],
+        json!({
+            "thinkingEnabled": false,
+            "nativeWebSearchEnabled": false,
+            "reasoning": "xhigh"
+        })
+    );
+    assert_eq!(
+        merged["customSettings"],
+        json!({
+            "conversationTitleModel": {
+                "customProviderId": "provider-a",
+                "model": "gpt-5-mini"
+            }
+        })
+    );
+    assert_eq!(
+        merged["selectedModel"],
+        json!({
+            "customProviderId": "provider-a",
+            "model": "gpt-5.4"
+        })
+    );
+}
+
+#[test]
+fn merge_settings_sync_snapshot_without_cache_leaves_ui_only_fields_absent() {
+    let db_snapshot = json!({
+        "system": { "executionMode": "agent-dev" },
+        "automationCron": { "revision": 3, "tasks": [{ "id": "cron-a" }] },
+    });
+
+    let merged =
+        merge_settings_sync_snapshot(db_snapshot, None).expect("merge settings sync snapshot");
+
+    let merged_map = merged.as_object().expect("merged snapshot object");
+    assert!(!merged_map.contains_key("theme"));
+    assert!(!merged_map.contains_key("locale"));
+    assert!(!merged_map.contains_key("selectedModel"));
+    assert_eq!(merged["system"], json!({ "executionMode": "agent-dev" }));
+}
+
+#[test]
+fn settings_sync_attaches_private_stt_only_to_the_outbound_payload() {
+    let public_snapshot = json!({
+        "theme": "dark",
+        "stt": {
+            "provider": "tencent_cloud",
+            "providers": {
+                "tencent_cloud": {
+                    "id": "tencent_cloud",
+                    "configured": true,
+                    "appId": "123",
+                    "secretId": "",
+                    "secretKey": ""
+                }
+            }
+        }
+    });
+    let raw_stt = json!({
+        "provider": "tencent_cloud",
+        "providers": {
+            "tencent_cloud": {
+                "id": "tencent_cloud",
+                "appId": "123",
+                "secretId": "desktop-secret-id",
+                "secretKey": "desktop-secret-key"
+            }
+        }
+    });
+
+    let outbound = attach_stt_secret_sync(public_snapshot.clone(), Some(raw_stt.clone()))
+        .expect("attach private STT settings");
+
+    assert_eq!(outbound["sttSecretSync"], raw_stt);
+    assert_eq!(
+        public_snapshot["stt"]["providers"]["tencent_cloud"]["secretId"],
+        ""
+    );
+    assert!(public_snapshot.get("sttSecretSync").is_none());
+}
+
+#[test]
+fn merge_settings_update_into_snapshot_keeps_unrelated_fields() {
+    let full_snapshot = json!({
+        "system": { "executionMode": "agent-dev" },
+        "theme": "dark",
+        "locale": "en-US",
+        "selectedModel": {
+            "customProviderId": "provider-a",
+            "model": "gpt-5.4"
+        },
+        "remote": { "enableWebTerminal": true },
+    });
+    let partial_update = json!({
+        "theme": "system",
+        "remote": { "enableWebTerminal": false },
+    });
+
+    let merged = merge_settings_update_into_snapshot(full_snapshot, partial_update)
+        .expect("merge settings update into snapshot");
+
+    assert_eq!(merged["theme"], json!("system"));
+    assert_eq!(merged["locale"], json!("en-US"));
+    assert_eq!(
+        merged["selectedModel"],
+        json!({
+            "customProviderId": "provider-a",
+            "model": "gpt-5.4"
+        })
+    );
+    assert_eq!(merged["system"], json!({ "executionMode": "agent-dev" }));
+    // Remote settings are desktop-owned and must not be overwritten by clients.
+    assert_eq!(merged["remote"], json!({ "enableWebTerminal": true }));
+}
+
+#[test]
+fn settings_update_reports_removed_workspace_project_ids() {
+    let current = json!({
+        "system": {
+            "workspaceProjects": [
+                { "id": "default-project", "path": "/default" },
+                { "id": "project-b", "path": "/b" },
+                { "id": "project-a", "path": "/a" }
+            ]
+        }
+    });
+    let update = json!({
+        "system": {
+            "workspaceProjects": [
+                { "id": "default-project", "path": "/default" },
+                { "id": "project-b", "path": "/b" }
+            ]
+        }
+    });
+
+    assert_eq!(
+        removed_workspace_project_ids(&current, &update).expect("removed ids"),
+        vec!["project-a"]
+    );
+    assert!(
+        removed_workspace_project_ids(&current, &json!({ "theme": "dark" }))
+            .expect("unrelated update")
+            .is_empty()
+    );
+}
+
+#[test]
+fn settings_update_rejects_malformed_workspace_project_ids() {
+    let current = json!({
+        "system": {
+            "workspaceProjects": [{ "id": "project-a", "path": "/a" }]
+        }
+    });
+    let malformed = json!({
+        "system": {
+            "workspaceProjects": [{ "path": "/a" }]
+        }
+    });
+
+    let error = removed_workspace_project_ids(&current, &malformed)
+        .expect_err("missing ids must not trigger accidental revocation");
+    assert!(error.contains("non-empty id"), "{error}");
+}
+
+#[test]
+fn local_settings_update_event_keeps_private_api_key_updates_only_at_root() {
+    let payload = json!({
+        "customProviders": [
+            {
+                "id": "provider-a",
+                "name": "A",
+                "apiKey": "leaked-key"
+            }
+        ],
+        "remote": {
+            "enableWebTerminal": true
+        },
+        "providerApiKeyUpdates": {
+            "provider-a": "new-key"
+        },
+        "providerUsageQuerySecretUpdates": {
+            "provider-a": {
+                "accessToken": "usage-token",
+                "secretAccessKey": "usage-secret"
+            }
+        }
+    });
+
+    let event_payload =
+        build_local_settings_update_event_payload(payload).expect("build event payload");
+    assert_eq!(event_payload.get("remote"), None);
+    assert_eq!(event_payload["customProviders"][0]["apiKey"], Value::Null);
+    assert_eq!(
+        event_payload["customProviders"][0]["apiKeyConfigured"],
+        true
+    );
+    assert_eq!(
+        event_payload["providerApiKeyUpdates"]["provider-a"],
+        "new-key"
+    );
+    assert_eq!(
+        event_payload["providerUsageQuerySecretUpdates"]["provider-a"]["accessToken"],
+        "usage-token"
+    );
+    assert_eq!(
+        event_payload["providerUsageQuerySecretUpdates"]["provider-a"]["secretAccessKey"],
+        "usage-secret"
+    );
+}
+
+#[test]
+fn terminal_project_path_key_is_required_for_gateway_requests() {
+    assert_eq!(
+        required_terminal_project_path_key(" /workspace/project ").as_deref(),
+        Ok("/workspace/project")
+    );
+    assert_eq!(
+        required_terminal_project_path_key(r" C:\Repo\ ").as_deref(),
+        Ok("c:/repo")
+    );
+    assert!(required_terminal_project_path_key(" ").is_err());
+}
+
+#[test]
+fn set_disconnected_status_resets_runtime_fields_for_new_config() {
+    let config = RemoteSettingsPayload {
+        enabled: true,
+        gateway_url: "https://gateway.example.com".to_string(),
+        gateway_port: 50051,
+        token: "dev-token".to_string(),
+        agent_id: "agent-new".to_string(),
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        enable_web_terminal: false,
+        enable_web_ssh_terminal: false,
+        enable_web_git: false,
+        enable_web_tunnels: false,
+        ..RemoteSettingsPayload::default()
+    };
+    let mut status = GatewayStatusSnapshot {
+        online: true,
+        enabled: true,
+        configured: true,
+        gateway_url: "https://old-gateway.example.com".to_string(),
+        agent_id: "agent-old".to_string(),
+        session_id: Some("session-123".to_string()),
+        connected_since: Some(123),
+        last_heartbeat: Some(456),
+        last_error: Some("previous error".to_string()),
+        protocol: Some("v2".to_string()),
+    };
+
+    set_disconnected_status(
+        &mut status,
+        &config,
+        Some("connect gateway failed".to_string()),
+    );
+
+    assert!(!status.online);
+    assert!(status.enabled);
+    assert!(status.configured);
+    assert_eq!(status.gateway_url, "https://gateway.example.com");
+    assert_eq!(status.agent_id, "agent-new");
+    assert_eq!(status.session_id, None);
+    assert_eq!(status.connected_since, None);
+    assert_eq!(status.last_heartbeat, None);
+    assert_eq!(status.last_error.as_deref(), Some("connect gateway failed"));
+}
+
+#[test]
+fn effective_agent_id_requires_persisted_identity_and_does_not_use_hostname() {
+    let mut config = RemoteSettingsPayload::default();
+    assert!(effective_agent_id(&config).is_err());
+
+    config.agent_id = " agent-550e8400-e29b-41d4-a716-446655440000 ".to_string();
+    assert_eq!(
+        effective_agent_id(&config).as_deref(),
+        Ok("agent-550e8400-e29b-41d4-a716-446655440000")
+    );
+}
+
+#[test]
+fn chat_runtime_wake_ping_uses_dedicated_request_prefix() {
+    assert!(is_chat_runtime_wake_request_id(
+        "chat-runtime-wake-request-1"
+    ));
+    assert!(is_chat_runtime_wake_request_id(
+        "  chat-runtime-wake-request-2  "
+    ));
+    assert!(!is_chat_runtime_wake_request_id("ping-request-1"));
+}
+
+#[test]
+fn gateway_connection_nudge_detects_offline_and_stale_sessions() {
+    let config = RemoteSettingsPayload {
+        enabled: true,
+        gateway_url: "https://gateway.example.com".to_string(),
+        gateway_port: 50051,
+        token: "dev-token".to_string(),
+        agent_id: "agent".to_string(),
+        auto_reconnect: true,
+        heartbeat_interval: 30,
+        enable_web_terminal: false,
+        enable_web_ssh_terminal: false,
+        enable_web_git: false,
+        enable_web_tunnels: false,
+        ..RemoteSettingsPayload::default()
+    };
+    assert_eq!(
+        gateway_connection_stale_after(&config),
+        Duration::from_secs(50)
+    );
+
+    let mut status = GatewayStatusSnapshot {
+        online: false,
+        enabled: true,
+        configured: true,
+        gateway_url: config.gateway_url.clone(),
+        agent_id: config.agent_id.clone(),
+        session_id: None,
+        connected_since: None,
+        last_heartbeat: None,
+        last_error: None,
+        protocol: None,
+    };
+    assert!(gateway_connection_needs_restart(&status, &config, 1_000));
+
+    status.online = true;
+    status.last_heartbeat = Some(960);
+    assert!(!gateway_connection_needs_restart(&status, &config, 1_000));
+    status.last_heartbeat = Some(940);
+    assert!(gateway_connection_needs_restart(&status, &config, 1_000));
+
+    let mut disabled = config.clone();
+    disabled.enabled = false;
+    assert!(!gateway_connection_needs_restart(&status, &disabled, 1_000));
+}
+
+#[test]
+fn gateway_reconnect_backoff_is_fast_after_a_stable_session_and_bounded_on_failures() {
+    let (first_delay, next_delay) =
+        gateway_reconnect_backoff(GATEWAY_RECONNECT_MIN, Duration::from_secs(1));
+    assert_eq!(first_delay, GATEWAY_RECONNECT_MIN);
+    assert_eq!(next_delay, GATEWAY_RECONNECT_MIN * 2);
+
+    let (capped_delay, capped_next) =
+        gateway_reconnect_backoff(GATEWAY_RECONNECT_MAX, Duration::from_secs(1));
+    assert_eq!(capped_delay, GATEWAY_RECONNECT_MAX);
+    assert_eq!(capped_next, GATEWAY_RECONNECT_MAX);
+
+    let (stable_delay, stable_next) =
+        gateway_reconnect_backoff(GATEWAY_RECONNECT_MAX, GATEWAY_RECONNECT_STABLE_AFTER);
+    assert_eq!(stable_delay, GATEWAY_RECONNECT_MIN);
+    assert_eq!(stable_next, GATEWAY_RECONNECT_MIN * 2);
+}
+
+#[test]
+fn runtime_status_envelope_carries_run_reports() {
+    let active_run = proto::ChatRunReport {
+        run_id: "run-1".to_string(),
+        conversation_id: "conversation-1".to_string(),
+        state: "running".to_string(),
+        error_code: String::new(),
+        message: String::new(),
+        updated_at: 1_772_000_000_000,
+    };
+    let finished_run = proto::ChatRunReport {
+        run_id: "run-2".to_string(),
+        conversation_id: "conversation-2".to_string(),
+        state: "failed".to_string(),
+        error_code: "desktop_run_lost".to_string(),
+        message: "The desktop runtime stopped reporting this run.".to_string(),
+        updated_at: 1_772_000_000_500,
+    };
+
+    let envelope = build_gateway_runtime_status_envelope(
+        "worker-1".to_string(),
+        "busy".to_string(),
+        true,
+        2,
+        vec![active_run],
+        vec![finished_run],
+    );
+
+    let status = match envelope.payload.expect("payload") {
+        super::proto::agent_envelope::Payload::RuntimeStatus(status) => status,
+        _ => panic!("expected runtime status payload"),
+    };
+    assert_eq!(status.worker_id, "worker-1");
+    assert_eq!(status.state, "busy");
+    assert!(status.visible);
+    assert_eq!(status.active_run_count, 2);
+    assert_eq!(status.active_runs.len(), 1);
+    assert_eq!(status.active_runs[0].run_id, "run-1");
+    assert_eq!(status.active_runs[0].state, "running");
+    assert_eq!(status.active_runs[0].updated_at, 1_772_000_000_000);
+    assert_eq!(status.finished_runs.len(), 1);
+    assert_eq!(status.finished_runs[0].run_id, "run-2");
+    assert_eq!(status.finished_runs[0].state, "failed");
+    assert_eq!(status.finished_runs[0].error_code, "desktop_run_lost");
+    assert_eq!(
+        status.finished_runs[0].message,
+        "The desktop runtime stopped reporting this run."
+    );
+}
+
+#[test]
+fn runtime_status_republish_record_tracks_last_webview_report() {
+    let now = Instant::now();
+    let record =
+        GatewayController::next_runtime_status_republish_record("worker-1", "busy", true, 2, now)
+            .expect("busy state must be recorded for republish");
+    assert_eq!(record.worker_id, "worker-1");
+    assert_eq!(record.state, "busy");
+    assert!(record.visible);
+    assert_eq!(record.active_run_count, 2);
+
+    // "suspended" is the webview's goodbye: stop echoing on its behalf.
+    assert!(GatewayController::next_runtime_status_republish_record(
+        "worker-1",
+        "suspended",
+        false,
+        0,
+        now,
+    )
+    .is_none());
+}
+
+#[test]
+fn runtime_status_republish_payload_expires_after_max_age() {
+    let now = Instant::now();
+    let record =
+        GatewayController::next_runtime_status_republish_record("worker-1", "ready", true, 0, now)
+            .expect("record");
+
+    let fresh = GatewayController::runtime_status_republish_payload(
+        Some(&record),
+        now + GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE - Duration::from_secs(1),
+    );
+    assert_eq!(
+        fresh,
+        Some(("worker-1".to_string(), "ready".to_string(), true, 0))
+    );
+
+    // A webview that has been silent past the max age (it refreshes the
+    // record at least once a minute even when throttled) is gone; the echo
+    // must stop instead of impersonating it.
+    let stale = GatewayController::runtime_status_republish_payload(
+        Some(&record),
+        now + GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE + Duration::from_secs(1),
+    );
+    assert_eq!(stale, None);
+
+    assert_eq!(
+        GatewayController::runtime_status_republish_payload(None, now),
+        None
+    );
+}
+
+#[test]
+fn stalled_webview_status_refreshes_running_ledger_only_inside_grace_window() {
+    let now = Instant::now();
+    let record =
+        GatewayController::next_runtime_status_republish_record("worker-1", "busy", false, 1, now)
+            .expect("busy record");
+
+    assert!(
+        !GatewayController::webview_status_report_stalled_but_alive_at(
+            Some(&record),
+            now + GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW,
+        )
+    );
+    assert!(
+        GatewayController::webview_status_report_stalled_but_alive_at(
+            Some(&record),
+            now + GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW + Duration::from_secs(1),
+        )
+    );
+    assert!(
+        !GatewayController::webview_status_report_stalled_but_alive_at(
+            Some(&record),
+            now + GATEWAY_RUNTIME_STATUS_REPUBLISH_MAX_AGE + Duration::from_secs(1),
+        )
+    );
+    assert!(!GatewayController::webview_status_report_stalled_but_alive_at(None, now,));
+    let idle_record =
+        GatewayController::next_runtime_status_republish_record("worker-1", "ready", false, 0, now)
+            .expect("idle record");
+    assert!(
+        !GatewayController::webview_status_report_stalled_but_alive_at(
+            Some(&idle_record),
+            now + GATEWAY_WEBVIEW_REPORT_FRESH_WINDOW + Duration::from_secs(1),
+        )
+    );
+}
+
+#[test]
+fn gateway_offline_is_ignored_for_best_effort_publishes() {
+    assert_eq!(
+        ignore_gateway_outbound_offline(Err(GATEWAY_OUTBOUND_OFFLINE_ERROR.to_string())),
+        Ok(())
+    );
+    assert_eq!(ignore_gateway_outbound_offline(Ok(())), Ok(()));
+}
+
+#[test]
+fn gateway_publish_keeps_real_send_failures() {
+    for error in [
+        "gateway outbound sender lock poisoned",
+        "gateway outbound control lane is offline",
+        "gateway outbound lane closed",
+    ] {
+        assert_eq!(
+            ignore_gateway_outbound_offline(Err(error.to_string())),
+            Err(error.to_string())
+        );
+    }
+}
+
+#[test]
+fn chat_queue_event_envelope_carries_snapshot() {
+    let envelope = build_chat_queue_event_envelope(GatewayChatQueueEventInput {
+        conversation_id: "conversation-1".to_string(),
+        snapshot_json: r#"{"items":[]}"#.to_string(),
+        revision: 7,
+    });
+
+    assert!(envelope.request_id.starts_with("chat-queue-event-"));
+    match envelope.payload {
+        Some(proto::agent_envelope::Payload::ChatQueueEvent(event)) => {
+            assert_eq!(event.conversation_id, "conversation-1");
+            assert_eq!(event.snapshot_json, r#"{"items":[]}"#);
+            assert_eq!(event.revision, 7);
+        }
+        other => panic!("unexpected payload: {other:?}"),
+    }
+}
+
+// Fourth review (2aa05c4e): the desktop agent's K-brain memory switch bridge, driven
+// through the real write_switch against a one-shot local HTTP stand-in. settings.get takes the
+// switch from the snapshot's own K-brain settings read, so there is no second read to test.
+mod review4_kbrain_memory {
+    use super::super::kbrain_memory::write_switch;
+    use crate::services::kbrain_backend::KBrainBackendConnection;
+    use std::io::{Read, Write};
+    use std::time::Duration;
+
+    const TOKEN: &str = "review4-secret-token";
+
+    /// One request: waits `delay`, answers `status` with `body`, returns the raw request.
+    fn kbrain_stub(
+        status: &'static str,
+        body: &'static str,
+        delay: Duration,
+    ) -> (KBrainBackendConnection, std::thread::JoinHandle<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind stub");
+        let base_url = format!("http://{}", listener.local_addr().expect("stub addr"));
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept");
+            stream
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .expect("read timeout");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                match stream.read(&mut chunk) {
+                    Ok(0) | Err(_) => break,
+                    Ok(read) => request.extend_from_slice(&chunk[..read]),
+                }
+                let text = String::from_utf8_lossy(&request);
+                if let Some((head, rest)) = text.split_once("\r\n\r\n") {
+                    let length = head
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if rest.len() >= length {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(delay);
+            let response = format!(
+                "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            String::from_utf8_lossy(&request).into_owned()
+        });
+        let connection = KBrainBackendConnection {
+            base_url,
+            token: TOKEN.into(),
+            protocol_version: "review4".into(),
+            storage_id: "review4".into(),
+        };
+        (connection, handle)
+    }
+
+    #[test]
+    fn review4_switch_errors_name_the_status_without_token_or_url() {
+        for status in ["401 Unauthorized", "500 Internal Server Error"] {
+            let (connection, handle) = kbrain_stub(status, r#"{"error":"x"}"#, Duration::ZERO);
+            let base_url = connection.base_url.clone();
+            let error = write_switch(&connection, true).expect_err("non-2xx write must fail");
+            handle.join().expect("stub thread");
+            assert!(error.contains(&status[..3]), "{error}");
+            assert!(
+                !error.contains(TOKEN) && !error.contains(&base_url),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn review4_switch_write_puts_only_the_memory_switch() {
+        let (connection, handle) = kbrain_stub("200 OK", "{}", Duration::ZERO);
+        write_switch(&connection, false).expect("write accepted");
+        let request = handle.join().expect("stub thread");
+        assert!(
+            request.starts_with("PUT /v1/settings HTTP/1.1\r\n"),
+            "{request}"
+        );
+        assert!(
+            request.ends_with(r#"{"memory":{"enabled":false}}"#),
+            "{request}"
+        );
+    }
+}
+
+fn sync_ack(id: &str, seq: u64, error: Option<&str>) -> SettingsSyncAck {
+    SettingsSyncAck {
+        id: id.to_string(),
+        seq,
+        error: error.map(str::to_string),
+    }
+}
+
+#[test]
+fn settings_sync_client_marker_is_taken_out_of_the_update() {
+    let mut update = json!({
+        "theme": "dark",
+        "syncClient": { "id": "tab-a", "seq": 3 },
+        "appliedClientSeqs": { "tab-a": { "seq": 99 } },
+        "settingsSyncVersion": { "epoch": "e", "generation": 9 },
+    });
+    let client = take_settings_sync_client(&mut update)
+        .expect("valid marker")
+        .expect("marker present");
+    assert_eq!((client.id.as_str(), client.seq), ("tab-a", 3));
+    assert_eq!(
+        update,
+        json!({ "theme": "dark" }),
+        "neither key may reach the snapshot"
+    );
+
+    let mut legacy = json!({ "theme": "light" });
+    assert_eq!(
+        take_settings_sync_client(&mut legacy).expect("no marker"),
+        None
+    );
+
+    for bad in [
+        json!({ "id": "", "seq": 1 }),
+        json!({ "id": "tab", "seq": 0 }),
+        json!({ "id": "tab", "seq": -1 }),
+        json!({ "id": "x".repeat(129), "seq": 1 }),
+        json!("tab"),
+    ] {
+        let mut update = json!({ "syncClient": bad });
+        assert!(take_settings_sync_client(&mut update).is_err(), "{update}");
+    }
+}
+
+#[test]
+fn settings_sync_client_marker_rides_along_to_the_frontend_event() {
+    let mut update = json!({ "syncClient": { "id": "tab-a", "seq": 7 } });
+    let client = take_settings_sync_client(&mut update).unwrap();
+    let event = with_settings_sync_client(json!({ "theme": "dark" }), client.as_ref());
+    assert_eq!(event["syncClient"], json!({ "id": "tab-a", "seq": 7 }));
+    assert_eq!(
+        with_settings_sync_client(json!({ "theme": "dark" }), None),
+        json!({ "theme": "dark" })
+    );
+}
+
+#[test]
+fn applied_client_seqs_track_each_tab_independently_and_never_go_backwards() {
+    let mut table = AppliedClientSeqs::default();
+    assert_eq!(
+        table.to_value(),
+        json!({}),
+        "an empty table still marks ack support"
+    );
+    table.record(&sync_ack("tab-a", 2, None));
+    table.record(&sync_ack("tab-b", 9, None));
+    table.record(&sync_ack("tab-a", 1, Some("late"))); // out of order: ignored
+    table.record(&sync_ack("tab-a", 3, Some("  disk full  ")));
+    assert_eq!(
+        table.to_value(),
+        json!({
+            "tab-b": { "seq": 9 },
+            "tab-a": { "seq": 3, "error": "disk full" },
+        })
+    );
+    table.record(&sync_ack("tab-a", 4, Some("   ")));
+    assert_eq!(
+        table.to_value()["tab-a"],
+        json!({ "seq": 4 }),
+        "a later success clears the error"
+    );
+    table.record(&sync_ack("", 5, None));
+    table.record(&sync_ack("tab-c", 0, None));
+    assert_eq!(table.to_value().as_object().unwrap().len(), 2);
+}
+
+#[test]
+fn applied_client_seqs_evict_the_least_recently_acknowledged_tab() {
+    let mut table = AppliedClientSeqs::default();
+    for index in 0..64 {
+        table.record(&sync_ack(&format!("tab-{index}"), 1, None));
+    }
+    table.record(&sync_ack("tab-0", 2, None)); // refreshes tab-0
+    table.record(&sync_ack("tab-new", 1, None));
+    let value = table.to_value();
+    let acks = value.as_object().unwrap();
+    assert_eq!(acks.len(), 64);
+    assert!(acks.contains_key("tab-0"));
+    assert!(acks.contains_key("tab-new"));
+    assert!(
+        !acks.contains_key("tab-1"),
+        "oldest untouched tab is evicted"
+    );
+}
+
+#[test]
+fn a_slow_settings_read_never_overwrites_a_snapshot_stored_meanwhile() {
+    let mut cache = SettingsSnapshotCache::default();
+    assert!(cache.store(json!({ "theme": "light" }), None));
+    let read_at = 1; // a reconcile reads the cache here, then awaits DB and K-brain
+    assert!(cache.store(json!({ "theme": "dark" }), None)); // frontend publish lands
+    assert!(!cache.store(json!({ "theme": "light" }), Some(read_at)));
+    assert_eq!(cache.value(), Some(&json!({ "theme": "dark" })));
+    assert!(
+        cache.store(json!({ "theme": "system" }), Some(2)),
+        "an up-to-date read stores"
+    );
+    assert_eq!(cache.value(), Some(&json!({ "theme": "system" })));
+}
+
+#[test]
+fn outbound_snapshots_carry_acks_and_their_cache_version() {
+    let stamp = SettingsSyncStamp {
+        acks: json!({ "tab-a": { "seq": 2 } }),
+        epoch: "desktop-1".to_string(),
+        generation: 7,
+    };
+    let snapshot = attach_settings_sync_stamp(json!({ "theme": "dark" }), &stamp);
+    assert_eq!(
+        snapshot,
+        json!({
+            "theme": "dark",
+            "appliedClientSeqs": { "tab-a": { "seq": 2 } },
+            "settingsSyncVersion": { "epoch": "desktop-1", "generation": 7 },
+        })
+    );
+}

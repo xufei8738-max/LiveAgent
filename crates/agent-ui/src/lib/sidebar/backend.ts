@@ -1,0 +1,54 @@
+// The platform boundary of the sidebar state layer. Each end implements this
+// once (GUI: Tauri IPC + CHAT_HISTORY_SYNC_EVENT; web: gateway WebSocket +
+// activity-store bridge); the store never touches a transport directly.
+// Shared between agent-gui and agent-gateway/web.
+
+import type {
+  SidebarBackendEvent,
+  SidebarConversation,
+  SidebarScope,
+  SidebarWorkdirSummary,
+} from "./types";
+
+export type SidebarListPage = {
+  items: SidebarConversation[];
+  totalCount: number;
+};
+
+/**
+ * Archived conversations (K-brain `session_archive`). Archived conversations leave the
+ * normal list; the backend's own sync reports both directions as list changes.
+ */
+export type SidebarArchiveBackend = {
+  /** False hides every archive action (older backends, other runtimes). */
+  isSupported(): Promise<boolean>;
+  setArchived(id: string, archived: boolean): Promise<void>;
+  /** `page` is 1-based, like listConversations. */
+  listArchived(page: number, pageSize: number): Promise<SidebarListPage>;
+};
+
+export type SidebarBackend = {
+  listPinnedConversations?(): Promise<SidebarConversation[]>;
+  listConversations(page: number, pageSize: number, scope: SidebarScope): Promise<SidebarListPage>;
+  listWorkdirs(): Promise<SidebarWorkdirSummary[]>;
+  renameConversation(id: string, title: string): Promise<SidebarConversation>;
+  setConversationPinned(id: string, isPinned: boolean): Promise<SidebarConversation>;
+  setConversationCwd(id: string, cwd: string): Promise<SidebarConversation>;
+  deleteConversation(id: string): Promise<void>;
+  archive?: SidebarArchiveBackend;
+  // The single event subscription for this end. The store subscribes exactly
+  // once per start() and applies every event through the reconcile reducers.
+  subscribeEvents(listener: (event: SidebarBackendEvent) => void): () => void;
+  // Emits true/false on transport connectivity changes; a false→true
+  // transition triggers an authoritative refresh. Omitted on ends whose
+  // backend is always reachable (GUI local sqlite).
+  subscribeConnection?(listener: (connected: boolean) => void): () => void;
+  // Event-sourced backends may disable reconcile (null) or choose a bounded
+  // safety interval. A health change reconfigures the timer without restarting.
+  getReconcileIntervalMs?(): number | null;
+  subscribeSyncState?(listener: () => void): () => void;
+  getSyncError?(): string | undefined;
+  // Ids an authoritative reconcile must never drop even when the server list
+  // omits them (e.g. web command-pipeline pending conversations).
+  getProtectedConversationIds?(): Iterable<string>;
+};

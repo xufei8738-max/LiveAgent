@@ -1,0 +1,61 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# AI
+.codex
+.claude
+.codex-artifacts
+.liveagent
+workspace
+!crates/agent-gui/src-tauri/src/commands/workspace/
+!crates/agent-gui/src-tauri/src/commands/workspace/**
+!crates/agent-gui/src/pages/chat/workspace/
+!crates/agent-gui/src/pages/chat/workspace/**
+!crates/agent-gui/test/workspace/
+!crates/agent-gui/test/workspace/**
+cert/
+node_modules
+dist
+dist-ssr
+target
+*.local
+.vscode
+target
+bin
+# Generated Tauri external binary and local locked-artifact cache
+crates/agent-gui/src-tauri/binaries/
+.liveagent/kbrain-artifact/
+.liveagent/kbrain-cache/
+.serena
+chatroom
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+._*
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+.pnpm-store
+workspace.zip
+
+# Debug symbols (MSVC)
+*.pdb
+
+# Desktop Gateway sidecars are built from this checkout before Tauri dev/build.
+/crates/agent-gui/src-tauri/binaries/
+
+# Local workflow artifacts
+/.trellis
+/AGENTS.md
+/CLAUDE.md

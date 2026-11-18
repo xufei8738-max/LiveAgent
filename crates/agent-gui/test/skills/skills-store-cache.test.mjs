@@ -1,0 +1,94 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import { normalizeClassGroups } from "../../../agent-ui/test-support/source-class-groups.mjs";
+
+const hubSource = readFileSync(
+  new URL("../../../agent-ui/src/pages/skills-hub/SkillsHubPage.tsx", import.meta.url),
+  "utf8",
+);
+const storeSource = normalizeClassGroups(
+  readFileSync(
+    new URL("../../../agent-ui/src/pages/skills-hub/SkillsStoreView.tsx", import.meta.url),
+    "utf8",
+  ),
+);
+const cacheSource = readFileSync(
+  new URL("../../../agent-ui/src/pages/skills-hub/skillStoreCache.ts", import.meta.url),
+  "utf8",
+);
+const storeCardSource = normalizeClassGroups(
+  readFileSync(
+    new URL("../../../agent-ui/src/pages/skills-hub/StoreSkillCard.tsx", import.meta.url),
+    "utf8",
+  ),
+);
+const installedViewSource = normalizeClassGroups(
+  readFileSync(
+    new URL("../../../agent-ui/src/pages/skills-hub/InstalledSkillsView.tsx", import.meta.url),
+    "utf8",
+  ),
+);
+const cardLayoutSource = normalizeClassGroups(
+  readFileSync(
+    new URL("../../../agent-ui/src/pages/skills-hub/skillCardLayout.ts", import.meta.url),
+    "utf8",
+  ),
+);
+
+test("the skill store reuses a fresh catalog snapshot when returning to the tab", () => {
+  assert.match(hubSource, /const cached = readSkillStoreCatalog\(cacheKey\)/);
+  assert.match(
+    hubSource,
+    /setStoreItems\(cached\?\.items \?\? \[\]\)[\s\S]*cached && isSkillStoreCatalogFresh\(cached\)/,
+  );
+  assert.match(cacheSource, /const catalogRequests = new Map/);
+  assert.match(cacheSource, /if \(existingRequest\) return existingRequest/);
+});
+
+test("the skill store appends the next cursor page instead of refetching the full list", () => {
+  assert.match(
+    cacheSource,
+    /listClawHubSkills\(\{[\s\S]*sort: params\.sort,[\s\S]*cursor: params\.cursor,[\s\S]*limit: params\.limit/,
+  );
+  assert.match(hubSource, /loadMoreSkillStoreCatalog\(\{[\s\S]*cursor: storeCursor/);
+  assert.doesNotMatch(hubSource, /limit:\s*storeItems\.length\s*\+/);
+});
+
+test("an opened skill detail is shown from cache and refreshed only when stale", () => {
+  assert.match(storeSource, /const cached = readSkillStoreDetail\(previewSkill\)/);
+  assert.match(storeSource, /setPreviewDetail\(cached\?\.detail \?\? null\)/);
+  assert.match(storeSource, /setPreviewLoading\(!cached\)/);
+  assert.match(storeSource, /cached && isSkillStoreDetailFresh\(cached, previewSkill\)/);
+  assert.match(cacheSource, /const detailRequests = new Map/);
+  assert.match(
+    cacheSource,
+    /writeLruEntry\(detailCache, initialKey[\s\S]*buildClawHubSkillKey\(snapshot\.skill\)/,
+  );
+});
+
+test("background catalog refresh does not move the tabs or disable the card grid", () => {
+  assert.match(storeSource, /absolute inset-x-0 top-0 z-40 h-px/);
+  assert.match(storeSource, /w-\[42%\] origin-left animate-hub-loading-progress motion-reduce:animate-none! h-full rounded-full bg-foreground\/45/);
+  assert.doesNotMatch(storeSource, /Loader2 aria-hidden=\{!refreshing\}/);
+  assert.doesNotMatch(storeSource, /blur-\[1px\]/);
+  assert.doesNotMatch(storeSource, /pointer-events-none saturate/);
+});
+
+test("store cards keep a static surface on pointer hover", () => {
+  assert.doesNotMatch(storeSource, /hover:shadow-md/);
+  assert.doesNotMatch(storeSource, /hover:-translate-y/);
+  assert.doesNotMatch(storeSource, /group-hover:bg-muted\/80/);
+});
+
+test("both skill cards and both lists share one card shell and one grid", () => {
+  assert.match(cardLayoutSource, /bg-settings-tile px-3\.5 py-2\.5 text-left transition-colors/);
+  assert.match(cardLayoutSource, /hover:bg-settings-tile-hover/);
+  assert.match(cardLayoutSource, /grid gap-1\.5/);
+  assert.doesNotMatch(cardLayoutSource, /auto-fit,minmax/);
+  assert.match(storeCardSource, /cn\(\s*SKILL_CARD_SHELL_CLASS/);
+  assert.match(installedViewSource, /SKILL_LIST_GRID_CLASS/);
+  assert.match(storeSource, /SKILL_LIST_GRID_CLASS/);
+  assert.match(storeSource, /StoreSkillCard/);
+  assert.match(storeCardSource, /data-card-action-zone=""/);
+});

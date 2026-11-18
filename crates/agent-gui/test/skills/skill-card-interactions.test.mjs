@@ -1,0 +1,117 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
+
+const uiRoot = new URL("../../../agent-ui/src/", import.meta.url);
+
+function readUiSource(path) {
+  return readFileSync(new URL(path, uiRoot), "utf8");
+}
+
+test("installed Skill card actions do not bubble into the card preview trigger", () => {
+  const source = readUiSource("pages/skills-hub/InstalledSkillCard.tsx");
+
+  assert.match(source, /data-card-action-zone=""/);
+  assert.match(source, /onPointerDown=\{\(event\) => event\.stopPropagation\(\)\}/);
+  assert.match(source, /onMouseDown=\{\(event\) => event\.stopPropagation\(\)\}/);
+  assert.match(source, /onClick=\{\(event\) => event\.stopPropagation\(\)\}/);
+  assert.match(source, /onKeyDown=\{\(event\) => event\.stopPropagation\(\)\}/);
+  assert.match(source, /<ResourceActivationSwitch[\s\S]*stopPropagation/);
+});
+
+test("installed Skill cards follow the global Skills activation state", () => {
+  const cardSource = readUiSource("pages/skills-hub/InstalledSkillCard.tsx");
+
+  assert.match(cardSource, /const effectivelyEnabled = skillsEnabled && checked/);
+  assert.match(
+    cardSource,
+    /<ResourceActivationSwitch[\s\S]*checked=\{effectivelyEnabled\}[\s\S]*disabled=\{!skillsEnabled\}/,
+  );
+  assert.match(cardSource, /effectivelyEnabled \? \([\s\S]*settings\.skillsHubEnabledBadge/);
+  assert.match(cardSource, /!effectivelyEnabled && !alwaysEnabled && "opacity-75"/);
+  const InstalledSkillCard = () => null;
+  const { loadModule } = createTsModuleLoader({
+    mocks: {
+      "@liveagent/ui/i18n/index": { useLocale: () => ({ t: (key) => key }) },
+      "./InstalledSkillCard": { InstalledSkillCard },
+    },
+  });
+  const { InstalledSkillsView } = loadModule(
+    "@liveagent/ui/pages/skills-hub/InstalledSkillsView.tsx",
+  );
+  function findCard(node) {
+    if (!node || typeof node !== "object") return undefined;
+    if (node.type === InstalledSkillCard) return node;
+    const children = Array.isArray(node) ? node : [node.props?.children];
+    for (const child of children) {
+      const card = findCard(child);
+      if (card) return card;
+    }
+  }
+  for (const skillsEnabled of [false, true]) {
+    const view = InstalledSkillsView({
+      items: [{ skill: { name: "test-skill" }, categories: [] }],
+      skillsEnabled,
+      selected: new Set(["test-skill"]),
+      bulkSelection: new Set(),
+      categoryCounts: new Map(),
+      rootDir: "/skills",
+      loading: false,
+      initialContentPending: false,
+      bulkMode: false,
+      hasSkills: true,
+      loadError: null,
+      category: "all",
+      searchQuery: "",
+      filter: "",
+      deletingSkillName: null,
+      onRescan: () => {},
+      onToggle: () => {},
+      onEnterBulkMode: () => {},
+      onToggleBulkSelection: () => {},
+      onBulkCardClick: () => {},
+      onOpenPreview: () => {},
+      onDelete: () => {},
+      onSelectCategory: () => {},
+    });
+    const card = findCard(view);
+    assert.ok(card, "the installed skill must render");
+    assert.equal(card.props.skillsEnabled, skillsEnabled);
+    assert.equal(card.props.checked, true, "global activation must preserve selection");
+  }
+});
+
+test("installed Skill actions stay grouped on the right side of the resource row", () => {
+  const source = readUiSource("pages/skills-hub/InstalledSkillCard.tsx");
+  const toolbarIndex = source.indexOf('data-card-action-zone=""');
+  const switchIndex = source.indexOf("<ResourceActivationSwitch");
+  const deleteIndex = source.indexOf("<ConfirmDeletePopover");
+
+  assert.ok(toolbarIndex > -1 && deleteIndex > toolbarIndex && switchIndex > deleteIndex);
+  assert.match(source, /data-card-action-zone=""[\s\S]*role="toolbar"/);
+  assert.match(source, /<ConfirmDeletePopover[\s\S]*hover:bg-destructive\/10/);
+  assert.match(source, /<ResourceActivationSwitch[\s\S]*compact[\s\S]*stopPropagation/);
+});
+
+test("resource switches isolate pointer, mouse, click, and keyboard events when requested", () => {
+  const source = readUiSource("components/resources/ResourceActivationSwitch.tsx");
+
+  assert.match(source, /if \(props\.stopPropagation\) event\.stopPropagation\(\)/);
+  assert.match(source, /onPointerDown=\{stopEventPropagation\}/);
+  assert.match(source, /onMouseDown=\{stopEventPropagation\}/);
+  assert.match(source, /onKeyDown=\{stopEventPropagation\}/);
+  assert.match(source, /onClick=\{\(event\) => \{[\s\S]*stopEventPropagation\(event\)/);
+});
+
+test("confirmation popovers isolate cancel and confirm actions from parent cards", () => {
+  const source = readUiSource("components/ui/confirm-action-popover.tsx");
+
+  assert.match(source, /<PopoverContent[\s\S]*onPointerDown=.*stopPropagation/);
+  assert.match(source, /<PopoverContent[\s\S]*onClick=.*stopPropagation/);
+  assert.match(
+    source,
+    /variant="outline"[\s\S]*onClick=\{\(event\) => event\.stopPropagation\(\)\}/,
+  );
+  assert.match(source, /event\.stopPropagation\(\);[\s\S]*onConfirm\(\);/);
+});

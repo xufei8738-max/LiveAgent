@@ -1,0 +1,1506 @@
+import {
+  removeSshHostFromProjectAssociations,
+  type SshAuthType,
+  type SshHostConfig,
+  type SshProxyType,
+  updateSsh,
+} from "@liveagent/app/lib/settings";
+import type { SettingsSectionProps } from "@liveagent/app/pages/settings/types";
+import { invoke } from "@liveagent/app/shims/tauriCore";
+import {
+  Check,
+  ChevronDown,
+  Eye,
+  EyeOff,
+  Key,
+  LayoutGrid,
+  List,
+  Plus,
+  Server,
+  Shield,
+  SquarePen,
+  Trash2,
+  Upload,
+} from "@liveagent/ui/components/IconSet";
+import { FormField, FormFieldLabel } from "@liveagent/ui/components/settings/FormField";
+import { SettingsSection } from "@liveagent/ui/components/settings/SettingsLayout";
+import {
+  SettingsToggleGroup,
+  SettingsToggleGroupItem,
+} from "@liveagent/ui/components/settings/SettingsToggleGroup";
+import { EmptyState } from "@liveagent/ui/components/ui/empty-state";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import { hostAwareErrorMessage } from "@liveagent/ui/lib/shared/hostErrors";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import { useEffect, useRef, useState } from "react";
+import {
+  SettingsSelectContent,
+  SettingsSelectTrigger,
+} from "../../components/settings/SettingsSelect";
+import { Button } from "../../components/ui/button";
+import { useConfirmDialog } from "../../components/ui/confirm-dialog";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../../components/ui/dialog";
+import { Input } from "../../components/ui/input";
+import { Select, SelectItem, SelectValue } from "../../components/ui/select";
+import { Textarea } from "../../components/ui/textarea";
+import { createUuid } from "../../lib/shared/id";
+import {
+  type SshImportCandidate,
+  type SshScanResult,
+  scanSshImportCandidates,
+} from "../../lib/ssh/scan";
+import type { TerminalSession } from "../../lib/terminal/types";
+import {
+  hasSshAgentHostStatus,
+  type KBrainSshState,
+  SshAgentHostStatus,
+  SshAgentSyncError,
+  useKBrainSshState,
+} from "./SshAgentState";
+import { ConfirmActionPopover, PromptTag } from "./shared";
+
+type SshViewMode = "list" | "grid";
+type SshHostDraft = Omit<SshHostConfig, "id">;
+type SshKnownHostResetStatus = {
+  hostId: string;
+  kind: "success" | "info" | "error";
+  message: string;
+};
+
+type SshKnownHostResetResponse = {
+  deleted: number;
+};
+
+type RawTerminalListResponse = {
+  sessions?: TerminalSession[];
+};
+
+type SshReconnectTarget = {
+  id: string;
+  projectPathKey: string;
+};
+
+/** Non-empty secret input replaces the stored secret; empty input keeps it. */
+function sshSecretInputChanged(draftValue: string, storedValue: string) {
+  const next = draftValue.trim();
+  if (!next) return false;
+  return next !== storedValue.trim();
+}
+
+/**
+ * Whether the edited draft changes anything an established connection depends
+ * on. Cosmetic fields (name, description, sort order, `*Configured` flags)
+ * never count.
+ */
+export function sshHostConnectionFieldsChanged(
+  before: SshHostConfig,
+  draft: Omit<SshHostConfig, "id">,
+): boolean {
+  if (
+    before.host.trim() !== draft.host.trim() ||
+    before.port !== draft.port ||
+    before.username.trim() !== draft.username.trim() ||
+    before.authType !== draft.authType
+  ) {
+    return true;
+  }
+  if (before.proxy.useSystemProxy !== draft.proxy.useSystemProxy) {
+    return true;
+  }
+  // While the host reuses the app proxy, the manual proxy fields are inert and
+  // may not force a reconnect prompt.
+  if (
+    !draft.proxy.useSystemProxy &&
+    (before.proxy.type !== draft.proxy.type ||
+      before.proxy.url.trim() !== draft.proxy.url.trim() ||
+      before.proxy.port !== draft.proxy.port ||
+      before.proxy.username.trim() !== draft.proxy.username.trim() ||
+      sshSecretInputChanged(draft.proxy.password, before.proxy.password))
+  ) {
+    return true;
+  }
+  if (draft.authType === "password") {
+    return sshSecretInputChanged(draft.password, before.password);
+  }
+  if (draft.authType === "privateKey") {
+    return (
+      sshSecretInputChanged(draft.privateKey, before.privateKey) ||
+      draft.privateKeyPath.trim() !== before.privateKeyPath.trim() ||
+      sshSecretInputChanged(draft.privateKeyPassphrase, before.privateKeyPassphrase)
+    );
+  }
+  return false;
+}
+
+async function listActiveSshSessions(hostId: string): Promise<TerminalSession[]> {
+  const response = await invoke<RawTerminalListResponse>("terminal_list", {});
+  return (response.sessions ?? []).filter(
+    (session) =>
+      session.kind === "ssh" &&
+      session.ssh?.hostId === hostId &&
+      session.ssh.status !== "disconnected",
+  );
+}
+
+function normalizePortInput(value: string) {
+  const port = Number(value);
+  if (!Number.isFinite(port)) return 22;
+  const normalized = Math.floor(port);
+  return normalized >= 1 && normalized <= 65535 ? normalized : 22;
+}
+
+function normalizeOptionalPortInput(value: string) {
+  const trimmed = value.trim();
+  if (!trimmed) return 0;
+  const port = Number(trimmed);
+  if (!Number.isFinite(port)) return 0;
+  const normalized = Math.floor(port);
+  return normalized >= 1 && normalized <= 65535 ? normalized : 0;
+}
+
+function endpointLabel(host: SshHostConfig) {
+  const userPrefix = host.username.trim() ? `${host.username.trim()}@` : "";
+  return `${userPrefix}${host.host}:${host.port}`;
+}
+
+function authLabel(host: Pick<SshHostConfig, "authType">, t: (key: string) => string) {
+  if (host.authType === "privateKey") return t("settings.sshAuthPrivateKey");
+  if (host.authType === "keyboardInteractive") return t("settings.sshAuthKeyboardInteractive");
+  return t("settings.sshAuthPassword");
+}
+
+function SshPasswordInput(props: {
+  id: string;
+  value: string;
+  disabled?: boolean;
+  onChange: (value: string) => void;
+}) {
+  const { id, value, disabled = false, onChange } = props;
+  const { t } = useLocale();
+  const [visible, setVisible] = useState(false);
+  const toggleLabel = visible ? t("settings.sshHidePassword") : t("settings.sshShowPassword");
+
+  return (
+    <div className="relative">
+      <Input
+        variant="plain"
+        id={id}
+        type={visible ? "text" : "password"}
+        value={value}
+        disabled={disabled}
+        className="pr-10"
+        onChange={(event) => onChange(event.currentTarget.value)}
+      />
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon-sm"
+        className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground disabled:pointer-events-none disabled:opacity-50"
+        disabled={disabled}
+        onClick={() => setVisible((current) => !current)}
+        title={toggleLabel}
+        aria-label={toggleLabel}
+      >
+        {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
+      </Button>
+    </div>
+  );
+}
+
+function SshHostModal(props: {
+  initialData?: SshHostConfig;
+  onSave: (data: SshHostDraft) => void;
+  onClose: () => void;
+}) {
+  const { initialData, onSave, onClose } = props;
+  const { t } = useLocale();
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const [name, setName] = useState(initialData?.name ?? "");
+  const [host, setHost] = useState(initialData?.host ?? "");
+  const [port, setPort] = useState(String(initialData?.port ?? 22));
+  const [username, setUsername] = useState(initialData?.username ?? "");
+  const [authType, setAuthType] = useState<SshAuthType>(initialData?.authType ?? "password");
+  const [password, setPassword] = useState(initialData?.password ?? "");
+  const [privateKey, setPrivateKey] = useState(initialData?.privateKey ?? "");
+  const [privateKeyPath, setPrivateKeyPath] = useState(initialData?.privateKeyPath ?? "");
+  const [privateKeyPassphrase, setPrivateKeyPassphrase] = useState(
+    initialData?.privateKeyPassphrase ?? "",
+  );
+  const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [proxyUseSystem, setProxyUseSystem] = useState(initialData?.proxy.useSystemProxy === true);
+  const [proxyType, setProxyType] = useState<SshProxyType>(initialData?.proxy.type ?? "socks5");
+  // The proxy type selector offers "app proxy" alongside the manual protocol
+  // choices; the manual type is kept so switching back restores it.
+  const proxySelection: "system" | SshProxyType = proxyUseSystem ? "system" : proxyType;
+  const [proxyUrl, setProxyUrl] = useState(initialData?.proxy.url ?? "");
+  const [proxyPort, setProxyPort] = useState(
+    initialData?.proxy.port ? String(initialData.proxy.port) : "",
+  );
+  const [proxyUsername, setProxyUsername] = useState(initialData?.proxy.username ?? "");
+  const [proxyPassword, setProxyPassword] = useState(initialData?.proxy.password ?? "");
+  const isEditing = Boolean(initialData);
+  const isPasswordAuth = authType === "password";
+  const isPrivateKeyAuth = authType === "privateKey";
+
+  function handleFileSelected(file: File | undefined) {
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      const content = typeof reader.result === "string" ? reader.result : "";
+      setPrivateKey(content.trim());
+      setPrivateKeyPath(file.name);
+      setAuthType("privateKey");
+    };
+    reader.readAsText(file);
+  }
+
+  function handleSave() {
+    const trimmedName = name.trim();
+    const trimmedHost = host.trim();
+    if (!trimmedName || !trimmedHost) return;
+    const trimmedPassword = password.trim();
+    const trimmedPrivateKey = privateKey.trim();
+    const trimmedPrivateKeyPath = privateKeyPath.trim();
+    const trimmedPrivateKeyPassphrase = privateKeyPassphrase.trim();
+    const trimmedProxyPassword = proxyPassword.trim();
+    const nextPassword = isPasswordAuth ? trimmedPassword : "";
+    const nextPrivateKey = isPrivateKeyAuth ? trimmedPrivateKey : "";
+    const nextPrivateKeyPath = isPrivateKeyAuth ? trimmedPrivateKeyPath : "";
+    const nextPrivateKeyPassphrase = isPrivateKeyAuth ? trimmedPrivateKeyPassphrase : "";
+    onSave({
+      name: trimmedName,
+      description: initialData?.description ?? "",
+      host: trimmedHost,
+      port: normalizePortInput(port),
+      username: username.trim(),
+      authType,
+      password: nextPassword,
+      passwordConfigured:
+        isPasswordAuth &&
+        (nextPassword.length > 0 ||
+          (initialData?.authType === "password" && initialData?.passwordConfigured === true)),
+      privateKey: nextPrivateKey,
+      privateKeyPath: nextPrivateKeyPath,
+      privateKeyConfigured:
+        isPrivateKeyAuth &&
+        (nextPrivateKey.length > 0 ||
+          nextPrivateKeyPath.length > 0 ||
+          (initialData?.authType === "privateKey" && initialData?.privateKeyConfigured === true)),
+      privateKeyPassphrase: nextPrivateKeyPassphrase,
+      privateKeyPassphraseConfigured:
+        isPrivateKeyAuth &&
+        (nextPrivateKeyPassphrase.length > 0 ||
+          (initialData?.authType === "privateKey" &&
+            initialData?.privateKeyPassphraseConfigured === true)),
+      proxy: {
+        type: proxyType,
+        url: proxyUrl.trim(),
+        port: normalizeOptionalPortInput(proxyPort),
+        username: proxyUsername.trim(),
+        password: trimmedProxyPassword,
+        passwordConfigured:
+          trimmedProxyPassword.length > 0 || initialData?.proxy.passwordConfigured === true,
+        useSystemProxy: proxyUseSystem,
+      },
+    });
+    onClose();
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        className="flex h-[min(46rem,calc(100dvh-2rem))] max-w-lg flex-col"
+        closeLabel={t("settings.cancel")}
+        showCloseButton
+      >
+        <DialogHeader className="flex-row items-center gap-3">
+          <div className="flex size-9 items-center justify-center rounded-xl bg-emerald-500/10 text-emerald-500">
+            <Key className="size-5" />
+          </div>
+          <div className="flex-1">
+            <DialogTitle className="text-sm">
+              {isEditing ? t("settings.sshEdit") : t("settings.sshAdd")}
+            </DialogTitle>
+            <DialogDescription className="text-xs">{t("settings.sshDesc")}</DialogDescription>
+          </div>
+        </DialogHeader>
+
+        <DialogBody>
+          <div className="space-y-4">
+            <FormField density="compact">
+              <FormFieldLabel htmlFor="ssh-name" size="compact">
+                {t("settings.sshName")}
+                <span className="ml-0.5 text-red-500">*</span>
+              </FormFieldLabel>
+              <Input
+                variant="plain"
+                id="ssh-name"
+                value={name}
+                onChange={(event) => setName(event.currentTarget.value)}
+              />
+            </FormField>
+            <FormField density="compact">
+              <FormFieldLabel htmlFor="ssh-host" size="compact">
+                {t("settings.sshHost")}
+                <span className="ml-0.5 text-red-500">*</span>
+              </FormFieldLabel>
+              <Input
+                variant="plain"
+                id="ssh-host"
+                value={host}
+                onChange={(event) => setHost(event.currentTarget.value)}
+              />
+            </FormField>
+            <FormField density="compact">
+              <FormFieldLabel htmlFor="ssh-username" size="compact">
+                {t("settings.sshUsername")}
+              </FormFieldLabel>
+              <Input
+                variant="plain"
+                id="ssh-username"
+                value={username}
+                onChange={(event) => setUsername(event.currentTarget.value)}
+              />
+            </FormField>
+            <FormField density="compact">
+              <FormFieldLabel htmlFor="ssh-port" size="compact">
+                {t("settings.sshPort")}
+              </FormFieldLabel>
+              <Input
+                variant="plain"
+                id="ssh-port"
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={65535}
+                step={1}
+                value={port}
+                onChange={(event) => setPort(event.currentTarget.value)}
+              />
+            </FormField>
+          </div>
+
+          <FormField density="compact" className="mt-4">
+            <FormFieldLabel htmlFor="ssh-auth-type" size="compact" className="block">
+              {t("settings.sshAuthMethod")}
+            </FormFieldLabel>
+            <Select value={authType} onValueChange={(value) => setAuthType(value as SshAuthType)}>
+              <SettingsSelectTrigger
+                id="ssh-auth-type"
+                className="flex h-9 w-full justify-between rounded-lg bg-settings-tile-hover px-3 shadow-none"
+              >
+                <SelectValue>
+                  {t(
+                    authType === "password"
+                      ? "settings.sshAuthPassword"
+                      : authType === "privateKey"
+                        ? "settings.sshAuthPrivateKey"
+                        : "settings.sshAuthKeyboardInteractive",
+                  )}
+                </SelectValue>
+              </SettingsSelectTrigger>
+              <SettingsSelectContent>
+                <SelectItem value="password">{t("settings.sshAuthPassword")}</SelectItem>
+                <SelectItem value="privateKey">{t("settings.sshAuthPrivateKey")}</SelectItem>
+                <SelectItem value="keyboardInteractive">
+                  {t("settings.sshAuthKeyboardInteractive")}
+                </SelectItem>
+              </SettingsSelectContent>
+            </Select>
+            <p className="text-xs text-muted-foreground">
+              {t(
+                authType === "password"
+                  ? "settings.sshAuthPasswordHint"
+                  : authType === "privateKey"
+                    ? "settings.sshAuthPrivateKeyHint"
+                    : "settings.sshAuthKeyboardInteractiveHint",
+              )}
+            </p>
+          </FormField>
+
+          <div className="mt-4">
+            <div hidden={!isPasswordAuth}>
+              <FormField density="compact">
+                <FormFieldLabel htmlFor="ssh-password" size="compact">
+                  {t("settings.sshPassword")}
+                </FormFieldLabel>
+                <SshPasswordInput
+                  id="ssh-password"
+                  value={password}
+                  disabled={!isPasswordAuth}
+                  onChange={setPassword}
+                />
+                {initialData?.passwordConfigured && !password.trim() ? (
+                  <div className="text-xs text-muted-foreground">
+                    {t("settings.sshPasswordConfigured")}
+                  </div>
+                ) : null}
+              </FormField>
+            </div>
+
+            <div hidden={!isPrivateKeyAuth}>
+              <div className="space-y-3">
+                <div className="relative">
+                  <Button
+                    variant="ghost"
+                    size="icon-xs"
+                    className={cn(
+                      "absolute right-2 top-2 z-10",
+                      "rounded-md border border-transparent bg-background/80 p-0 text-muted-foreground shadow-none",
+                      "hover:border-border/70 hover:bg-muted/70 hover:text-foreground",
+                    )}
+                    aria-label={t("settings.sshPrivateKeyImport")}
+                    disabled={!isPrivateKeyAuth}
+                    onClick={() => fileInputRef.current?.click()}
+                    title={t("settings.sshPrivateKeyImport")}
+                  >
+                    <Upload className="size-3.5" aria-hidden="true" />
+                  </Button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    className="hidden"
+                    disabled={!isPrivateKeyAuth}
+                    onChange={(event) => handleFileSelected(event.currentTarget.files?.[0])}
+                  />
+                  <Textarea
+                    variant="plain"
+                    id="ssh-private-key"
+                    aria-label={t("settings.sshPrivateKey")}
+                    value={privateKey}
+                    disabled={!isPrivateKeyAuth}
+                    className="min-h-40 resize-y pr-12 font-mono text-xs leading-relaxed"
+                    onChange={(event) => setPrivateKey(event.currentTarget.value)}
+                  />
+                </div>
+                {initialData?.privateKeyConfigured && !privateKey.trim() ? (
+                  <div className="text-xs text-muted-foreground">
+                    {t("settings.sshPrivateKeyConfigured")}
+                  </div>
+                ) : null}
+                <FormField density="compact">
+                  <FormFieldLabel htmlFor="ssh-private-key-passphrase" size="compact">
+                    {t("settings.sshPrivateKeyPassphrase")}
+                  </FormFieldLabel>
+                  <SshPasswordInput
+                    id="ssh-private-key-passphrase"
+                    value={privateKeyPassphrase}
+                    disabled={!isPrivateKeyAuth}
+                    onChange={setPrivateKeyPassphrase}
+                  />
+                  {initialData?.privateKeyPassphraseConfigured && !privateKeyPassphrase.trim() ? (
+                    <div className="text-xs text-muted-foreground">
+                      {t("settings.sshPrivateKeyPassphraseConfigured")}
+                    </div>
+                  ) : null}
+                </FormField>
+              </div>
+            </div>
+          </div>
+
+          <div className="mt-5 rounded-xl bg-settings-tile">
+            <button
+              type="button"
+              className={cn(
+                "flex w-full items-center justify-between gap-3 px-4 py-3",
+                "text-left text-sm font-medium transition-colors hover:bg-muted/30",
+              )}
+              aria-expanded={advancedOpen}
+              aria-controls="ssh-advanced-options"
+              onClick={() => setAdvancedOpen((open) => !open)}
+            >
+              <span>{t("settings.sshAdvancedSettings")}</span>
+              <ChevronDown
+                className={cn(
+                  "size-4 text-muted-foreground transition-transform duration-200",
+                  advancedOpen ? "rotate-180" : "",
+                )}
+              />
+            </button>
+
+            <div id="ssh-advanced-options" hidden={!advancedOpen}>
+              <div aria-hidden={!advancedOpen} className="px-4 pb-4" inert={!advancedOpen}>
+                <div className="space-y-4">
+                  <FormField density="compact">
+                    <FormFieldLabel size="compact">{t("settings.sshProxyType")}</FormFieldLabel>
+                    <div className="grid grid-cols-3 gap-2 rounded-xl border border-border/60 bg-background p-1">
+                      {(
+                        [
+                          { value: "system", label: t("settings.sshProxyUseSystemTag") },
+                          { value: "socks5", label: t("settings.sshProxyTypeSocks5") },
+                          { value: "http", label: t("settings.sshProxyTypeHttp") },
+                        ] as const
+                      ).map((option) => (
+                        <button
+                          key={option.value}
+                          type="button"
+                          className={cn(
+                            "rounded-lg px-3 py-2 text-xs font-medium transition-colors",
+                            proxySelection === option.value
+                              ? "bg-muted text-foreground shadow-sm"
+                              : "text-muted-foreground hover:bg-muted/60 hover:text-foreground",
+                          )}
+                          onClick={() => {
+                            if (option.value === "system") {
+                              setProxyUseSystem(true);
+                              return;
+                            }
+                            setProxyUseSystem(false);
+                            setProxyType(option.value);
+                          }}
+                        >
+                          {option.label}
+                        </button>
+                      ))}
+                    </div>
+                    {proxyUseSystem ? (
+                      <p className="text-xs leading-relaxed text-muted-foreground">
+                        {t("settings.sshProxyUseSystemHint")}
+                      </p>
+                    ) : null}
+                  </FormField>
+                  {proxyUseSystem ? null : (
+                    <>
+                      <FormField density="compact">
+                        <FormFieldLabel htmlFor="ssh-proxy-url" size="compact">
+                          {t("settings.sshProxyUrl")}
+                        </FormFieldLabel>
+                        <Input
+                          variant="plain"
+                          id="ssh-proxy-url"
+                          value={proxyUrl}
+                          placeholder={t(
+                            proxyType === "socks5"
+                              ? "settings.sshProxyUrlSocks5Placeholder"
+                              : "settings.sshProxyUrlHttpPlaceholder",
+                          )}
+                          onChange={(event) => setProxyUrl(event.currentTarget.value)}
+                        />
+                      </FormField>
+                      <FormField density="compact">
+                        <FormFieldLabel htmlFor="ssh-proxy-port" size="compact">
+                          {t("settings.sshProxyPort")}
+                        </FormFieldLabel>
+                        <Input
+                          variant="plain"
+                          id="ssh-proxy-port"
+                          type="number"
+                          inputMode="numeric"
+                          min={1}
+                          max={65535}
+                          step={1}
+                          value={proxyPort}
+                          onChange={(event) => setProxyPort(event.currentTarget.value)}
+                        />
+                      </FormField>
+                      <FormField density="compact">
+                        <FormFieldLabel htmlFor="ssh-proxy-username" size="compact">
+                          {t("settings.sshProxyUsername")}
+                        </FormFieldLabel>
+                        <Input
+                          variant="plain"
+                          id="ssh-proxy-username"
+                          value={proxyUsername}
+                          onChange={(event) => setProxyUsername(event.currentTarget.value)}
+                        />
+                      </FormField>
+                      <FormField density="compact">
+                        <FormFieldLabel htmlFor="ssh-proxy-password" size="compact">
+                          {t("settings.sshProxyPassword")}
+                        </FormFieldLabel>
+                        <SshPasswordInput
+                          id="ssh-proxy-password"
+                          value={proxyPassword}
+                          onChange={setProxyPassword}
+                        />
+                        {initialData?.proxy.passwordConfigured && !proxyPassword.trim() ? (
+                          <div className="text-xs text-muted-foreground">
+                            {t("settings.sshProxyPasswordConfigured")}
+                          </div>
+                        ) : null}
+                      </FormField>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </DialogBody>
+
+        <DialogFooter>
+          <DialogActions>
+            <Button size="sm" variant="outline" onClick={onClose}>
+              {t("settings.cancel")}
+            </Button>
+            <Button size="sm" onClick={handleSave} disabled={!name.trim() || !host.trim()}>
+              {t("settings.save")}
+            </Button>
+          </DialogActions>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SshImportModal(props: {
+  existingHosts: SshHostConfig[];
+  onImport: (hosts: SshImportCandidate[]) => void;
+  onClose: () => void;
+}) {
+  const { existingHosts, onImport, onClose } = props;
+  const { t } = useLocale();
+  const [result, setResult] = useState<SshScanResult | null>(null);
+  const [error, setError] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set());
+
+  // biome-ignore lint/correctness/useExhaustiveDependencies: 导入面板打开时按现有主机扫描一次；t 只用于失败文案，语言切换无需重新扫描。
+  useEffect(() => {
+    let cancelled = false;
+    setResult(null);
+    setError("");
+    scanSshImportCandidates(existingHosts)
+      .then((scanResult) => {
+        if (cancelled) return;
+        setResult(scanResult);
+        setSelectedIds(
+          new Set(scanResult.candidates.filter((item) => !item.duplicate).map((item) => item.id)),
+        );
+      })
+      .catch((scanError) => {
+        if (cancelled) return;
+        setError(hostAwareErrorMessage(scanError, t("settings.sshImportDesktopHostRequired")));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [existingHosts]);
+
+  const candidates = result?.candidates ?? [];
+  const selected = candidates.filter((candidate) => selectedIds.has(candidate.id));
+
+  function toggle(id: string) {
+    setSelectedIds((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent
+        className="flex max-h-[calc(100dvh-2rem)] max-w-xl flex-col"
+        closeLabel={t("settings.cancel")}
+        showCloseButton
+      >
+        <DialogHeader>
+          <div>
+            <DialogTitle className="text-sm">{t("settings.sshImport")}</DialogTitle>
+            <DialogDescription className="text-xs">{t("settings.sshImportDesc")}</DialogDescription>
+          </div>
+        </DialogHeader>
+
+        <DialogBody>
+          {!result && !error ? (
+            <div
+              className={cn(
+                "flex h-48 items-center justify-center",
+                "rounded-xl bg-settings-tile text-sm text-muted-foreground",
+              )}
+            >
+              {t("settings.sshImportScanning")}
+            </div>
+          ) : null}
+
+          {error ? (
+            <div className="rounded-2xl border border-destructive/30 bg-destructive/5 p-4 text-sm text-destructive">
+              {t("settings.sshImportFailed")}: {error}
+            </div>
+          ) : null}
+
+          {result ? (
+            <div className="space-y-4">
+              <div className="px-1 text-xs text-muted-foreground">
+                <div className="break-all font-medium text-foreground">{result.sshDirPath}</div>
+                <div className="mt-1">
+                  {t("settings.sshImportFound")
+                    .replace("{count}", String(candidates.length))
+                    .replace("{keys}", String(result.keyFiles.length))}
+                </div>
+              </div>
+
+              {candidates.length === 0 ? (
+                <EmptyState variant="settings" size="compact">
+                  <Key className="size-8 text-muted-foreground/50" />
+                  <div>
+                    <div className="text-sm font-medium">{t("settings.sshImportEmpty")}</div>
+                    <div className="mt-1 text-xs text-muted-foreground">
+                      {t("settings.sshImportEmptyHint")}
+                    </div>
+                  </div>
+                </EmptyState>
+              ) : (
+                <div className="space-y-2">
+                  {candidates.map((candidate) => (
+                    <button
+                      key={candidate.id}
+                      type="button"
+                      disabled={candidate.duplicate}
+                      aria-pressed={selectedIds.has(candidate.id)}
+                      onClick={() => toggle(candidate.id)}
+                      className={cn(
+                        "flex w-full items-center gap-3 rounded-xl px-4 py-3",
+                        "cursor-pointer text-left transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                        selectedIds.has(candidate.id)
+                          ? "bg-settings-active"
+                          : "bg-settings-tile hover:bg-settings-tile-hover",
+                        candidate.duplicate ? "cursor-not-allowed opacity-60" : "",
+                      )}
+                    >
+                      <span
+                        className={cn(
+                          "flex size-5 shrink-0 items-center justify-center rounded border",
+                          "transition-colors duration-150",
+                          selectedIds.has(candidate.id)
+                            ? "border-foreground bg-foreground text-background"
+                            : "border-border bg-background",
+                        )}
+                      >
+                        <Check
+                          className={cn(
+                            "size-3.5",
+                            selectedIds.has(candidate.id) ? "opacity-100" : "opacity-0",
+                          )}
+                        />
+                      </span>
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="truncate text-sm font-medium">{candidate.name}</span>
+                          <span className="text-xs text-muted-foreground">
+                            {authLabel(candidate, t)}
+                          </span>
+                          {candidate.duplicate ? (
+                            <PromptTag label={t("settings.sshImportDuplicate")} muted />
+                          ) : null}
+                        </div>
+                        <div className="mt-1 truncate text-xs text-muted-foreground">
+                          {candidate.username ? `${candidate.username}@` : ""}
+                          {candidate.host}:{candidate.port}
+                        </div>
+                      </div>
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          ) : null}
+        </DialogBody>
+
+        <DialogFooter className="flex-row items-center justify-between gap-3">
+          <div className="text-xs text-muted-foreground">
+            {t("settings.sshImportSelected").replace("{count}", String(selected.length))}
+          </div>
+          <DialogActions>
+            <Button size="sm" variant="outline" onClick={onClose}>
+              {t("settings.cancel")}
+            </Button>
+            <Button
+              size="sm"
+              disabled={selected.length === 0}
+              onClick={() => {
+                onImport(selected);
+                onClose();
+              }}
+            >
+              {t("settings.sshImport")}
+            </Button>
+          </DialogActions>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+function SshHostCard(props: {
+  host: SshHostConfig;
+  viewMode: SshViewMode;
+  resetStatus?: SshKnownHostResetStatus;
+  resettingKnownHost: boolean;
+  agentState: KBrainSshState | null;
+  onEdit: () => void;
+  onDelete: () => void;
+  onResetKnownHost: () => void;
+}) {
+  const {
+    host,
+    viewMode,
+    resetStatus,
+    resettingKnownHost,
+    agentState,
+    onEdit,
+    onDelete,
+    onResetKnownHost,
+  } = props;
+  const { t } = useLocale();
+  const showKeyPath = host.authType === "privateKey" && host.privateKeyPath.trim().length > 0;
+  const showKeyConfigured = host.authType === "privateKey" && host.privateKeyConfigured;
+  const showProxy =
+    host.proxy.useSystemProxy ||
+    host.proxy.url.trim().length > 0 ||
+    host.proxy.port > 0 ||
+    host.proxy.passwordConfigured;
+  const proxyTagLabel = host.proxy.useSystemProxy
+    ? t("settings.sshProxyUseSystemTag")
+    : t("settings.sshAdvancedProxy");
+  const hasMeta = showKeyPath || showKeyConfigured;
+  const hasAgent = hasSshAgentHostStatus(host.id, agentState);
+  const hasFooter = hasMeta || resetStatus || hasAgent;
+
+  const actions = (
+    <div className="settings-hover-actions flex items-center gap-0.5 opacity-0 transition-opacity focus-within:opacity-100 group-hover:opacity-100">
+      <ConfirmActionPopover
+        title={t("settings.sshKnownHostResetTitle")}
+        description={t("settings.sshKnownHostResetDesc")}
+        confirmLabel={t("settings.sshKnownHostResetConfirm")}
+        onConfirm={onResetKnownHost}
+      >
+        {(open) => (
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            className="text-muted-foreground hover:text-foreground"
+            onClick={open}
+            title={t("settings.sshKnownHostReset")}
+            aria-label={t("settings.sshKnownHostReset")}
+            disabled={resettingKnownHost}
+          >
+            <Shield className="size-3.5" />
+          </Button>
+        )}
+      </ConfirmActionPopover>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        className="text-muted-foreground hover:text-foreground"
+        onClick={onEdit}
+        title={t("settings.edit")}
+      >
+        <SquarePen className="size-3.5" />
+      </Button>
+      <Button
+        variant="ghost"
+        size="icon-xs"
+        className="text-muted-foreground hover:text-destructive"
+        onClick={onDelete}
+        title={t("settings.delete")}
+      >
+        <Trash2 className="size-3.5" />
+      </Button>
+    </div>
+  );
+
+  const metaTags = (
+    <div className="flex flex-wrap items-center gap-1.5">
+      {showKeyPath ? <PromptTag label={host.privateKeyPath} muted /> : null}
+      {showKeyConfigured ? <PromptTag label={t("settings.sshPrivateKeyConfigured")} muted /> : null}
+    </div>
+  );
+
+  const resetStatusNode = resetStatus ? (
+    <div
+      className={cn(
+        "text-xs leading-relaxed",
+        resetStatus.kind === "error" ? "text-destructive" : "text-muted-foreground",
+      )}
+    >
+      {resetStatus.message}
+    </div>
+  ) : null;
+
+  if (viewMode === "grid") {
+    return (
+      <div
+        className={cn(
+          "group relative z-0 flex flex-col",
+          "rounded-xl bg-settings-tile p-4 transition-colors",
+          "hover:z-10 hover:bg-settings-tile-hover",
+        )}
+      >
+        <div className="absolute right-3 top-3">{actions}</div>
+        <div className="flex items-start gap-3 pr-12">
+          <div
+            className={cn(
+              "flex size-10 shrink-0 items-center justify-center",
+              "rounded-lg bg-settings-active text-foreground",
+            )}
+          >
+            <Server className="size-18px" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <div className="truncate text-sm font-medium text-foreground">{host.name}</div>
+            <div className="mt-1 flex flex-wrap items-center gap-1.5">
+              <PromptTag label={authLabel(host, t)} />
+              {showProxy ? <PromptTag label={proxyTagLabel} muted /> : null}
+            </div>
+          </div>
+        </div>
+        <div className="mt-3 truncate font-mono text-xs text-muted-foreground">
+          {endpointLabel(host)}
+        </div>
+        {hasFooter ? (
+          <div className="mt-auto space-y-2 pt-3">
+            {hasMeta ? metaTags : null}
+            {hasAgent ? <SshAgentHostStatus hostId={host.id} state={agentState} /> : null}
+            {resetStatusNode}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={cn(
+        "group relative z-0",
+        "rounded-xl bg-settings-tile transition-colors",
+        "hover:z-10 hover:bg-settings-tile-hover",
+      )}
+    >
+      <div className="settings-card-row flex items-center gap-3 px-4 py-3">
+        <div
+          className={cn(
+            "flex size-9 shrink-0 items-center justify-center",
+            "rounded-lg bg-settings-active text-foreground",
+          )}
+        >
+          <Server className="size-4" />
+        </div>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="truncate text-sm font-medium text-foreground">{host.name}</span>
+            <PromptTag label={authLabel(host, t)} />
+            {showProxy ? <PromptTag label={proxyTagLabel} muted /> : null}
+          </div>
+          <div className="mt-1 truncate font-mono text-xs text-muted-foreground">
+            {endpointLabel(host)}
+          </div>
+        </div>
+        {actions}
+      </div>
+      {hasFooter ? (
+        <div className="space-y-2 border-t border-border/40 px-4 py-2.5">
+          {hasMeta ? metaTags : null}
+          {hasAgent ? <SshAgentHostStatus hostId={host.id} state={agentState} /> : null}
+          {resetStatusNode}
+        </div>
+      ) : null}
+    </div>
+  );
+}
+
+function SshViewModeToggle(props: { value: SshViewMode; onChange: (value: SshViewMode) => void }) {
+  const { value, onChange } = props;
+  const { t } = useLocale();
+  const groupLabel = `${t("settings.sshViewList")} / ${t("settings.sshViewGrid")}`;
+  const options = [
+    { value: "list" as const, label: t("settings.sshViewList"), icon: List },
+    {
+      value: "grid" as const,
+      label: t("settings.sshViewGrid"),
+      icon: LayoutGrid,
+    },
+  ];
+
+  return (
+    <SettingsToggleGroup
+      value={[value]}
+      aria-label={groupLabel}
+      onValueChange={(values) => {
+        const nextMode = values[0] as SshViewMode | undefined;
+        if (nextMode) onChange(nextMode);
+      }}
+    >
+      {options.map((option) => {
+        const Icon = option.icon;
+        return (
+          <SettingsToggleGroupItem
+            key={option.value}
+            value={option.value}
+            title={option.label}
+            aria-label={option.label}
+            className="min-w-7 px-1.5"
+          >
+            <Icon className="size-3.5" />
+          </SettingsToggleGroupItem>
+        );
+      })}
+    </SettingsToggleGroup>
+  );
+}
+
+export function SshSection(props: SettingsSectionProps) {
+  const { settings, setSettings, saveState } = props;
+  const { t } = useLocale();
+  const [viewMode, setViewMode] = useState<SshViewMode>("list");
+  const [modalOpen, setModalOpen] = useState(false);
+  const [importOpen, setImportOpen] = useState(false);
+  const [editingHost, setEditingHost] = useState<SshHostConfig | null>(null);
+  const [knownHostResettingId, setKnownHostResettingId] = useState<string | null>(null);
+  const [knownHostResetStatus, setKnownHostResetStatus] = useState<SshKnownHostResetStatus | null>(
+    null,
+  );
+  const knownHostResetTimerRef = useRef<number | null>(null);
+  const { confirm: requestSshConfirm, dialog: sshConfirmDialog } = useConfirmDialog();
+  const saveStatusRef = useRef(saveState?.status ?? "idle");
+  saveStatusRef.current = saveState?.status ?? "idle";
+  const hosts = settings.ssh.hosts;
+  const { state: agentState, refresh: refreshAgentState } = useKBrainSshState(
+    saveState?.status ?? "idle",
+  );
+
+  useEffect(() => {
+    return () => {
+      if (knownHostResetTimerRef.current !== null) {
+        window.clearTimeout(knownHostResetTimerRef.current);
+      }
+    };
+  }, []);
+
+  function showKnownHostResetStatus(status: SshKnownHostResetStatus, durationMs = 5000) {
+    if (knownHostResetTimerRef.current !== null) {
+      window.clearTimeout(knownHostResetTimerRef.current);
+    }
+    setKnownHostResetStatus(status);
+    knownHostResetTimerRef.current = window.setTimeout(() => {
+      setKnownHostResetStatus((current) => (current?.hostId === status.hostId ? null : current));
+      knownHostResetTimerRef.current = null;
+    }, durationMs);
+  }
+
+  // The settings save pipeline is asynchronous on both ends (Tauri patch
+  // command / gateway SettingsUpdate round-trip). Reconnects re-read the host
+  // config from the store, so they must not start before the save landed.
+  async function waitForSettingsSaved(timeoutMs = 15000): Promise<"saved" | "error" | "timeout"> {
+    const startedAt = Date.now();
+    for (;;) {
+      const status = saveStatusRef.current;
+      if (status === "saved" || status === "idle") return "saved";
+      if (status === "error") return "error";
+      if (Date.now() - startedAt >= timeoutMs) return "timeout";
+      await new Promise((resolve) => window.setTimeout(resolve, 150));
+    }
+  }
+
+  async function runSshReconnectBatch(hostId: string, targets: SshReconnectTarget[]) {
+    let reconnected = 0;
+    let kbiFailures = 0;
+    let hostKeyFailures = 0;
+    const otherFailures: string[] = [];
+    for (const target of targets) {
+      try {
+        await invoke("terminal_ssh_reconnect", {
+          session_id: target.id,
+          project_path_key: target.projectPathKey,
+        });
+        reconnected += 1;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (message.includes("already in progress")) {
+          // An automatic reconnect is running; every attempt re-reads the
+          // saved settings, so the update still lands.
+          reconnected += 1;
+        } else if (message.includes("keyboard-interactive")) {
+          kbiFailures += 1;
+        } else if (message.includes("host key")) {
+          hostKeyFailures += 1;
+        } else {
+          otherFailures.push(message);
+        }
+      }
+    }
+    if (reconnected === targets.length) {
+      showKnownHostResetStatus(
+        {
+          hostId,
+          kind: "success",
+          message: t("settings.sshReconnectResultSuccess").replace("{count}", String(reconnected)),
+        },
+        8000,
+      );
+      return;
+    }
+    const details: string[] = [];
+    if (kbiFailures > 0) {
+      details.push(t("settings.sshReconnectResultKbi").replace("{count}", String(kbiFailures)));
+    }
+    if (hostKeyFailures > 0) {
+      details.push(
+        t("settings.sshReconnectResultHostKey").replace("{count}", String(hostKeyFailures)),
+      );
+    }
+    if (otherFailures.length > 0) {
+      details.push(otherFailures[0]);
+    }
+    const summary = t("settings.sshReconnectResultPartial")
+      .replace("{reconnected}", String(reconnected))
+      .replace("{total}", String(targets.length));
+    showKnownHostResetStatus(
+      {
+        hostId,
+        kind: "error",
+        message: [summary, ...details].join(" "),
+      },
+      10000,
+    );
+  }
+
+  async function promptSshReconnectAfterSave(host: SshHostConfig, nextAuthType: SshAuthType) {
+    let sessions: TerminalSession[];
+    try {
+      sessions = await listActiveSshSessions(host.id);
+    } catch {
+      // Session listing unavailable (e.g. web terminal disabled) — the update
+      // still applies on the next connect, so stay silent.
+      return;
+    }
+    if (sessions.length === 0) return;
+    const count = String(sessions.length);
+    if (nextAuthType === "keyboardInteractive") {
+      await requestSshConfirm({
+        title: t("settings.sshReconnectKbiTitle"),
+        subtitle: host.name,
+        description: t("settings.sshReconnectKbiNotice").replace("{count}", count),
+        confirmLabel: t("settings.sshReconnectKbiGotIt"),
+        cancelLabel: t("settings.cancel"),
+        closeLabel: t("settings.sshReconnectKbiGotIt"),
+        hideCancel: true,
+      });
+      return;
+    }
+    const proceed = await requestSshConfirm({
+      title: t("settings.sshReconnectPromptTitle"),
+      subtitle: host.name,
+      description: t("settings.sshReconnectPromptDesc").replace("{count}", count),
+      detail: t("settings.sshReconnectPromptDetail"),
+      confirmLabel: t("settings.sshReconnectPromptConfirm").replace("{count}", count),
+      cancelLabel: t("settings.sshReconnectPromptKeep"),
+    });
+    if (!proceed) return;
+    const saveOutcome = await waitForSettingsSaved();
+    if (saveOutcome !== "saved") {
+      showKnownHostResetStatus({
+        hostId: host.id,
+        kind: "error",
+        message: t("settings.sshReconnectSaveFailed"),
+      });
+      return;
+    }
+    await runSshReconnectBatch(
+      host.id,
+      sessions.map((session) => ({
+        id: session.id,
+        projectPathKey: session.projectPathKey,
+      })),
+    );
+  }
+
+  function openAdd() {
+    setEditingHost(null);
+    setModalOpen(true);
+  }
+
+  function openEdit(host: SshHostConfig) {
+    setEditingHost(host);
+    setModalOpen(true);
+  }
+
+  function closeModal() {
+    setModalOpen(false);
+    setEditingHost(null);
+  }
+
+  function handleSave(data: SshHostDraft) {
+    const target = editingHost;
+    if (target && sshHostConnectionFieldsChanged(target, data)) {
+      void promptSshReconnectAfterSave(target, data.authType);
+    }
+    setSettings((prev) => {
+      if (editingHost) {
+        return updateSsh(prev, {
+          hosts: prev.ssh.hosts.map((host) => {
+            if (host.id !== editingHost.id) return host;
+            const keepPasswordSecret = data.authType === "password" && host.authType === "password";
+            const keepPrivateKeySecret =
+              data.authType === "privateKey" && host.authType === "privateKey";
+            const nextPassword =
+              data.authType === "password"
+                ? data.password || (keepPasswordSecret ? host.password : "")
+                : "";
+            const nextPrivateKey =
+              data.authType === "privateKey"
+                ? data.privateKey || (keepPrivateKeySecret ? host.privateKey : "")
+                : "";
+            const nextPrivateKeyPassphrase =
+              data.authType === "privateKey"
+                ? data.privateKeyPassphrase ||
+                  (keepPrivateKeySecret ? host.privateKeyPassphrase : "")
+                : "";
+            return {
+              ...host,
+              ...data,
+              password: nextPassword,
+              privateKey: nextPrivateKey,
+              privateKeyPassphrase: nextPrivateKeyPassphrase,
+              passwordConfigured:
+                data.authType === "password" &&
+                (data.password.trim().length > 0 ||
+                  (keepPasswordSecret && host.passwordConfigured === true)),
+              privateKeyConfigured:
+                data.authType === "privateKey" &&
+                (data.privateKey.trim().length > 0 ||
+                  data.privateKeyPath.trim().length > 0 ||
+                  (keepPrivateKeySecret && host.privateKeyConfigured === true)),
+              privateKeyPassphraseConfigured:
+                data.authType === "privateKey" &&
+                (data.privateKeyPassphrase.trim().length > 0 ||
+                  (keepPrivateKeySecret && host.privateKeyPassphraseConfigured === true)),
+              proxy: {
+                ...data.proxy,
+                password: data.proxy.password || host.proxy.password,
+                passwordConfigured:
+                  data.proxy.password.trim().length > 0 || host.proxy.passwordConfigured === true,
+              },
+            };
+          }),
+        });
+      }
+      return updateSsh(prev, {
+        hosts: [
+          ...prev.ssh.hosts,
+          {
+            id: createUuid(),
+            ...data,
+          },
+        ],
+      });
+    });
+  }
+
+  function handleDelete(id: string) {
+    setSettings((prev) =>
+      removeSshHostFromProjectAssociations(
+        updateSsh(prev, {
+          hosts: prev.ssh.hosts.filter((host) => host.id !== id),
+        }),
+        id,
+      ),
+    );
+  }
+
+  async function handleDeleteRequest(host: SshHostConfig) {
+    let sessions: TerminalSession[] = [];
+    try {
+      sessions = await listActiveSshSessions(host.id);
+    } catch {
+      sessions = [];
+    }
+    const proceed = await requestSshConfirm({
+      title: t("settings.deleteConfirm"),
+      subtitle: host.name,
+      description:
+        sessions.length > 0
+          ? t("settings.sshDeleteActiveWarning").replace("{count}", String(sessions.length))
+          : t("settings.deleteConfirmDesc"),
+      confirmLabel: t("settings.delete"),
+      cancelLabel: t("settings.cancel"),
+    });
+    if (!proceed) return;
+    // Close before deleting so the sessions never outlive their host config;
+    // best-effort — a session that already ended is fine to ignore.
+    for (const session of sessions) {
+      try {
+        await invoke("terminal_close", {
+          session_id: session.id,
+          project_path_key: session.projectPathKey,
+        });
+      } catch {
+        // ignore
+      }
+    }
+    handleDelete(host.id);
+  }
+
+  async function handleResetKnownHost(host: SshHostConfig) {
+    const targetHost = host.host.trim();
+    if (!targetHost || host.port <= 0) {
+      showKnownHostResetStatus({
+        hostId: host.id,
+        kind: "error",
+        message: t("settings.sshKnownHostResetFailed").replace(
+          "{error}",
+          t("settings.sshRequired"),
+        ),
+      });
+      return;
+    }
+
+    setKnownHostResettingId(host.id);
+    try {
+      const response = await invoke<SshKnownHostResetResponse>("settings_reset_ssh_known_host", {
+        host: targetHost,
+        port: host.port,
+      });
+      void refreshAgentState();
+      showKnownHostResetStatus({
+        hostId: host.id,
+        kind: response.deleted > 0 ? "success" : "info",
+        message:
+          response.deleted > 0
+            ? t("settings.sshKnownHostResetSuccess")
+            : t("settings.sshKnownHostResetEmpty"),
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      showKnownHostResetStatus({
+        hostId: host.id,
+        kind: "error",
+        message: t("settings.sshKnownHostResetFailed").replace("{error}", message),
+      });
+    } finally {
+      setKnownHostResettingId((current) => (current === host.id ? null : current));
+    }
+  }
+
+  function handleImport(candidates: SshImportCandidate[]) {
+    setSettings((prev) =>
+      updateSsh(prev, {
+        hosts: [
+          ...prev.ssh.hosts,
+          ...candidates.map((candidate) => {
+            const { id: _id, source: _source, duplicate: _duplicate, ...host } = candidate;
+            return {
+              id: createUuid(),
+              ...host,
+            };
+          }),
+        ],
+      }),
+    );
+  }
+
+  return (
+    <>
+      <div className="settings-ssh-section space-y-5">
+        <SettingsSection
+          description={t("settings.sshDesc")}
+          actions={
+            hosts.length > 0 ? (
+              <>
+                <div
+                  className={cn(
+                    "flex items-center gap-2 rounded-lg bg-muted/50 px-2.5 py-1.5",
+                    "text-xs text-muted-foreground",
+                  )}
+                >
+                  <span className="tabular-nums font-medium text-foreground">{hosts.length}</span>
+                  {t("settings.sshCount")}
+                </div>
+                <SshViewModeToggle value={viewMode} onChange={setViewMode} />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="gap-1.5"
+                  onClick={() => setImportOpen(true)}
+                >
+                  <Upload className="size-3.5" />
+                  {t("settings.sshImport")}
+                </Button>
+                <Button variant="outline" size="sm" className="gap-1.5" onClick={openAdd}>
+                  <Plus className="size-3.5" />
+                  {t("settings.sshAdd")}
+                </Button>
+              </>
+            ) : null
+          }
+        />
+
+        <SshAgentSyncError state={agentState} />
+
+        {hosts.length === 0 ? (
+          <EmptyState variant="settings">
+            <div className="flex size-14 items-center justify-center rounded-2xl bg-settings-active">
+              <Key className="size-6 text-muted-foreground" />
+            </div>
+            <div className="space-y-1.5">
+              <p className="text-sm font-medium text-foreground">{t("settings.sshNoHosts")}</p>
+              <p className="mx-auto max-w-sm text-xs leading-relaxed text-muted-foreground">
+                {t("settings.sshNoHostsHint")}
+              </p>
+            </div>
+            <div className="flex items-center gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                className="gap-1.5"
+                onClick={() => setImportOpen(true)}
+              >
+                <Upload className="size-3.5" />
+                {t("settings.sshImport")}
+              </Button>
+              <Button size="sm" className="gap-1.5" onClick={openAdd}>
+                <Plus className="size-3.5" />
+                {t("settings.sshAdd")}
+              </Button>
+            </div>
+          </EmptyState>
+        ) : (
+          <div
+            className={viewMode === "grid" ? "grid grid-cols-1 gap-3 sm:grid-cols-2" : "space-y-2"}
+          >
+            {hosts.map((host) => (
+              <SshHostCard
+                key={host.id}
+                host={host}
+                viewMode={viewMode}
+                resetStatus={
+                  knownHostResetStatus?.hostId === host.id ? knownHostResetStatus : undefined
+                }
+                resettingKnownHost={knownHostResettingId === host.id}
+                agentState={agentState}
+                onEdit={() => openEdit(host)}
+                onDelete={() => void handleDeleteRequest(host)}
+                onResetKnownHost={() => void handleResetKnownHost(host)}
+              />
+            ))}
+          </div>
+        )}
+      </div>
+
+      {modalOpen ? (
+        <SshHostModal
+          initialData={editingHost ?? undefined}
+          onSave={handleSave}
+          onClose={closeModal}
+        />
+      ) : null}
+      {importOpen ? (
+        <SshImportModal
+          existingHosts={hosts}
+          onImport={handleImport}
+          onClose={() => setImportOpen(false)}
+        />
+      ) : null}
+      {sshConfirmDialog}
+    </>
+  );
+}

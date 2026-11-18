@@ -1,0 +1,295 @@
+import fs from "node:fs";
+import path from "node:path";
+import vm from "node:vm";
+import { createRequire } from "node:module";
+import { fileURLToPath } from "node:url";
+import { Compile } from "typebox/compile";
+import { transpileTypeScriptModule } from "../../../../scripts/typescript-source-tools.mjs";
+
+const DEFAULT_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".json"];
+
+function createDefaultMocks() {
+  const typeboxMock = {
+    Type: {
+      Object(properties = {}, options = {}) {
+        return { type: "object", properties, ...options };
+      },
+      String(options = {}) {
+        return { type: "string", ...options };
+      },
+      Number(options = {}) {
+        return { type: "number", ...options };
+      },
+      Integer(options = {}) {
+        return { type: "integer", ...options };
+      },
+      Null(options = {}) {
+        return { type: "null", ...options };
+      },
+      Any(options = {}) {
+        return { ...options };
+      },
+      Record(key, value, options = {}) {
+        return { type: "object", propertyNames: key, additionalProperties: value, ...options };
+      },
+      Boolean(options = {}) {
+        return { type: "boolean", ...options };
+      },
+      Literal(value, options = {}) {
+        return { const: value, ...options };
+      },
+      Union(anyOf = [], options = {}) {
+        return { anyOf, ...options };
+      },
+      Optional(schema) {
+        return { ...schema, optional: true };
+      },
+      Array(items, options = {}) {
+        return { type: "array", items, ...options };
+      },
+    },
+  };
+
+  return {
+    "@tauri-apps/api/core": {
+      invoke() {
+        throw new Error("tauri invoke mock was not expected to be called");
+      },
+    },
+    typebox: typeboxMock,
+    "react/jsx-runtime": {
+      jsx(type, props, key) {
+        return { type, props: props ?? {}, key: key ?? null };
+      },
+      jsxs(type, props, key) {
+        return { type, props: props ?? {}, key: key ?? null };
+      },
+      Fragment: Symbol.for("react.fragment"),
+    },
+  };
+}
+
+function createIconModuleMock(specifier) {
+  if (specifier.endsWith("?raw")) {
+    return {
+      __esModule: true,
+      default: '<svg viewBox="0 0 24 24"><path d="M0 0h24v24H0z"/></svg>',
+    };
+  }
+
+  const iconName = specifier.split("/").pop() || "icon";
+  return {
+    __esModule: true,
+    default(props) {
+      return { type: iconName, props: props ?? {} };
+    },
+  };
+}
+
+function hasExtension(filePath) {
+  return path.extname(filePath).length > 0;
+}
+
+function resolveAsFileOrDirectory(candidate) {
+  if (hasExtension(candidate) && fs.existsSync(candidate)) {
+    return candidate;
+  }
+
+  for (const ext of DEFAULT_EXTENSIONS) {
+    const withExt = `${candidate}${ext}`;
+    if (fs.existsSync(withExt)) return withExt;
+  }
+
+  if (fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+    for (const ext of DEFAULT_EXTENSIONS) {
+      const indexPath = path.join(candidate, `index${ext}`);
+      if (fs.existsSync(indexPath)) return indexPath;
+    }
+  }
+
+  throw new Error(`Cannot resolve module path: ${candidate}`);
+}
+
+export function createTsModuleLoader(options = {}) {
+  const rootDir = options.rootDir
+    ? path.resolve(options.rootDir)
+    : path.resolve(fileURLToPath(new URL("../..", import.meta.url)));
+  const hostSourceDir = path.join(rootDir, "src");
+  const sharedSourceDir = fileURLToPath(new URL("../../../agent-ui/src", import.meta.url));
+  const cache = new Map();
+  const defaultMocks = createDefaultMocks();
+  const mocks = new Map(Object.entries(defaultMocks));
+  const optionMocks = options.mocks ?? {};
+  // Tests often key mocks with `new URL(..., import.meta.url).pathname`. On Windows that yields
+  // "/D:/x/src/lib/host.ts" while module resolution produces "D:\x\src\lib\host.ts", so the mock
+  // silently never matched. Normalize such keys to the native path form.
+  const normalizeMockKey = (specifier) =>
+    /^\/[A-Za-z]:\//.test(specifier) ? path.normalize(decodeURIComponent(specifier.slice(1))) : specifier;
+  for (const [rawSpecifier, override] of Object.entries(optionMocks)) {
+    const specifier = normalizeMockKey(rawSpecifier);
+    const base = defaultMocks[specifier];
+    const isPlainMerge =
+      base &&
+      typeof base === "object" &&
+      !Array.isArray(base) &&
+      override &&
+      typeof override === "object" &&
+      !Array.isArray(override);
+    mocks.set(specifier, isPlainMerge ? { ...base, ...override } : override);
+  }
+
+  const hostModulePath = path.join(hostSourceDir, "lib/host.ts");
+  const hasExplicitHostMock =
+    Object.keys(optionMocks).some((key) => normalizeMockKey(key) === hostModulePath) ||
+    Object.hasOwn(optionMocks, "@liveagent/app/lib/host");
+  if (Object.hasOwn(optionMocks, "@tauri-apps/api/core") && !hasExplicitHostMock) {
+    const hostModule = loadModule("src/lib/host.ts");
+    mocks.set(hostModulePath, {
+      ...hostModule,
+      isKBrainBackendEnabled: () => false,
+      isTauriHost: () => true,
+      isKBrainBrowserHost: () => false,
+    });
+  }
+
+  function resolveLocal(specifier, parentDir = rootDir) {
+    if (specifier.startsWith("@liveagent/ui/")) {
+      return resolveAsFileOrDirectory(
+        path.join(sharedSourceDir, specifier.slice("@liveagent/ui/".length)),
+      );
+    }
+    if (specifier.startsWith("@liveagent/app/")) {
+      return resolveAsFileOrDirectory(
+        path.join(hostSourceDir, specifier.slice("@liveagent/app/".length)),
+      );
+    }
+    if (specifier.startsWith("@liveagent/adapters/")) {
+      return resolveAsFileOrDirectory(
+        path.join(hostSourceDir, "agent-ui-adapters", specifier.slice("@liveagent/adapters/".length)),
+      );
+    }
+
+    const candidate = path.isAbsolute(specifier)
+      ? specifier
+      : path.resolve(parentDir, specifier);
+    return resolveAsFileOrDirectory(candidate);
+  }
+
+  function resolveMock(specifier, parentDir) {
+    if (specifier.startsWith("~icons/")) return createIconModuleMock(specifier);
+    if (mocks.has(specifier)) return mocks.get(specifier);
+    if (
+      specifier.startsWith(".") ||
+      path.isAbsolute(specifier) ||
+      specifier.startsWith("src/") ||
+      specifier.startsWith("test/") ||
+      specifier.startsWith("src-tauri/") ||
+      specifier.startsWith("@liveagent/ui/") ||
+      specifier.startsWith("@liveagent/app/") ||
+      specifier.startsWith("@liveagent/adapters/")
+    ) {
+      const resolved = resolveLocal(specifier, parentDir);
+      if (mocks.has(resolved)) return mocks.get(resolved);
+    }
+    return undefined;
+  }
+
+  function loadModule(specifier, parentDir = rootDir) {
+    const mock = resolveMock(specifier, parentDir);
+    if (mock !== undefined) return mock;
+    if (specifier.endsWith(".css")) return {};
+
+
+
+    const isRootRelative =
+      specifier.startsWith("src/") ||
+      specifier.startsWith("test/") ||
+      specifier.startsWith("src-tauri/") ||
+      specifier.startsWith("@liveagent/ui/") ||
+      specifier.startsWith("@liveagent/app/") ||
+      specifier.startsWith("@liveagent/adapters/");
+
+    if (!isRootRelative && !specifier.startsWith(".") && !path.isAbsolute(specifier)) {
+      const require = createRequire(path.join(parentDir, "__liveagent_test_loader__.js"));
+      try {
+        return require(specifier);
+      } catch (error) {
+        if (error.code !== "ERR_PACKAGE_PATH_NOT_EXPORTED") throw error;
+        // Import-only ESM packages still run synchronously in Node when they have no top-level await.
+        for (const modulesDir of require.resolve.paths(specifier) ?? []) {
+          const manifestPath = path.join(modulesDir, specifier, "package.json");
+          if (!fs.existsSync(manifestPath)) continue;
+          const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+          const target = manifest.exports?.["."]?.import;
+          if (typeof target === "string") {
+            return require(path.resolve(path.dirname(manifestPath), target));
+          }
+        }
+        throw error;
+      }
+    }
+
+    const filePath = resolveLocal(specifier, isRootRelative ? rootDir : parentDir);
+    if (cache.has(filePath)) return cache.get(filePath).exports;
+
+    if (filePath.endsWith(".json")) {
+      const jsonModule = { exports: JSON.parse(fs.readFileSync(filePath, "utf8")) };
+      cache.set(filePath, jsonModule);
+      return jsonModule.exports;
+    }
+
+    const source = fs.readFileSync(filePath, "utf8");
+    const outputText = transpileTypeScriptModule(source, filePath);
+
+    const module = { exports: {} };
+    cache.set(filePath, module);
+
+    const dirname = path.dirname(filePath);
+    const localRequire = (nextSpecifier) => loadModule(nextSpecifier, dirname);
+    localRequire.resolve = (nextSpecifier) =>
+      nextSpecifier.startsWith(".") ||
+      path.isAbsolute(nextSpecifier) ||
+      nextSpecifier.startsWith("@liveagent/ui/") ||
+      nextSpecifier.startsWith("@liveagent/app/") ||
+      nextSpecifier.startsWith("@liveagent/adapters/")
+        ? resolveLocal(nextSpecifier, dirname)
+        : createRequire(path.join(dirname, "__liveagent_test_loader__.js")).resolve(nextSpecifier);
+
+    const wrapped = `(function (exports, require, module, __filename, __dirname) {\n${outputText}\n})`;
+    const script = new vm.Script(wrapped, { filename: filePath });
+    const previousWindow = globalThis.window;
+    if (typeof globalThis.window === "undefined") {
+      globalThis.window = {
+        setTimeout,
+        clearTimeout,
+      };
+    }
+
+    try {
+      const compiled = script.runInThisContext();
+      compiled(module.exports, localRequire, module, filePath, dirname);
+    } finally {
+      if (typeof previousWindow === "undefined") {
+        delete globalThis.window;
+      } else {
+        globalThis.window = previousWindow;
+      }
+    }
+    return module.exports;
+  }
+
+  function validateToolArguments(tool, toolCall) {
+    const validator = Compile(tool.parameters);
+    if (!validator.Check(toolCall.arguments)) {
+      throw new Error(`Invalid arguments for ${toolCall.name}`);
+    }
+    return toolCall.arguments;
+  }
+
+  return {
+    rootDir,
+    loadModule,
+    resolveLocal,
+    validateToolArguments,
+  };
+}

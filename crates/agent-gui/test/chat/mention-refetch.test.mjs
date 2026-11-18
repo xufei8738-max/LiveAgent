@@ -1,0 +1,98 @@
+import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
+import test from "node:test";
+
+const sourceRoots = [
+  new URL("../../../agent-ui/src/components/chat/", import.meta.url),
+];
+
+function source(root) {
+  return ["MentionComposer.tsx", "MentionComposerInternals.tsx", "MentionComposerModel.ts"]
+    .map((file) => readFileSync(new URL(file, root), "utf8"))
+    .join("\n");
+}
+
+function extractFunction(src, name) {
+  src = src.replace(/\r\n/g, "\n");
+  const start = src.indexOf(`function ${name}(`);
+  assert.notEqual(start, -1, `missing function ${name}`);
+  const end = src.indexOf("\n}\n", start);
+  assert.notEqual(end, -1, `unterminated function ${name}`);
+  return src.slice(start, end + 3);
+}
+
+function loadCoversQuery(src) {
+  const body = extractFunction(src, "mentionSnapshotCoversQuery").replace(
+    /\(\s*fetched[^)]*\)\s*:\s*boolean/s,
+    "(fetched, trigger, normalizedQuery)",
+  );
+  return new Function(`${body}; return mentionSnapshotCoversQuery;`)();
+}
+
+test("the shared composer owns the snapshot-coverage decision", () => {
+  assert.match(source(sourceRoots[0]), /function mentionSnapshotCoversQuery\(/);
+});
+
+test("a truncated snapshot never claims to cover an extended query", () => {
+  for (const root of sourceRoots) {
+    const coversQuery = loadCoversQuery(source(root));
+
+    // Complete snapshots narrow client-side, exactly as before.
+    const complete = { trigger: "file", query: "", truncated: false };
+    assert.equal(coversQuery(complete, "file", ""), true);
+    assert.equal(coversQuery(complete, "file", "src/app"), true);
+    assert.equal(coversQuery(complete, "skill", "src/app"), false);
+
+    // The big-workspace regression: an empty-query snapshot capped by the
+    // backend must refetch for every non-empty query instead of filtering
+    // the incomplete cache.
+    const truncated = { trigger: "file", query: "", truncated: true };
+    assert.equal(coversQuery(truncated, "file", ""), true);
+    assert.equal(coversQuery(truncated, "file", "s"), false);
+    assert.equal(coversQuery(truncated, "file", "settings.rs"), false);
+
+    // Query edits that stop extending the fetched query always refetch.
+    const scoped = { trigger: "file", query: "src/", truncated: false };
+    assert.equal(coversQuery(scoped, "file", "src/main"), true);
+    assert.equal(coversQuery(scoped, "file", "sr"), false);
+
+    // No snapshot yet means nothing to refetch against.
+    assert.equal(coversQuery(null, "file", "anything"), true);
+  }
+});
+
+test("the shared composer wires truncation tracking and debounced refetches", () => {
+  for (const root of sourceRoots) {
+    const composer = source(root);
+    // The fetch snapshot starts pessimistic and is corrected by the response.
+    assert.match(composer, /truncated: isFileFetch,/);
+    assert.match(
+      composer,
+      /mentionFetchRef\.current = \{ \.\.\.mentionFetchRef\.current, truncated: resp\.truncated \}/,
+    );
+    // Query-driven file refetches are debounced and keep the current entries
+    // so the popup does not flash empty between keystrokes.
+    assert.match(composer, /const MENTION_REFETCH_DEBOUNCE_MS = 150;/);
+    assert.match(composer, /startMentionSession\(ctx, \{ keepEntries: true \}\)/);
+    // While a refetch is pending the popup reports loading instead of a
+    // premature "no matching files".
+    assert.match(
+      composer,
+      /mentionMenuMode === "files" && \(mentionSessionLoading \|\| mentionRefetchPending\)/,
+    );
+  }
+});
+
+test("bare @ opens the reference root before file indexing", () => {
+  const composer = source(sourceRoots[0]);
+  assert.match(
+    composer,
+    /type MentionMenuMode = "root" \| "apps" \| "files" \| "conversations"/,
+  );
+  assert.match(composer, /\{ type: "category", category: "apps" \}/);
+  assert.match(composer, /\{ type: "category", category: "files" \}/);
+  assert.match(composer, /\{ type: "category", category: "conversations" \}/);
+  assert.match(composer, /mode === "files" && Boolean\(normalizedWorkdir\)/);
+  assert.match(composer, /mentionMenuMode !== "root"/);
+  assert.match(composer, /returnToMentionRoot\(\)/);
+});

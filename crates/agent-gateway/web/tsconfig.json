@@ -1,0 +1,19 @@
+{
+  "extends": "../../../tsconfig.base.json",
+  "compilerOptions": {
+    "target": "ES2022",
+    "types": [],
+    "allowJs": false,
+    "allowSyntheticDefaultImports": true,
+    "paths": {
+      "@/*": ["./src/*"],
+      "@liveagent/app/*": ["./src/*"],
+      "@liveagent/adapters/*": ["./src/agent-ui-adapters/*"],
+      "@liveagent/ui/*": ["../../agent-ui/src/*"],
+      "@tauri-apps/api/core": ["./src/shims/tauriCore.ts"],
+      "@tauri-apps/api/event": ["./src/shims/tauriEvent.ts"],
+      "@tauri-apps/plugin-opener": ["./src/shims/tauriOpener.ts"]
+    }
+  },
+  "include": ["src"]
+}

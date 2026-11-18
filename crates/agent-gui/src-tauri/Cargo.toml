@@ -1,0 +1,130 @@
+[package]
+name = "oneagent"
+# Release builds override this development version from the Git tag workflow.
+version = "2.0.25"
+description = "OneAgent desktop application"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "oneagent_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+serde_json = "1.0.150"
+tauri-build = { version = "2.6.3", features = [] }
+prost-build = "0.14.4"
+
+[dependencies]
+tauri = { version = "2.11.5", features = ["tray-icon", "image-png"] }
+tauri-plugin-single-instance = "2.4.3"
+tauri-plugin-opener = "2.5.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = { version = "1.0.150", features = ["raw_value"] }
+reqwest = { version = "0.13.4", features = ["blocking", "json", "stream", "socks"] }
+rquickjs = { version = "0.8", features = ["array-buffer", "classes", "bindgen"] }
+percent-encoding = "2.3.2"
+urlencoding = "2.1.3"
+axum = "0.8.9"
+tokio = { version = "1.52.3", features = ["macros", "net", "sync", "time", "io-util", "process", "rt-multi-thread"] }
+tokio-stream = "0.1.18"
+tokio-tungstenite = { version = "0.29.0", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3.32"
+async-trait = "0.1.89"
+hmac = "0.12.1"
+sha1 = "0.10.6"
+flate2 = "1.1.8"
+uuid = { version = "1.23.4", features = ["v4"] }
+base64 = "0.22.1"
+globset = "0.4.18"
+lopdf = "0.43.0"
+regex = "1.12.4"
+thiserror = "2.0.18"
+walkdir = "2.5.0"
+notify = "8.2.0"
+rfd = "0.17.2"
+# Text and image clipboard access for the desktop image preview actions.
+arboard = { version = "3.6.1", default-features = false, features = ["wayland-data-control", "image-data"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "webp"] }
+tauri-plugin-mcp-bridge = "0.12.0"
+dirs = "6.0.0"
+toml = "0.9.11"
+ignore = "0.4.27"
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+leveldb-core = "0.1.0"
+chrono = "0.4.45"
+chrono-tz = "0.10.4"
+iana-time-zone = "0.1"
+tauri-plugin-notification = "2"
+tokio-cron-scheduler = "0.15.1"
+# 与 tokio-cron-scheduler 共用的 cron 解析器;直接依赖用于校验与计算未来触发时间。
+croner = "3.0.1"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std"] }
+prost = "0.14.4"
+zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
+sha2 = "0.11.0"
+zstd = "0.13.3"
+tempfile = "3.27.0"
+tauri-plugin-updater = "2.10.1"
+tauri-plugin-global-shortcut = "2.3.2"
+tauri-plugin-window-state = "2.4.1"
+semver = "1.0.28"
+quick-xml = "0.41.0"
+portable-pty = "0.9.0"
+wait-timeout = "0.2.1"
+russh = "0.62.2"
+russh-sftp = "2.3.0"
+encoding_rs = "0.8.35"
+chardetng = "0.1.17"
+# MCP OAuth（docs/design/mcp-oauth.md）：token 只进 OS keystore；PKCE/state 熵源。
+keyring = { version = "3.6.3", features = ["apple-native", "windows-native", "sync-secret-service"] }
+getrandom = "0.3.4"
+# 浏览器登录态导入（services/browser/cookie_import）：解密 Chromium Cookies。
+aes = "0.9.1"
+cbc = "0.2.1"
+aes-gcm = { version = "0.11.0", default-features = false, features = ["aes", "alloc"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-user-notifications = { version = "0.3", default-features = false, features = ["std", "block2", "UNUserNotificationCenter", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationSettings", "UNNotificationSound", "UNNotificationTrigger", "UNNotificationResponse"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "libc", "NSButton", "NSControl", "NSView", "NSWindow", "NSWorkspace", "NSRunningApplication", "NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphics", "NSGraphicsContext", "objc2-core-graphics"] }
+objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "AVCaptureDevice", "AVMediaFormat"] }
+objc2 = { version = "0.6", default-features = false, features = ["std"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSBundle", "NSString", "NSData", "NSDictionary", "NSArray", "NSObject", "NSEnumerator", "NSGeometry", "NSNotification", "NSOperation", "block2", "objc2-core-foundation"] }
+block2 = "0.6"
+# 读 .app bundle 的 Info.plist（输入框 @ 应用提及的枚举）。
+plist = "1.10"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Security_Isolation",
+    "Win32_System_Threading",
+    "Win32_System_JobObjects",
+    "Win32_System_Console",
+    "Win32_System_Environment",
+    "Win32_System_Registry",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_WindowsAndMessaging",
+    # 已安装应用枚举（输入框 @ 应用提及）：SHGetFileInfoW 取图标需要
+    # Shell + Com（SHGetFileInfo 要求 COM 已初始化），位图转像素走 Gdi。
+    "Win32_UI_Shell",
+    "Win32_Graphics_Gdi",
+    "Win32_System_Com",
+    # 代理服务检测：GetExtendedTcpTable 列监听端口，GetBestRoute 取默认网关
+    # （MIB_IPFORWARDROW 需要 WinSock 特性）。
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
+    # 浏览器登录态导入：DPAPI 解封 Chromium os_crypt 密钥（CryptUnprotectData）。
+    "Win32_Security_Cryptography",
+] }
+
+[dev-dependencies]
+tauri = { version = "2.11.5", features = ["test"] }

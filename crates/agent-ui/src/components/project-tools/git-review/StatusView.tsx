@@ -1,0 +1,701 @@
+import { ContextMenuItem, ContextMenuPopup } from "@liveagent/ui/components/ui/context-menu";
+// GitReview status view: staged/unstaged change lists, the commit composer
+// pinned under the change list, the working-tree/branch diff pane and the
+// change context menus.
+//
+// Shared implementation owned by @liveagent/ui. Host-specific Git operations
+// and optional platform capabilities enter through the shared contracts.
+
+import {
+  BrushCleaning,
+  ChevronRight,
+  ExternalLink,
+  Eye,
+  FilePenLine,
+  FolderTree,
+  GitCommitHorizontal,
+  MoreHorizontal,
+  RefreshCw,
+  Trash2,
+} from "@liveagent/ui/components/IconSet";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import type { GitStatusEntry } from "@liveagent/ui/lib/git/types";
+import { hostAwareErrorMessage } from "@liveagent/ui/lib/shared/hostErrors";
+import {
+  type MouseEvent as ReactMouseEvent,
+  type RefObject,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { cn } from "../../../lib/shared/utils";
+import { getFileTypeIcon } from "../../chat/fileTypeIcons";
+import { Button } from "../../ui/button";
+import { useRightDockToolContext } from "../RightDockContext";
+import { GitCommitComposer } from "./CommitComposer";
+import { DiffReviewCard } from "./DiffView";
+import {
+  basename,
+  type ChangeContextMenuState,
+  type ChangeListSection,
+  type ChangesMenuState,
+  canStageEntry,
+  canUnstageEntry,
+  type DiffViewKind,
+  GIT_REVIEW_SPLIT_GRID_CLASS,
+  type GitDiscardConfirmState,
+  type GitReviewStackedPane,
+  isDeletedStatusEntry,
+  parentPath,
+  revealTargetForEntry,
+  statusLabel,
+  statusTone,
+} from "./model";
+import { GitDiscardConfirmModal } from "./Toolbar";
+import type { GitReviewData } from "./useGitReviewData";
+
+const INITIAL_CHANGE_ENTRY_RENDER_COUNT = 160;
+const CHANGE_ENTRY_RENDER_BATCH_SIZE = 160;
+
+export function GitReviewStatusView(props: {
+  activeDiffView: DiffViewKind;
+  collapsedSections: Record<ChangeListSection, boolean>;
+  commitMessage: string;
+  data: GitReviewData;
+  onActiveDiffViewChange: (view: DiffViewKind) => void;
+  onCommitMessageChange: (value: string) => void;
+  onStackedPaneChange: (pane: GitReviewStackedPane, dir: "forward" | "back") => void;
+  onToggleSection: (section: ChangeListSection) => void;
+  panelRef: RefObject<HTMLDivElement | null>;
+  stackedPane: GitReviewStackedPane;
+  useSplitReviewLayout: boolean;
+  writeDisabled: boolean;
+}) {
+  const {
+    activeDiffView,
+    collapsedSections,
+    commitMessage,
+    data,
+    onActiveDiffViewChange,
+    onCommitMessageChange,
+    onStackedPaneChange,
+    onToggleSection,
+    panelRef,
+    stackedPane,
+    useSplitReviewLayout,
+    writeDisabled,
+  } = props;
+  const {
+    branchDiff,
+    branchError,
+    busy,
+    cwd,
+    diffLoading,
+    gitClient,
+    loading,
+    refresh,
+    runOperation,
+    selectPath,
+    selectedPath,
+    setError,
+    state,
+    worktreeDiff,
+  } = data;
+  const context = useRightDockToolContext();
+  const onRevealInFileTree = context.fileTree.onRevealInFileTree;
+  const { t } = useLocale();
+
+  const [changeContextMenu, setChangeContextMenu] = useState<ChangeContextMenuState | null>(null);
+  const [changesMenu, setChangesMenu] = useState<ChangesMenuState | null>(null);
+  const [discardConfirm, setDiscardConfirm] = useState<GitDiscardConfirmState | null>(null);
+  const listPaneRef = useRef<HTMLElement | null>(null);
+  const detailPaneRef = useRef<HTMLElement | null>(null);
+
+  const entries = state.entries;
+  const stagedEntries = useMemo(() => entries.filter(canUnstageEntry), [entries]);
+  const workingEntries = useMemo(() => entries.filter(canStageEntry), [entries]);
+  const [visibleStagedEntryCount, setVisibleStagedEntryCount] = useState(
+    INITIAL_CHANGE_ENTRY_RENDER_COUNT,
+  );
+  const [visibleWorkingEntryCount, setVisibleWorkingEntryCount] = useState(
+    INITIAL_CHANGE_ENTRY_RENDER_COUNT,
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: repository and entry-count changes reset incremental rendering
+  useEffect(() => {
+    setVisibleStagedEntryCount(INITIAL_CHANGE_ENTRY_RENDER_COUNT);
+    setVisibleWorkingEntryCount(INITIAL_CHANGE_ENTRY_RENDER_COUNT);
+  }, [state.repoRoot, state.head, stagedEntries.length, workingEntries.length]);
+  const visibleStagedEntries = useMemo(
+    () => stagedEntries.slice(0, visibleStagedEntryCount),
+    [stagedEntries, visibleStagedEntryCount],
+  );
+  const visibleWorkingEntries = useMemo(
+    () => workingEntries.slice(0, visibleWorkingEntryCount),
+    [workingEntries, visibleWorkingEntryCount],
+  );
+  const hiddenStagedEntryCount = Math.max(0, stagedEntries.length - visibleStagedEntries.length);
+  const hiddenWorkingEntryCount = Math.max(0, workingEntries.length - visibleWorkingEntries.length);
+  const hasStageableChanges = state.dirtyCounts.unstaged > 0 || state.dirtyCounts.untracked > 0;
+  const hasStagedChanges = state.dirtyCounts.staged > 0;
+  const hasDiscardableChanges = entries.length > 0;
+  const selectedEntry = useMemo(
+    () => entries.find((entry) => entry.path === selectedPath) ?? null,
+    [entries, selectedPath],
+  );
+  const contextEntry = useMemo(
+    () => entries.find((entry) => entry.path === changeContextMenu?.path) ?? null,
+    [changeContextMenu?.path, entries],
+  );
+  const contextEntrySection = changeContextMenu?.section ?? "changes";
+  const contextEntryCanStage =
+    contextEntrySection === "changes" && contextEntry ? canStageEntry(contextEntry) : false;
+  const contextEntryCanUnstage =
+    contextEntrySection === "staged" && contextEntry ? canUnstageEntry(contextEntry) : false;
+  const contextEntryCanAddToGitignore =
+    contextEntrySection === "changes" && Boolean(contextEntry?.untracked);
+
+  const selectEntry = useCallback(
+    (entry: GitStatusEntry) => {
+      selectPath(entry.path);
+      if (!useSplitReviewLayout) {
+        onStackedPaneChange("detail", "forward");
+      }
+    },
+    [onStackedPaneChange, selectPath, useSplitReviewLayout],
+  );
+
+  const openChangeContextMenu = useCallback(
+    (event: ReactMouseEvent, entry: GitStatusEntry, section: ChangeListSection) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setChangesMenu(null);
+      const panelRect = panelRef.current?.getBoundingClientRect();
+      // Base UI positions the popup at this pointer anchor.
+      setChangeContextMenu({
+        x: panelRect ? event.clientX - panelRect.left : event.clientX,
+        y: panelRect ? event.clientY - panelRect.top : event.clientY,
+        path: entry.path,
+        section,
+      });
+    },
+    [panelRef],
+  );
+
+  const toggleChangeSection = useCallback(
+    (section: ChangeListSection) => {
+      setChangeContextMenu((current) => (current?.section === section ? null : current));
+      setChangesMenu((current) => (current?.section === section ? null : current));
+      onToggleSection(section);
+    },
+    [onToggleSection],
+  );
+
+  const openChangesMenu = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>, section: ChangeListSection) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setChangeContextMenu(null);
+      const panelRect = panelRef.current?.getBoundingClientRect();
+      const buttonRect = event.currentTarget.getBoundingClientRect();
+      // Anchor at the button's bottom-right corner. A stable outer positioning
+      // layer keeps the inner menu's transform animation out of coordinate
+      // measurement and boundary correction.
+      setChangesMenu({
+        right: panelRect
+          ? panelRect.right - buttonRect.right
+          : window.innerWidth - buttonRect.right,
+        y: panelRect ? buttonRect.bottom - panelRect.top + 4 : buttonRect.bottom + 4,
+        section,
+      });
+    },
+    [panelRef],
+  );
+
+  const viewEntryChanges = useCallback(
+    (entry: GitStatusEntry) => {
+      setChangeContextMenu(null);
+      onActiveDiffViewChange("workingTree");
+      selectEntry(entry);
+    },
+    [onActiveDiffViewChange, selectEntry],
+  );
+
+  const stageEntry = useCallback(
+    (entry: GitStatusEntry) => {
+      setChangeContextMenu(null);
+      if (!gitClient) return;
+      void runOperation("stage", () => gitClient.stage(cwd, entry.path));
+    },
+    [cwd, gitClient, runOperation],
+  );
+
+  const unstageEntry = useCallback(
+    (entry: GitStatusEntry) => {
+      setChangeContextMenu(null);
+      if (!gitClient) return;
+      void runOperation("unstage", () => gitClient.unstage(cwd, entry.path));
+    },
+    [cwd, gitClient, runOperation],
+  );
+
+  const discardEntry = useCallback((entry: GitStatusEntry) => {
+    setChangeContextMenu(null);
+    setDiscardConfirm({
+      kind: "entry",
+      path: entry.path,
+      oldPath: entry.oldPath ?? null,
+    });
+  }, []);
+
+  const addEntryToGitignore = useCallback(
+    (entry: GitStatusEntry) => {
+      setChangeContextMenu(null);
+      if (!gitClient) return;
+      void runOperation("add_to_gitignore", () => gitClient.addToGitignore(cwd, entry.path));
+    },
+    [cwd, gitClient, runOperation],
+  );
+
+  const stageAllChanges = useCallback(() => {
+    setChangesMenu(null);
+    if (!gitClient) return;
+    void runOperation("stage_all", () => gitClient.stageAll(cwd));
+  }, [cwd, gitClient, runOperation]);
+
+  const unstageAllChanges = useCallback(() => {
+    setChangesMenu(null);
+    if (!gitClient) return;
+    void runOperation("unstage_all", () => gitClient.unstageAll(cwd));
+  }, [cwd, gitClient, runOperation]);
+
+  const discardAllChanges = useCallback(() => {
+    setChangesMenu(null);
+    setDiscardConfirm({ kind: "all" });
+  }, []);
+
+  const closeDiscardConfirm = useCallback(() => {
+    if (busy === "discard" || busy === "discard_all") return;
+    setDiscardConfirm(null);
+  }, [busy]);
+
+  const confirmDiscardChanges = useCallback(async () => {
+    if (!discardConfirm || !gitClient) return;
+    if (discardConfirm.kind === "all") {
+      await runOperation("discard_all", () => gitClient.discardAll(cwd), "discard_all");
+    } else {
+      const target = discardConfirm;
+      await runOperation(
+        "discard",
+        () => gitClient.discard(cwd, target.path, target.oldPath ?? undefined),
+        "discard",
+      );
+    }
+    setDiscardConfirm(null);
+  }, [cwd, discardConfirm, gitClient, runOperation]);
+
+  const revealEntryInFileTree = useCallback(
+    (entry: GitStatusEntry) => {
+      if (!onRevealInFileTree) return;
+      setChangeContextMenu(null);
+      onRevealInFileTree(revealTargetForEntry(entry));
+    },
+    [onRevealInFileTree],
+  );
+
+  const canOpenSystemFileLocation = typeof gitClient?.openSystemFileLocation === "function";
+
+  const openEntrySystemFileLocation = useCallback(
+    (entry: GitStatusEntry) => {
+      setChangeContextMenu(null);
+      setError("");
+      void gitClient?.openSystemFileLocation?.(cwd, entry.path).catch((err) => {
+        setError(hostAwareErrorMessage(err, t("git.branchSelector.runtimeUnsupported")));
+      });
+    },
+    [cwd, gitClient, setError, t],
+  );
+
+  const renderChangeEntry = (entry: GitStatusEntry, section: ChangeListSection) => {
+    const selected = entry.path === selectedPath;
+    const contextMenuOpen =
+      entry.path === changeContextMenu?.path && section === changeContextMenu?.section;
+    const TypeIcon = getFileTypeIcon(entry.path, "file");
+    const fileName = basename(entry.path);
+    const filePath = parentPath(entry.path);
+    const deleted = isDeletedStatusEntry(entry);
+    return (
+      // biome-ignore lint/a11y/noStaticElementInteractions: Context-menu targeting is a pointer-specific enhancement; the nested button remains the keyboard activation target.
+      <div
+        key={`${section}:${entry.kind}:${entry.oldPath ?? ""}:${entry.path}`}
+        className={cn(
+          "select-none border-b border-l-2 border-border/60 border-l-transparent px-3 py-2 transition-colors",
+          "hover:bg-muted/40",
+          selected && "border-l-emerald-500 bg-emerald-500/10",
+          contextMenuOpen && "border-l-primary bg-primary/10 ring-1 ring-inset ring-primary/35",
+        )}
+        onContextMenu={(event) => openChangeContextMenu(event, entry, section)}
+      >
+        <button
+          type="button"
+          className={cn(
+            "flex w-full select-none items-start gap-2 rounded-sm bg-transparent p-0",
+            "text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          )}
+          onClick={() => selectEntry(entry)}
+          title={entry.path}
+        >
+          <TypeIcon className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
+          <span className="min-w-0 flex-1 select-none">
+            <span
+              className={cn(
+                "block truncate text-xs font-medium text-foreground",
+                deleted && "line-through",
+              )}
+            >
+              {fileName}
+            </span>
+            <span
+              className={cn(
+                "block truncate text-xs leading-4 text-muted-foreground",
+                deleted && "line-through",
+              )}
+            >
+              {filePath}
+            </span>
+          </span>
+          <span className={cn("mt-0.5 shrink-0 text-tiny font-semibold", statusTone(entry))}>
+            {statusLabel(entry)}
+          </span>
+        </button>
+      </div>
+    );
+  };
+
+  const renderChangeSection = (
+    section: ChangeListSection,
+    title: string,
+    sectionEntries: GitStatusEntry[],
+    visibleSectionEntries: GitStatusEntry[],
+    hiddenCount: number,
+    emptyLabel: string,
+    onShowMore: () => void,
+    collapsed: boolean,
+    onToggle: () => void,
+  ) => (
+    <section className="relative border-b border-border/60 bg-background last:border-b-0">
+      <div
+        className={cn(
+          "sticky top-0 z-20 grid h-7 w-full grid-cols-[minmax(0,1fr)_auto_auto] items-center",
+          "gap-2 border-b border-border/60 bg-muted px-3",
+        )}
+      >
+        <button
+          type="button"
+          className={cn(
+            "flex min-w-0 items-center gap-1.5 rounded-sm bg-transparent p-0 text-left",
+            "hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring",
+          )}
+          aria-expanded={!collapsed}
+          onClick={onToggle}
+        >
+          <ChevronRight
+            className={cn(
+              "size-3 shrink-0 text-muted-foreground transition-transform duration-200 ease-out motion-reduce:transition-none",
+              !collapsed && "rotate-90",
+            )}
+            aria-hidden="true"
+          />
+          <span className="min-w-0 truncate text-xs font-semibold text-muted-foreground">
+            {title}
+          </span>
+        </button>
+        <span
+          className={cn(
+            "inline-flex h-4 min-w-6 shrink-0 items-center justify-center justify-self-end",
+            "rounded bg-background/70 px-1.5",
+            "text-center text-tiny font-medium tabular-nums text-muted-foreground",
+          )}
+        >
+          {sectionEntries.length}
+        </span>
+        <Button
+          type="button"
+          size="sm"
+          variant="ghost"
+          className="-mr-1 size-5 shrink-0 px-0 text-muted-foreground"
+          title={t("projectTools.gitReview.changesActions")}
+          aria-label={t("projectTools.gitReview.changesActions")}
+          onClick={(event) => openChangesMenu(event, section)}
+        >
+          <MoreHorizontal className="size-3.5" />
+        </Button>
+      </div>
+      <div
+        aria-hidden={collapsed}
+        inert={collapsed}
+        className={cn(
+          "grid overflow-hidden transition-[grid-template-rows,opacity] duration-200 ease-out motion-reduce:transition-none",
+          collapsed ? "grid-rows-[0fr] opacity-0" : "grid-rows-[1fr] opacity-100",
+        )}
+      >
+        <div
+          className={cn(
+            "min-h-0 overflow-hidden transition-[opacity,transform] duration-200 ease-out motion-reduce:transition-none",
+            collapsed ? "-translate-y-1 opacity-0" : "translate-y-0 opacity-100",
+          )}
+        >
+          {sectionEntries.length === 0 ? (
+            <div className="p-3 text-xs text-muted-foreground">{emptyLabel}</div>
+          ) : (
+            <>
+              {visibleSectionEntries.map((entry) => renderChangeEntry(entry, section))}
+              {hiddenCount > 0 ? (
+                <div className="border-b border-border/60 px-3 py-2">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-7 w-full text-xs"
+                    onClick={onShowMore}
+                  >
+                    {t("projectTools.gitReview.showMoreChanges").replace(
+                      "{count}",
+                      String(hiddenCount),
+                    )}
+                  </Button>
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </div>
+    </section>
+  );
+
+  return (
+    <>
+      <GitDiscardConfirmModal
+        target={discardConfirm}
+        loading={busy === "discard" || busy === "discard_all"}
+        onClose={closeDiscardConfirm}
+        onConfirm={confirmDiscardChanges}
+      />
+      <div
+        key="changes"
+        className={cn(
+          "min-h-0 flex-1 gap-3 overflow-hidden p-3",
+          useSplitReviewLayout ? `grid ${GIT_REVIEW_SPLIT_GRID_CLASS}` : "flex flex-col",
+        )}
+      >
+        <aside
+          ref={listPaneRef}
+          className={cn(
+            "min-h-0 flex-col overflow-hidden rounded-lg border border-border/70 bg-background",
+            useSplitReviewLayout || stackedPane === "list" ? "flex" : "hidden",
+            !useSplitReviewLayout && "flex-1",
+          )}
+        >
+          <div className="isolate min-h-0 flex-1 overflow-auto [overscroll-behavior:contain]">
+            {entries.length === 0 ? (
+              <div className="px-3 py-6 text-xs text-muted-foreground">
+                {t("projectTools.gitReview.noLocalChanges")}
+              </div>
+            ) : (
+              <>
+                {renderChangeSection(
+                  "staged",
+                  t("projectTools.gitReview.stagedChangesTitle"),
+                  stagedEntries,
+                  visibleStagedEntries,
+                  hiddenStagedEntryCount,
+                  t("projectTools.gitReview.noStagedChanges"),
+                  () =>
+                    setVisibleStagedEntryCount(
+                      (current) => current + CHANGE_ENTRY_RENDER_BATCH_SIZE,
+                    ),
+                  collapsedSections.staged,
+                  () => toggleChangeSection("staged"),
+                )}
+                {renderChangeSection(
+                  "changes",
+                  t("projectTools.gitReview.changesTitle"),
+                  workingEntries,
+                  visibleWorkingEntries,
+                  hiddenWorkingEntryCount,
+                  t("projectTools.gitReview.noWorkingChanges"),
+                  () =>
+                    setVisibleWorkingEntryCount(
+                      (current) => current + CHANGE_ENTRY_RENDER_BATCH_SIZE,
+                    ),
+                  collapsedSections.changes,
+                  () => toggleChangeSection("changes"),
+                )}
+              </>
+            )}
+          </div>
+          <GitCommitComposer
+            commitMessage={commitMessage}
+            data={data}
+            onCommitMessageChange={onCommitMessageChange}
+            stagedEntries={stagedEntries}
+            writeDisabled={writeDisabled}
+          />
+        </aside>
+        <main
+          ref={detailPaneRef}
+          className={cn(
+            "h-full min-h-0 flex-col overflow-hidden",
+            useSplitReviewLayout || stackedPane === "detail" ? "flex" : "hidden",
+            !useSplitReviewLayout && "flex-1",
+          )}
+        >
+          {selectedEntry ? (
+            <div className="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
+              <div
+                className={cn(
+                  "flex shrink-0 items-center gap-2",
+                  "rounded-md border border-border/70 bg-muted/20 px-3 py-2 text-xs",
+                )}
+              >
+                <span className="text-muted-foreground">
+                  {t("projectTools.gitReview.selected")}
+                </span>
+                <span className="min-w-0 flex-1 truncate font-medium" title={selectedEntry.path}>
+                  {selectedEntry.path}
+                </span>
+              </div>
+              <DiffReviewCard
+                activeView={activeDiffView}
+                branchDiff={branchDiff}
+                branchError={branchError}
+                diffLoading={diffLoading}
+                onActiveViewChange={onActiveDiffViewChange}
+                showStat={useSplitReviewLayout}
+                worktreeDiff={worktreeDiff}
+                onInsertComposerSegments={context.git.onInsertComposerSegments}
+              />
+            </div>
+          ) : (
+            <div
+              className={cn(
+                "flex min-h-0 flex-1 items-center justify-center",
+                "rounded-lg border border-border/70 bg-muted/10 px-4",
+                "text-center text-xs text-muted-foreground",
+              )}
+            >
+              {t("projectTools.gitReview.selectFileToViewDiff")}
+            </div>
+          )}
+        </main>
+      </div>
+      {changesMenu ? (
+        <ContextMenuPopup
+          point={{
+            x: (panelRef.current?.clientWidth ?? window.innerWidth) - changesMenu.right,
+            y: changesMenu.y,
+          }}
+          coordinateRoot={panelRef}
+          align="end"
+          onClose={() => setChangesMenu(null)}
+          className="min-w-56"
+        >
+          {changesMenu.section === "changes" ? (
+            <ContextMenuItem
+              disabled={writeDisabled || busy !== "" || !hasStageableChanges}
+              onClick={stageAllChanges}
+            >
+              <FilePenLine className="size-3.5" />
+              <span>{t("projectTools.gitReview.stageAllChanges")}</span>
+            </ContextMenuItem>
+          ) : (
+            <ContextMenuItem
+              disabled={writeDisabled || busy !== "" || !hasStagedChanges}
+              onClick={unstageAllChanges}
+            >
+              <GitCommitHorizontal className="size-3.5" />
+              <span>{t("projectTools.gitReview.unstageAllChanges")}</span>
+            </ContextMenuItem>
+          )}
+          <ContextMenuItem
+            disabled={writeDisabled || busy !== "" || !hasDiscardableChanges}
+            onClick={discardAllChanges}
+          >
+            <Trash2 className="size-3.5" />
+            <span>{t("projectTools.gitReview.discardAllChanges")}</span>
+          </ContextMenuItem>
+          <ContextMenuItem
+            disabled={loading}
+            onClick={() => {
+              setChangesMenu(null);
+              void refresh();
+            }}
+          >
+            <RefreshCw className="size-3.5" />
+            <span>{t("projectTools.gitReview.refreshChanges")}</span>
+          </ContextMenuItem>
+        </ContextMenuPopup>
+      ) : null}
+      {changeContextMenu && contextEntry ? (
+        <ContextMenuPopup
+          point={changeContextMenu}
+          coordinateRoot={panelRef}
+          onClose={() => setChangeContextMenu(null)}
+          className="min-w-56"
+        >
+          <ContextMenuItem onClick={() => viewEntryChanges(contextEntry)}>
+            <Eye className="size-3.5" />
+            <span>{t("projectTools.gitReview.viewChanges")}</span>
+          </ContextMenuItem>
+          {contextEntrySection === "staged" ? (
+            <ContextMenuItem
+              disabled={writeDisabled || busy !== "" || !contextEntryCanUnstage}
+              onClick={() => unstageEntry(contextEntry)}
+            >
+              <GitCommitHorizontal className="size-3.5" />
+              <span>{t("projectTools.gitReview.unstageChanges")}</span>
+            </ContextMenuItem>
+          ) : (
+            <ContextMenuItem
+              disabled={writeDisabled || busy !== "" || !contextEntryCanStage}
+              onClick={() => stageEntry(contextEntry)}
+            >
+              <FilePenLine className="size-3.5" />
+              <span>{t("projectTools.gitReview.stageChanges")}</span>
+            </ContextMenuItem>
+          )}
+          <ContextMenuItem
+            disabled={writeDisabled || busy !== ""}
+            onClick={() => discardEntry(contextEntry)}
+          >
+            <BrushCleaning className="size-3.5" />
+            <span>{t("projectTools.gitReview.discardChanges")}</span>
+          </ContextMenuItem>
+          {contextEntryCanAddToGitignore ? (
+            <ContextMenuItem
+              disabled={writeDisabled || busy !== ""}
+              onClick={() => addEntryToGitignore(contextEntry)}
+            >
+              <GitCommitHorizontal className="size-3.5" />
+              <span>{t("projectTools.gitReview.addToGitignore")}</span>
+            </ContextMenuItem>
+          ) : null}
+          <ContextMenuItem
+            disabled={!onRevealInFileTree}
+            onClick={() => revealEntryInFileTree(contextEntry)}
+          >
+            <FolderTree className="size-3.5" />
+            <span>{t("projectTools.gitReview.revealInFileTree")}</span>
+          </ContextMenuItem>
+          {canOpenSystemFileLocation ? (
+            <ContextMenuItem onClick={() => openEntrySystemFileLocation(contextEntry)}>
+              <ExternalLink className="size-3.5" />
+              <span>{t("projectTools.gitReview.openSystemFileLocation")}</span>
+            </ContextMenuItem>
+          ) : null}
+        </ContextMenuPopup>
+      ) : null}
+    </>
+  );
+}

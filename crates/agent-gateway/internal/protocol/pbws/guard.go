@@ -1,0 +1,506 @@
+package pbws
+
+import (
+	"encoding/json"
+	"errors"
+	"strings"
+
+	"github.com/liveagent/agent-gateway/internal/chatcmd"
+	"github.com/liveagent/agent-gateway/internal/kbrain"
+	gatewayv2 "github.com/liveagent/agent-gateway/internal/proto/v2"
+	"github.com/liveagent/agent-gateway/internal/protocol/shared"
+	"github.com/liveagent/agent-gateway/internal/session"
+)
+
+// 直通白名单与限额校验：本文件明确限定浏览器可发起的操作——未列入白名单的载荷臂（内部推送臂、须走网关编排的 chat_command、ping 等）
+// 一律拒绝；功能开关门控与字段限额在转发前施加；list 类响应后处理经 finalize 钩子执行。
+
+const (
+	maxHistoryListLimit        = 200
+	defaultHistoryListPage     = 1
+	defaultHistoryListPageSize = 80
+	maxWorkspaceRootGrants     = 64
+	maxSlashCommandWorkdirLen  = 32768
+	maxPermissionRulesInputLen = 32768
+)
+
+const (
+	errComposerCommandsUnsupported = "desktop app does not support composer commands; update LiveAgent on the desktop"
+	errComposerGoalUnsupported     = "/goal is not available on a direct K-brain target"
+	errProxyDetectUnsupported      = "desktop app does not support proxy detection; update LiveAgent on the desktop"
+	errPermissionRulesUnsupported  = "desktop app does not support permission rules; update LiveAgent on the desktop"
+	errUsageStatsUnsupported       = "desktop app does not support usage statistics; update LiveAgent on the desktop"
+)
+
+func requireComposerCommands(sm session.AgentView) error {
+	if !sm.SupportsCapability(gatewayv2.ComposerCommandsV1Capability) {
+		return errors.New(errComposerCommandsUnsupported)
+	}
+	return nil
+}
+
+// vetAgentRequest 校验并（必要时）原地修正一条直通请求；返回错误则拒绝转发，错误信息面向客户端。
+// 门控按目标 Agent 的视图判定（sm 为绑定 agent_id 的只读视图）。
+func vetAgentRequest(sm session.AgentView, env *gatewayv2.GatewayEnvelope) error {
+	switch payload := env.GetPayload().(type) {
+	case nil:
+		return errors.New("agent_request payload is required")
+
+	// ---- 普通直通臂（无门控） ----
+	case *gatewayv2.GatewayEnvelope_Planning:
+		if payload.Planning == nil || len(payload.Planning.GetInputJson()) > 4_000_000 {
+			return errors.New("invalid planning request")
+		}
+		return nil
+	case *gatewayv2.GatewayEnvelope_HistoryList:
+		clampHistoryList(payload.HistoryList)
+		return nil
+	case *gatewayv2.GatewayEnvelope_HistoryGet,
+		*gatewayv2.GatewayEnvelope_HistoryRename,
+		*gatewayv2.GatewayEnvelope_HistoryDelete,
+		*gatewayv2.GatewayEnvelope_HistoryPrefix,
+		*gatewayv2.GatewayEnvelope_HistoryPin,
+		*gatewayv2.GatewayEnvelope_HistorySetCwd,
+		*gatewayv2.GatewayEnvelope_HistoryShareGet,
+		*gatewayv2.GatewayEnvelope_HistoryShareSet,
+		*gatewayv2.GatewayEnvelope_HistoryWorkdirs,
+		*gatewayv2.GatewayEnvelope_HistoryBranch,
+		*gatewayv2.GatewayEnvelope_ProviderList,
+		*gatewayv2.GatewayEnvelope_ProviderUsage,
+		*gatewayv2.GatewayEnvelope_ProviderModels,
+		*gatewayv2.GatewayEnvelope_SettingsGet,
+		*gatewayv2.GatewayEnvelope_SettingsUpdate,
+		*gatewayv2.GatewayEnvelope_SettingsResetSshKnownHost,
+		*gatewayv2.GatewayEnvelope_SkillFilesList,
+		*gatewayv2.GatewayEnvelope_SkillMetadataRead,
+		*gatewayv2.GatewayEnvelope_SkillTextRead,
+		*gatewayv2.GatewayEnvelope_SkillManage,
+		*gatewayv2.GatewayEnvelope_FileMentionList,
+		// 已安装应用清单（@ 应用提及）：只读宿主能力，桌面端返回什么由
+		// 桌面自己裁决（枚举实现见 services/cua_driver/installed_apps.rs）。
+		*gatewayv2.GatewayEnvelope_InstalledAppsList,
+		*gatewayv2.GatewayEnvelope_UploadedImagePreview,
+		*gatewayv2.GatewayEnvelope_MemoryManage,
+		*gatewayv2.GatewayEnvelope_CronManage,
+		*gatewayv2.GatewayEnvelope_FsRoots,
+		*gatewayv2.GatewayEnvelope_FsListDirs,
+		*gatewayv2.GatewayEnvelope_FsCreateProjectFolder,
+		*gatewayv2.GatewayEnvelope_FsList,
+		*gatewayv2.GatewayEnvelope_FsWriteText,
+		*gatewayv2.GatewayEnvelope_FsCreateDir,
+		*gatewayv2.GatewayEnvelope_FsRename,
+		*gatewayv2.GatewayEnvelope_FsDelete,
+		*gatewayv2.GatewayEnvelope_FsReadEditableText,
+		*gatewayv2.GatewayEnvelope_FsReadWorkspaceImage,
+		// 轨迹只读：不含任何写能力，也不触碰工作区，直通即可。
+		*gatewayv2.GatewayEnvelope_TrajectoryFetch,
+		*gatewayv2.GatewayEnvelope_ChatQueue,
+		// 澄清轮次：一次纯文本补全，载荷转发给桌面端执行，无网关侧门控。
+		*gatewayv2.GatewayEnvelope_ClarifyTurn:
+		return nil
+	case *gatewayv2.GatewayEnvelope_ChatFileOpen:
+		return vetChatFileOpen(payload.ChatFileOpen)
+	case *gatewayv2.GatewayEnvelope_WorkspaceRootGrants:
+		return vetWorkspaceRootGrants(payload.WorkspaceRootGrants)
+	case *gatewayv2.GatewayEnvelope_Checkpoint:
+		return vetCheckpoint(payload.Checkpoint)
+	case *gatewayv2.GatewayEnvelope_CuaDriver:
+		return vetCuaDriver(payload.CuaDriver)
+	// 输入框“/”指令：只发给声明了 COMPOSER_COMMANDS_V1 的桌面端；旧版桌面端不认识这些
+	// 载荷臂，会静默丢弃，浏览器只能等到请求超时。
+	case *gatewayv2.GatewayEnvelope_SlashCommandList:
+		if err := requireComposerCommands(sm); err != nil {
+			return err
+		}
+		return vetSlashCommandList(payload.SlashCommandList)
+	case *gatewayv2.GatewayEnvelope_GoalManage:
+		if err := requireComposerCommands(sm); err != nil {
+			return err
+		}
+		return vetGoalManage(payload.GoalManage)
+	case *gatewayv2.GatewayEnvelope_LoopManage:
+		if err := requireComposerCommands(sm); err != nil {
+			return err
+		}
+		return vetLoopManage(payload.LoopManage)
+	// 代理服务检测：只发给声明了 PROXY_DETECT_V1 的桌面端，理由同上。
+	case *gatewayv2.GatewayEnvelope_ProxyDetect:
+		if !sm.SupportsCapability(gatewayv2.ProxyDetectV1Capability) {
+			return errors.New(errProxyDetectUnsupported)
+		}
+		return vetProxyDetect(payload.ProxyDetect)
+	// 权限规则（设置 → 权限）：只发给声明了 PERMISSION_RULES_V1 的桌面端，理由同上。
+	case *gatewayv2.GatewayEnvelope_PermissionRules:
+		if !sm.SupportsCapability(gatewayv2.PermissionRulesV1Capability) {
+			return errors.New(errPermissionRulesUnsupported)
+		}
+		return vetPermissionRules(payload.PermissionRules)
+	// 用量统计（设置 → 用量统计）：只读；只发给声明了 USAGE_STATS_V1 的桌面端，理由同上。
+	case *gatewayv2.GatewayEnvelope_UsageStats:
+		if !sm.SupportsCapability(gatewayv2.UsageStatsV1Capability) {
+			return errors.New(errUsageStatsUnsupported)
+		}
+		return vetUsageStats(payload.UsageStats)
+
+	// ---- 带功能门控 / 限额的直通臂 ----
+	case *gatewayv2.GatewayEnvelope_GitRequest:
+		action := strings.TrimSpace(payload.GitRequest.GetAction())
+		if gitActionIsWrite(action) && !sm.WebGitEnabled() {
+			return errors.New("web git is disabled in desktop Remote settings")
+		}
+		return nil
+	case *gatewayv2.GatewayEnvelope_TerminalRequest:
+		req := payload.TerminalRequest
+		action := strings.TrimSpace(req.GetAction())
+		if req.GetConversationId() != "" || req.GetRunId() != "" {
+			if err := vetCanonicalTerminal(req); err != nil {
+				return err
+			}
+		}
+		if !shared.TerminalRequestAllowed(sm, action, strings.TrimSpace(req.GetSessionId())) {
+			return errors.New(shared.TerminalPermissionError(action))
+		}
+		return nil
+	case *gatewayv2.GatewayEnvelope_SftpRequest:
+		if !sm.WebSshTerminalEnabled() {
+			return errors.New("web SSH SFTP is disabled in desktop Remote settings")
+		}
+		return nil
+	case *gatewayv2.GatewayEnvelope_TunnelMutation:
+		if !sm.WebTunnelsEnabled() {
+			return errors.New("web tunnels are disabled in desktop Remote settings")
+		}
+		return nil
+	case *gatewayv2.GatewayEnvelope_ManagedProcessRequest:
+		req := payload.ManagedProcessRequest
+		action := strings.TrimSpace(req.GetAction())
+		if strings.TrimSpace(req.GetProcessId()) == "" && action != "clear" && action != "snapshot" {
+			return errors.New("process_id is required")
+		}
+		return nil
+
+	// ---- 明确拒绝的臂 ----
+	case *gatewayv2.GatewayEnvelope_PromptTemplateList,
+		*gatewayv2.GatewayEnvelope_PromptTemplateExpand:
+		// 提示词模板已并入 slash_command_list（目录）与 ChatRequest.prompt_command（由 K-brain
+		// 在运行时展开）；这两条独立通道没有调用方，不再对浏览器开放。proto 字段保留以兼容。
+		return errors.New("prompt template requests are retired; use slash_command_list and prompt_command")
+	default:
+		// 含 chat_command（须走网关编排）、ping（探活由网关发起）、upload_readable_files
+		// （走 HTTP 上传）、history_share_resolve（公共分享端点专用）及网关内部推送臂。
+		return errors.New("unsupported agent_request payload")
+	}
+}
+
+// vetCuaDriver 只放行 Computer Use 设置页的两个只读 action。安装（在宿主上联网执行安装脚本）与授权
+// （在宿主屏幕上弹 macOS TCC 对话框）是桌面本机动作，浏览器这端确认不了命令全文也点不到弹窗，
+// 一律不经网关下发；桌面端 handle_cua_driver 有同一份白名单兜底。
+func vetCuaDriver(req *gatewayv2.CuaDriverRequest) error {
+	switch strings.TrimSpace(req.GetAction()) {
+	case "probe", "permissions_status":
+		return nil
+	default:
+		return errors.New("unsupported cua_driver action")
+	}
+}
+
+// 用量统计：天数与时区先在网关校验（时区只放行 IANA 名字符），桌面端与直连 K-brain 的 relay 共用同一规则。
+func vetUsageStats(req *gatewayv2.UsageStatsRequest) error {
+	if req == nil {
+		return errors.New("invalid usage_stats request")
+	}
+	_, err := kbrain.UsageStatsQuery(req.GetDays(), req.GetTimezone())
+	return err
+}
+
+// 权限规则：只放行 list/add/delete，参数是 JSON 对象且限长（解释器命令的建议规则
+// 可能和命令一样长）。字段白名单与作用域由桌面端和直连 K-brain 的 relay 再校验。
+func vetPermissionRules(req *gatewayv2.PermissionRulesRequest) error {
+	if req == nil || len(req.GetInputJson()) > maxPermissionRulesInputLen {
+		return errors.New("invalid permission_rules request")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "list", "add", "delete":
+	default:
+		return errors.New("unsupported permission_rules action")
+	}
+	if input := strings.TrimSpace(req.GetInputJson()); input != "" {
+		var object map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(input), &object); err != nil || object == nil {
+			return errors.New("permission_rules input must be a JSON object")
+		}
+	}
+	return nil
+}
+
+// 代理服务检测：只放行检测与测速两个只读动作，测速参数限长；桌面端另外只接受
+// 自己检测到过的代理地址。
+func vetProxyDetect(req *gatewayv2.ProxyDetectRequest) error {
+	if req == nil || len(req.GetInputJson()) > 1024 {
+		return errors.New("invalid proxy_detect request")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "detect", "test":
+		return nil
+	default:
+		return errors.New("unsupported proxy_detect action")
+	}
+}
+
+func vetCheckpoint(req *gatewayv2.CheckpointRequest) error {
+	if req == nil || strings.TrimSpace(req.GetConversationId()) == "" || len(req.GetConversationId()) > 256 {
+		return errors.New("checkpoint conversation_id is invalid")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "list":
+		if req.GetTurnSeq() != 0 || len(req.GetAuthorizedRoots()) != 0 || len(req.GetExpected()) != 0 {
+			return errors.New("checkpoint list payload is invalid")
+		}
+	// K-brain numbers turns from 0, so turn_seq 0 is the first turn, not a
+	// missing value; the desktop and K-brain validate the sequence itself.
+	case "diff":
+		if len(req.GetExpected()) != 0 {
+			return errors.New("checkpoint diff payload is invalid")
+		}
+	case "rewind":
+	default:
+		return errors.New("checkpoint action is invalid")
+	}
+	if len(req.GetAuthorizedRoots()) > 64 {
+		return errors.New("too many checkpoint authorized roots")
+	}
+	for _, root := range req.GetAuthorizedRoots() {
+		if strings.TrimSpace(root) == "" || len(root) > 32768 {
+			return errors.New("checkpoint authorized root is invalid")
+		}
+	}
+	if len(req.GetExpected()) > 10_000 {
+		return errors.New("too many checkpoint expected entries")
+	}
+	for _, entry := range req.GetExpected() {
+		if entry == nil ||
+			strings.TrimSpace(entry.GetKey()) == "" ||
+			len(entry.GetKey()) > 65536 ||
+			strings.TrimSpace(entry.GetCurrentHash()) == "" ||
+			len(entry.GetCurrentHash()) > 256 {
+			return errors.New("checkpoint expected entry is invalid")
+		}
+	}
+	return nil
+}
+
+func vetWorkspaceRootGrants(req *gatewayv2.WorkspaceRootGrantsRequest) error {
+	if req == nil {
+		return errors.New("workspace root grants request is required")
+	}
+	if strings.TrimSpace(req.GetProjectId()) == "" || len(req.GetProjectId()) > 256 {
+		return errors.New("workspace root grants project_id is invalid")
+	}
+	switch strings.TrimSpace(req.GetAction()) {
+	case "list":
+		if strings.TrimSpace(req.GetProjectPath()) == "" || len(req.GetProjectPath()) > 32768 {
+			return errors.New("workspace root grants project_path is invalid")
+		}
+		if len(req.GetGrants()) != 0 {
+			return errors.New("workspace root grants list cannot include drafts")
+		}
+		return nil
+	case "apply":
+		if strings.TrimSpace(req.GetProjectPath()) == "" || len(req.GetProjectPath()) > 32768 {
+			return errors.New("workspace root grants project_path is invalid")
+		}
+		if len(req.GetGrants()) > maxWorkspaceRootGrants {
+			return errors.New("too many workspace root grants")
+		}
+	case "revoke":
+		if strings.TrimSpace(req.GetProjectPath()) != "" {
+			return errors.New("workspace root grants revoke cannot include project_path")
+		}
+		if len(req.GetGrants()) != 0 {
+			return errors.New("workspace root grants revoke cannot include drafts")
+		}
+		return nil
+	default:
+		return errors.New("workspace root grants action is invalid")
+	}
+
+	for _, grant := range req.GetGrants() {
+		if grant == nil || strings.TrimSpace(grant.GetAlias()) == "" || len(grant.GetAlias()) > 32 {
+			return errors.New("workspace root grant alias is invalid")
+		}
+		if strings.TrimSpace(grant.GetDisplayPath()) == "" || len(grant.GetDisplayPath()) > 32768 {
+			return errors.New("workspace root grant display_path is invalid")
+		}
+		if grant.Id != nil && (strings.TrimSpace(grant.GetId()) == "" || len(grant.GetId()) > 256) {
+			return errors.New("workspace root grant id is invalid")
+		}
+		switch strings.TrimSpace(grant.GetAccess()) {
+		case "read", "write":
+		default:
+			return errors.New("workspace root grant access is invalid")
+		}
+	}
+	return nil
+}
+
+const (
+	maxLoopPromptLen   = 16 * 1024
+	maxLoopIntervalLen = 16
+	maxLoopCronLen     = 256
+	maxComposerIDLen   = 256
+)
+
+// vetSlashCommandList 只带工作目录，按长度把关；项目级指令是否生效由 K-brain 按项目信任决定。
+func vetSlashCommandList(req *gatewayv2.SlashCommandListRequest) error {
+	if req == nil {
+		return errors.New("slash command list request is required")
+	}
+	req.Workdir = strings.TrimSpace(req.GetWorkdir())
+	if len(req.GetWorkdir()) > maxSlashCommandWorkdirLen {
+		return errors.New("slash command workdir is too long")
+	}
+	return nil
+}
+
+// vetGoalManage 放行目标栏的非运行动作 get/pause/update/clear：set/resume 会开始一轮
+// 运行，走 ChatRequest 的 goal_action。校验后原地规范化，桌面端按规范值精确匹配；
+// 只有 update 带目标正文，其余动作把它清空后再转发。
+func vetGoalManage(req *gatewayv2.GoalManageRequest) error {
+	if req == nil {
+		return errors.New("conversation is unavailable")
+	}
+	req.ConversationId = strings.TrimSpace(req.GetConversationId())
+	req.Action = strings.TrimSpace(req.GetAction())
+	if req.ConversationId == "" || len(req.ConversationId) > maxComposerIDLen {
+		return errors.New("conversation is unavailable")
+	}
+	switch req.Action {
+	case "get", "pause", "clear":
+		req.Goal = ""
+	case "update":
+		req.Goal = strings.TrimSpace(req.GetGoal())
+		if req.Goal == "" {
+			return errors.New("goal text is required for goal update")
+		}
+		if len(req.Goal) > chatcmd.MaxGoalTextLen {
+			return errors.New("goal text is too long")
+		}
+	default:
+		return errors.New("goal action must be get, pause, update or clear")
+	}
+	return nil
+}
+
+// vetLoopManage 校验会话内定时任务并原地规范化：支持间隔或旧版 cron，这里只按长度把关，
+// 真正的表达式与提示词校验在 K-brain 侧完成。与当前动作无关的字段清空后再转发。
+func vetLoopManage(req *gatewayv2.LoopManageRequest) error {
+	if req == nil {
+		return errors.New("conversation is unavailable")
+	}
+	req.ConversationId = strings.TrimSpace(req.GetConversationId())
+	req.Action = strings.TrimSpace(req.GetAction())
+	if req.ConversationId == "" || len(req.ConversationId) > maxComposerIDLen {
+		return errors.New("conversation is unavailable")
+	}
+	switch req.Action {
+	case "list":
+		req.Cron, req.Interval, req.Prompt, req.Reasoning, req.LoopId = "", "", "", "", ""
+	case "create":
+		req.Cron = strings.TrimSpace(req.GetCron())
+		req.Interval = strings.TrimSpace(req.GetInterval())
+		req.Prompt = strings.TrimSpace(req.GetPrompt())
+		req.Reasoning = strings.TrimSpace(req.GetReasoning())
+		req.LoopId = ""
+		if (req.Cron == "" && req.Interval == "") || len(req.Cron) > maxLoopCronLen {
+			return errors.New("loop schedule is required")
+		}
+		if req.Prompt == "" || len(req.Prompt) > maxLoopPromptLen {
+			return errors.New("loop prompt is required and must be within the size limit")
+		}
+		if len(req.Interval) > maxLoopIntervalLen {
+			return errors.New("loop interval is too long")
+		}
+		if len(req.Reasoning) > maxLoopIntervalLen {
+			return errors.New("loop reasoning is invalid")
+		}
+	case "cancel":
+		req.LoopId = strings.TrimSpace(req.GetLoopId())
+		req.Cron, req.Interval, req.Prompt, req.Reasoning = "", "", "", ""
+		if req.LoopId == "" || len(req.LoopId) > maxComposerIDLen {
+			return errors.New("loop id is required")
+		}
+	default:
+		return errors.New("loop action must be create, list or cancel")
+	}
+	return nil
+}
+
+func vetChatFileOpen(req *gatewayv2.ChatFileOpenRequest) error {
+	if req == nil || strings.TrimSpace(req.GetConversationId()) == "" || len(req.GetConversationId()) > 256 {
+		return errors.New("conversation is unavailable")
+	}
+	if strings.TrimSpace(req.GetWorkdir()) == "" || strings.TrimSpace(req.GetPath()) == "" {
+		return errors.New("linked file request is incomplete")
+	}
+	if len(req.GetWorkdir()) > 32768 || len(req.GetPath()) > 32768 {
+		return errors.New("linked file request is too large")
+	}
+	switch strings.TrimSpace(req.GetSource()) {
+	case "absolute", "relative", "file-url":
+	default:
+		return errors.New("linked file source is invalid")
+	}
+	if (req.Line != nil && req.GetLine() == 0) ||
+		(req.EndLine != nil && req.GetEndLine() == 0) ||
+		(req.Column != nil && req.GetColumn() == 0) {
+		return errors.New("linked file location is invalid")
+	}
+	if req.Line == nil && (req.EndLine != nil || req.Column != nil) {
+		return errors.New("linked file location is invalid")
+	}
+	if req.Line != nil && req.EndLine != nil && req.GetEndLine() < req.GetLine() {
+		return errors.New("linked file location is invalid")
+	}
+	return nil
+}
+
+// gitActionIsWrite 判定 git 直通请求是否为写操作：写操作受桌面端 Remote 设置
+// enable_web_git 门控，读操作（status/log/diff 等）始终放行。
+func gitActionIsWrite(action string) bool {
+	switch action {
+	case "clone", "clone_start", "clone_cancel", "clone_dismiss", "init", "switch_branch", "create_branch", "create_worktree", "stage", "stage_all", "unstage", "unstage_all", "discard", "discard_all", "add_to_gitignore", "commit", "fetch", "pull", "set_remote", "push", "delete_branch", "rename_branch", "remove_worktree", "stash_push", "stash_pop":
+		return true
+	default:
+		return false
+	}
+}
+
+// clampHistoryList 施加历史列表的分页默认值与上限。
+func clampHistoryList(req *gatewayv2.HistoryListRequest) {
+	if req == nil {
+		return
+	}
+	if req.GetPage() <= 0 {
+		req.Page = defaultHistoryListPage
+	}
+	if req.GetPageSize() <= 0 {
+		req.PageSize = defaultHistoryListPageSize
+	} else if req.GetPageSize() > maxHistoryListLimit {
+		req.PageSize = maxHistoryListLimit
+	}
+}
+
+func vetCanonicalTerminal(req *gatewayv2.TerminalRequest) error {
+	if strings.TrimSpace(req.GetConversationId()) == "" || strings.TrimSpace(req.GetRunId()) == "" {
+		return errors.New("terminal run identity requires conversation_id and run_id")
+	}
+	switch req.GetAction() {
+	case "create", "start", "read", "snapshot", "attach", "input", "resize", "rename", "close", "list", "close_project", "shell_options":
+	default:
+		return errors.New("invalid local canonical terminal action")
+	}
+	if len(req.GetData()) > 65536 || req.GetCols() > 65535 || req.GetRows() > 65535 {
+		return errors.New("terminal payload exceeds limits")
+	}
+	return nil
+}

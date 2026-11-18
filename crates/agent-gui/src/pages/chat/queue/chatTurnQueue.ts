@@ -1,0 +1,234 @@
+import type { MentionComposerDraft } from "@liveagent/ui/components/chat/MentionComposer";
+
+export type {
+  ChatQueueItemDetail,
+  ChatQueueItemSummary,
+  ChatQueueSnapshot,
+} from "@liveagent/ui/contracts/chatQueue";
+
+import type { ComposerTurnCommand } from "@liveagent/ui/lib/chat/composerCommands";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
+import type { ChatRuntimeControls, CommandSafetyMode, ExecutionMode } from "../../../lib/settings";
+import type {
+  GatewayChatRuntimeControlsEvent,
+  GatewaySelectedModelEvent,
+} from "../gateway/gatewayBridgeTypes";
+
+export { queuedChatTurnHasContent } from "@liveagent/ui/lib/chat/queuedChatTurn";
+
+export type QueuedGatewayChatRequest = {
+  requestId: string;
+  clientRequestId?: string;
+  workerId?: string;
+  queuePolicy?: "auto" | "append" | "interrupt";
+  selectedModel?: GatewaySelectedModelEvent;
+  runtimeControls?: GatewayChatRuntimeControlsEvent;
+  /** WebUI“/”指令的单轮语义；出队发送时原样交给 sendChat。 */
+  composerCommand?: ComposerTurnCommand;
+};
+
+export type QueuedChatTurn = {
+  id: string;
+  conversationId: string;
+  draft: MentionComposerDraft;
+  uploadedFiles: PendingUploadedFile[];
+  executionMode: ExecutionMode;
+  workdir: string;
+  commandSafetyMode: CommandSafetyMode;
+  runtimeControls: ChatRuntimeControls;
+  createdAt: number;
+  gatewayRequest?: QueuedGatewayChatRequest;
+};
+
+export type QueuedChatTurnInput = Omit<QueuedChatTurn, "createdAt" | "id"> & {
+  createdAt?: number;
+  id?: string;
+};
+
+export type QueuedChatTurnEditSlot = {
+  conversationId: string;
+  previousId: string | null;
+  nextId: string | null;
+  index?: number;
+};
+
+export function createQueuedChatTurn(input: QueuedChatTurnInput): QueuedChatTurn {
+  const createdAt = input.createdAt ?? Date.now();
+  return {
+    id: input.id?.trim() || `queued-chat-${createdAt}-${Math.random().toString(36).slice(2, 8)}`,
+    conversationId: input.conversationId.trim(),
+    draft: input.draft,
+    uploadedFiles: input.uploadedFiles.slice(),
+    executionMode: input.executionMode,
+    workdir: input.workdir.trim(),
+    commandSafetyMode: input.commandSafetyMode,
+    runtimeControls: { ...input.runtimeControls },
+    createdAt,
+    gatewayRequest: input.gatewayRequest ? { ...input.gatewayRequest } : undefined,
+  };
+}
+
+/**
+ * 编辑排队的 WebUI 轮次后保存：正文改过就去掉原来的“/”指令语义（goal set/resume、
+ * 提示词指令），按普通消息发送，避免改了文字仍执行旧目标或把普通文本当模板展开。
+ * 正文未变时原样保留。
+ */
+export function gatewayRequestAfterQueuedEdit(
+  request: QueuedGatewayChatRequest | undefined,
+  originalText: string,
+  editedText: string,
+): QueuedGatewayChatRequest | undefined {
+  if (!request?.composerCommand || originalText.trim() === editedText.trim()) return request;
+  const { composerCommand: _dropped, ...rest } = request;
+  return rest;
+}
+
+export function buildQueuedChatTurnPreview(draft: MentionComposerDraft) {
+  const parts = draft.segments.map((segment) => {
+    switch (segment.type) {
+      case "largePaste":
+        return segment.paste.label;
+      case "skillMention":
+        return `/${segment.skill.name}`;
+      case "commitMention":
+        return segment.commit.subject || segment.commit.shortSha || segment.commit.sha;
+      case "gitFileMention":
+        return segment.file.path;
+      case "conversationMention":
+        return segment.conversation.title;
+      case "codeMention":
+        return `${segment.reference.path}:${segment.reference.startLine}~${segment.reference.endLine}`;
+      case "fileMention":
+        return segment.reference.path;
+      case "text":
+        return segment.text;
+    }
+    return "";
+  });
+  return parts.join("").replace(/\s+/g, " ").trim() || draft.text.replace(/\s+/g, " ").trim();
+}
+
+function withoutTurn(queue: readonly QueuedChatTurn[], id: string) {
+  const key = id.trim();
+  return queue.filter((item) => item.id !== key);
+}
+
+export function appendQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  item: QueuedChatTurn,
+): QueuedChatTurn[] {
+  return [...withoutTurn(queue, item.id), item];
+}
+
+export function prependQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  item: QueuedChatTurn,
+): QueuedChatTurn[] {
+  return [item, ...withoutTurn(queue, item.id)];
+}
+
+export function resolveQueuedChatTurnSlotIndex(
+  queue: readonly QueuedChatTurn[],
+  slot: QueuedChatTurnEditSlot,
+) {
+  const compactQueue = queue.slice();
+  const nextIndex = slot.nextId ? compactQueue.findIndex((item) => item.id === slot.nextId) : -1;
+  if (nextIndex >= 0) return nextIndex;
+
+  const previousIndex = slot.previousId
+    ? compactQueue.findIndex((item) => item.id === slot.previousId)
+    : -1;
+  if (previousIndex >= 0) return previousIndex + 1;
+
+  if (Number.isInteger(slot.index) && slot.index !== undefined && slot.index >= 0) {
+    let scopedIndex = 0;
+    let lastConversationIndex = -1;
+    for (let index = 0; index < compactQueue.length; index += 1) {
+      if (compactQueue[index]?.conversationId !== slot.conversationId) continue;
+      if (scopedIndex >= slot.index) return index;
+      scopedIndex += 1;
+      lastConversationIndex = index;
+    }
+    if (lastConversationIndex >= 0) return lastConversationIndex + 1;
+  }
+
+  const firstConversationIndex = compactQueue.findIndex(
+    (item) => item.conversationId === slot.conversationId,
+  );
+  if (firstConversationIndex >= 0) return firstConversationIndex;
+  return compactQueue.length;
+}
+
+export function insertQueuedChatTurnAtSlot(
+  queue: readonly QueuedChatTurn[],
+  item: QueuedChatTurn,
+  slot: QueuedChatTurnEditSlot,
+): QueuedChatTurn[] {
+  const next = withoutTurn(queue, item.id);
+  const index = resolveQueuedChatTurnSlotIndex(next, slot);
+  return [...next.slice(0, index), item, ...next.slice(index)];
+}
+
+export function removeQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  id: string,
+): QueuedChatTurn[] {
+  return withoutTurn(queue, id);
+}
+
+export function removeQueuedChatTurnsForConversation(
+  queue: readonly QueuedChatTurn[],
+  conversationId: string,
+): QueuedChatTurn[] {
+  const key = conversationId.trim();
+  if (!key) return queue.slice();
+  return queue.filter((item) => item.conversationId !== key);
+}
+
+export function moveQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  id: string,
+  direction: "up" | "down",
+): QueuedChatTurn[] {
+  const key = id.trim();
+  const index = queue.findIndex((item) => item.id === key);
+  if (index < 0) return queue.slice();
+  const item = queue[index];
+  let swapIndex = index;
+  while (true) {
+    swapIndex = direction === "up" ? swapIndex - 1 : swapIndex + 1;
+    if (swapIndex < 0 || swapIndex >= queue.length) return queue.slice();
+    if (queue[swapIndex]?.conversationId === item?.conversationId) break;
+  }
+  if (swapIndex < 0 || swapIndex >= queue.length) return queue.slice();
+  const next = queue.slice();
+  [next[index], next[swapIndex]] = [next[swapIndex], next[index]];
+  return next;
+}
+
+export function promoteQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  id: string,
+): QueuedChatTurn[] {
+  const key = id.trim();
+  const item = queue.find((candidate) => candidate.id === key);
+  if (!item) return queue.slice();
+  return prependQueuedChatTurn(queue, item);
+}
+
+export function takeNextQueuedChatTurn(
+  queue: readonly QueuedChatTurn[],
+  conversationId: string,
+): { item: QueuedChatTurn | null; queue: QueuedChatTurn[] } {
+  const key = conversationId.trim();
+  if (!key) return { item: null, queue: queue.slice() };
+  const index = queue.findIndex((item) => item.conversationId === key);
+  if (index < 0) return { item: null, queue: queue.slice() };
+  const next = queue.slice();
+  const [item] = next.splice(index, 1);
+  return { item: item ?? null, queue: next };
+}
+
+export function getQueuedConversationIds(queue: readonly QueuedChatTurn[]) {
+  return Array.from(new Set(queue.map((item) => item.conversationId).filter(Boolean)));
+}

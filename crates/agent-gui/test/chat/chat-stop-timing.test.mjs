@@ -1,0 +1,890 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
+
+function createHookHarness() {
+  const refs = [];
+  const states = [];
+  const effects = [];
+  let refIndex = 0;
+  let stateIndex = 0;
+  let effectIndex = 0;
+
+  const react = {
+    useRef(initialValue) {
+      const index = refIndex++;
+      refs[index] ??= { current: initialValue };
+      return refs[index];
+    },
+    useState(initialValue) {
+      const index = stateIndex++;
+      if (!(index in states)) {
+        states[index] = typeof initialValue === "function" ? initialValue() : initialValue;
+      }
+      const setState = (next) => {
+        states[index] = typeof next === "function" ? next(states[index]) : next;
+      };
+      return [states[index], setState];
+    },
+    useCallback(callback) {
+      return callback;
+    },
+    useMemo(factory) {
+      return factory();
+    },
+    useSyncExternalStore(_subscribe, getSnapshot) {
+      return getSnapshot();
+    },
+    useEffect(effect, deps = []) {
+      const index = effectIndex++;
+      const previous = effects[index];
+      const changed =
+        !previous ||
+        deps.length !== previous.deps.length ||
+        deps.some((value, depIndex) => value !== previous.deps[depIndex]);
+      if (!changed) return;
+      previous?.cleanup?.();
+      effects[index] = { deps: [...deps], cleanup: effect() };
+    },
+  };
+
+  return {
+    react,
+    render(run) {
+      refIndex = 0;
+      stateIndex = 0;
+      effectIndex = 0;
+      return run();
+    },
+    cleanup() {
+      for (const effect of effects) {
+        effect?.cleanup?.();
+      }
+    },
+  };
+}
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+async function flushPromises() {
+  await Promise.resolve();
+  await new Promise((resolve) => setImmediate(resolve));
+}
+
+/**
+ * Per-conversation live transcript stores, matching
+ * useLiveTranscriptController: every conversation owns its own store, so a
+ * stub returning one shared object would hide cross-conversation leakage.
+ */
+function createLiveTranscriptStoreStub() {
+  const stores = new Map();
+  return (conversationId) => {
+    const key = String(conversationId ?? "").trim();
+    const existing = stores.get(key);
+    if (existing) return existing;
+    const created = { conversationId: key };
+    stores.set(key, created);
+    return created;
+  };
+}
+
+test("a stop intent aborts a controller and handler registered later", () => {
+  const hookHarness = createHookHarness();
+  const loader = createTsModuleLoader({
+    mocks: {
+      react: hookHarness.react,
+      "../../../lib/chat/conversation/conversationState": {
+        createConversationStateFromContext(value) {
+          return value;
+        },
+      },
+      "../runtime/chatPageRuntime": {
+        createConversationRuntimeEntry(value) {
+          return {
+            compactionStatus: "idle",
+            isSending: false,
+            errorMessage: null,
+            hookWarning: null,
+            workdir: "",
+            selectedModel: undefined,
+            ...value,
+          };
+        },
+        setConversationRuntimeCacheEntry(cache, key, value) {
+          cache.set(key, value);
+        },
+      },
+    },
+  });
+  const { useChatPageRuntimeStore } = loader.loadModule(
+    "src/pages/chat/hooks/useChatPageRuntimeStore.ts",
+  );
+  const state = { meta: { tools: [] }, messages: [] };
+  const noop = () => undefined;
+  const runtime = hookHarness.render(() =>
+    useChatPageRuntimeStore({
+      initialConversation: {
+        conversationId: "conversation-1",
+        sessionId: "session-1",
+        createdAt: 1,
+      },
+      initialConversationState: state,
+      currentConversationId: "conversation-1",
+      conversationState: state,
+      compactionStatus: "idle",
+      isSending: false,
+      errorMessage: null,
+      hookWarning: null,
+      setConversationState: noop,
+      setCompactionStatus: noop,
+      setIsSending: noop,
+      setErrorMessage: noop,
+      setHookWarning: noop,
+      setRunningConversationIds: noop,
+    }),
+  );
+
+  assert.equal(runtime.requestConversationStop("conversation-1"), false);
+  const controller = new AbortController();
+  runtime.setConversationAbortController("conversation-1", controller);
+  assert.equal(controller.signal.aborted, true);
+
+  const handlerCalls = [];
+  const firstHandler = (options) => {
+    handlerCalls.push(options);
+  };
+  runtime.setConversationStopHandler("conversation-1", firstHandler);
+  assert.deepEqual(handlerCalls, [{ force: false, requestVersion: 1 }]);
+
+  const replacementHandlerCalls = [];
+  const replacementHandler = (options) => {
+    replacementHandlerCalls.push(options);
+  };
+  runtime.setConversationStopHandler("conversation-1", replacementHandler);
+  runtime.clearConversationStopHandler("conversation-1", firstHandler);
+  assert.equal(runtime.requestConversationStop("conversation-1"), true);
+  assert.equal(
+    runtime.requestActiveConversationStop("conversation-1", { force: true }),
+    true,
+  );
+  assert.deepEqual(replacementHandlerCalls, [
+    { force: false, requestVersion: 1 },
+    { force: true, requestVersion: 2 },
+  ]);
+  assert.equal(runtime.consumeConversationStop("conversation-1", 1), false);
+  assert.equal(runtime.isConversationStopRequested("conversation-1"), true);
+  assert.equal(runtime.consumeConversationStop("conversation-1", 2), true);
+  hookHarness.cleanup();
+});
+
+test("a direct queue stop pauses processing until composer Stop resumes it", async () => {
+  const hookHarness = createHookHarness();
+  const sendGate = deferred();
+  const sendCalls = [];
+  const stopRequests = new Set();
+  const activeStopOptions = [];
+  const controllerWrites = [];
+  const sendingStateWrites = [];
+  const toolStatusWrites = [];
+  const liveTranscriptStores = createLiveTranscriptStoreStub();
+  let stopRequestVersion = 0;
+  let draftText = "first queued turn";
+  const composer = {
+    getDraft() {
+      return {
+        text: draftText,
+        isEmpty: false,
+        segments: [{ type: "text", text: draftText }],
+      };
+    },
+    clear() {},
+    focus() {},
+  };
+
+  const loader = createTsModuleLoader({
+    mocks: {
+      react: hookHarness.react,
+      "@tauri-apps/api/core": {
+        async invoke() {
+          return undefined;
+        },
+      },
+      "@tauri-apps/api/event": {
+        async listen() {
+          return () => undefined;
+        },
+      },
+      "../../../lib/settings": {
+        isAgentExecutionMode() {
+          return false;
+        },
+        normalizeChatRuntimeControls(value) {
+          return value ?? {};
+        },
+        normalizeSystemToolSelection(value) {
+          return Array.isArray(value) ? value : [];
+        },
+      },
+      "../../../lib/tools/askUserQuestionTools": {
+        answerAskUserQuestion() {
+          return { ok: false, message: "not pending" };
+        },
+      },
+      "../composer/composerDraftText": {
+        createTextComposerDraft(text, referencedConversations = []) {
+          return {
+            text,
+            isEmpty: !text.trim(),
+            segments: [{ type: "text", text }],
+            conversationMentions: referencedConversations,
+          };
+        },
+      },
+      "../gateway/gatewayBridgeTypes": {
+        gatewayComposerTurnCommand() {
+          return undefined;
+        },
+        normalizeGatewayCommandSafetyMode(value) {
+          return value === "sandboxOffline" ? value : undefined;
+        },
+        normalizeGatewayExecutionMode(value) {
+          return value;
+        },
+        normalizeGatewayWorkdir(value) {
+          return value;
+        },
+      },
+    },
+  });
+  const { useChatTurnQueue } = loader.loadModule(
+    "src/pages/chat/queue/useChatTurnQueue.ts",
+  );
+
+  const queue = hookHarness.render(() =>
+    useChatTurnQueue({
+      settings: {
+        system: {
+          executionMode: "chat",
+          workdir: "",
+          commandSafetyMode: "sandboxOffline",
+        },
+        chatRuntimeControls: {},
+      },
+      currentConversationId: "conversation-1",
+      currentConversationIdRef: { current: "conversation-1" },
+      conversationRuntimeCacheRef: { current: new Map() },
+      buildRuntimeEntryFromVisibleState() {
+        return { workdir: "" };
+      },
+      isConversationRunning() {
+        return false;
+      },
+      runningConversationIds: new Set(),
+      getConversationAbortController() {
+        return null;
+      },
+      setConversationAbortController(conversationId, controller) {
+        controllerWrites.push({ conversationId, controller });
+      },
+      setConversationSendingState(conversationId, value) {
+        sendingStateWrites.push({ conversationId, value });
+      },
+      requestConversationStop(conversationId) {
+        stopRequestVersion += 1;
+        const alreadyRequested = stopRequests.has(conversationId);
+        stopRequests.add(conversationId);
+        return alreadyRequested;
+      },
+      getConversationStopRequestVersion() {
+        return stopRequestVersion;
+      },
+      isConversationStopRequested(conversationId) {
+        return stopRequests.has(conversationId);
+      },
+      consumeConversationStop(conversationId) {
+        return stopRequests.delete(conversationId);
+      },
+      hasConversationStopHandler: () => false,
+      requestActiveConversationStop(_conversationId, options) {
+        activeStopOptions.push(options);
+        return true;
+      },
+      getConversationLiveTranscriptStore: liveTranscriptStores,
+      captureAbortSnapshot() {},
+      updateToolStatus(status, store) {
+        toolStatusWrites.push({ status, conversationId: store?.conversationId });
+      },
+      composerRef: { current: composer },
+      pendingUploadedFiles: [],
+      setPendingUploadsForConversation() {},
+      clearCachedComposerDraft() {},
+      displayedConversationWorkdir: "",
+      sendActionRef: {
+        current: async (overrides) => {
+          sendCalls.push(overrides);
+          return sendGate.promise;
+        },
+      },
+    }),
+  );
+
+  assert.equal(queue.enqueueCurrentComposerTurn("end"), true);
+  draftText = "second queued turn";
+  assert.equal(queue.enqueueCurrentComposerTurn("end"), true);
+  queue.requestQueuedChatTurnProcessing("conversation-1");
+  await flushPromises();
+  assert.equal(sendCalls.length, 1);
+  assert.equal(
+    sendCalls[0].commandSafetyModeOverride,
+    "sandboxOffline",
+    "a queued local turn must snapshot the selected sandbox mode",
+  );
+
+  queue.stopConversation("conversation-1");
+  queue.stopConversation("conversation-1");
+  assert.deepEqual(activeStopOptions, [{ force: false }, { force: true }]);
+  assert.deepEqual(controllerWrites, [
+    { conversationId: "conversation-1", controller: null },
+  ]);
+  assert.deepEqual(sendingStateWrites, [
+    { conversationId: "conversation-1", value: false },
+  ]);
+  // Stop-side tool status must be written to the stopping conversation's own
+  // transcript store, never a shared one.
+  assert.ok(toolStatusWrites.length > 0);
+  for (const write of toolStatusWrites) {
+    assert.equal(write.conversationId, "conversation-1");
+  }
+  stopRequests.delete("conversation-1");
+  sendGate.resolve(true);
+  await flushPromises();
+  await flushPromises();
+
+  assert.equal(sendCalls.length, 1, "the second queued turn must remain paused after Stop");
+  assert.equal(queue.queuedChatTurnsRef.current.length, 1);
+
+  queue.stopSending();
+  await flushPromises();
+
+  assert.equal(sendCalls.length, 2, "composer Stop must continue with the queued turn");
+  assert.equal(sendCalls[1].commandSafetyModeOverride, "sandboxOffline");
+  assert.equal(queue.queuedChatTurnsRef.current.length, 0);
+
+  // A gateway request parked in the GUI queue must retain the remote mode on
+  // both the queued send and the reconstructed bridge request.
+  assert.equal(
+    await queue.enqueueGatewayChatRequest(
+      {
+        requestId: "gateway-request-sandbox",
+        clientRequestId: "gateway-client-sandbox",
+        request: {
+          requestId: "gateway-request-sandbox",
+          clientRequestId: "gateway-client-sandbox",
+          conversationId: "conversation-1",
+          message:
+            "use [conversation: Earlier investigation](conversation:conversation-source)",
+          referencedConversations: [
+            { id: "conversation-source", title: "Earlier investigation" },
+          ],
+          executionMode: "tools",
+          commandSafetyMode: "sandboxOffline",
+          queuePolicy: "append",
+        },
+      },
+      "conversation-1",
+    ),
+    true,
+  );
+  queue.requestQueuedChatTurnProcessing("conversation-1");
+  await flushPromises();
+  await flushPromises();
+  const gatewaySend = sendCalls.at(-1);
+  assert.equal(gatewaySend.commandSafetyModeOverride, "sandboxOffline");
+  assert.equal(
+    gatewaySend.gatewayBridgeRequestOverride.commandSafetyModeOverride,
+    "sandboxOffline",
+  );
+  assert.deepEqual(gatewaySend.composerDraftOverride.conversationMentions, [
+    { id: "conversation-source", title: "Earlier investigation" },
+  ]);
+  hookHarness.cleanup();
+});
+
+test("K-brain native queue subscribes to Gateway queue answers", async () => {
+  const hookHarness = createHookHarness();
+  const listeners = new Map();
+  const responses = [];
+  const answerCalls = [];
+  const loader = createTsModuleLoader({
+    mocks: {
+      react: hookHarness.react,
+      [new URL("../../src/lib/host.ts", import.meta.url).pathname]: {
+        isKBrainBackendEnabled() {
+          return true;
+        },
+        isTauriHost() {
+          return true;
+        },
+        isKBrainBrowserHost() {
+          return false;
+        },
+      },
+      "@tauri-apps/api/core": {
+        async invoke(command, args) {
+          if (command === "gateway_chat_queue_respond") {
+            responses.push(args);
+          }
+          return undefined;
+        },
+      },
+      "@tauri-apps/api/event": {
+        async listen(eventName, callback) {
+          listeners.set(eventName, callback);
+          return () => listeners.delete(eventName);
+        },
+      },
+      "../../../lib/settings": {
+        isAgentExecutionMode() {
+          return false;
+        },
+        normalizeChatRuntimeControls(value) {
+          return value ?? {};
+        },
+        normalizeSystemToolSelection(value) {
+          return Array.isArray(value) ? value : [];
+        },
+      },
+      "../../../lib/tools/askUserQuestionTools": {
+        answerAskUserQuestion(toolCallId, answers, options) {
+          answerCalls.push({ toolCallId, answers, options });
+          if (options.conversationId !== "conversation-owner") {
+            return { ok: false, message: "Question belongs to a different conversation." };
+          }
+          return { ok: true };
+        },
+      },
+      "../composer/composerDraftText": {
+        createTextComposerDraft(text) {
+          return { text, isEmpty: !text.trim(), segments: [{ type: "text", text }] };
+        },
+      },
+      "../gateway/gatewayBridgeTypes": {
+        gatewayComposerTurnCommand() {
+          return undefined;
+        },
+        normalizeGatewayExecutionMode(value) {
+          return value;
+        },
+        normalizeGatewayWorkdir(value) {
+          return value;
+        },
+      },
+    },
+  });
+  const { useChatTurnQueue } = loader.loadModule(
+    "src/pages/chat/queue/useChatTurnQueue.ts",
+  );
+
+  hookHarness.render(() =>
+    useChatTurnQueue({
+      settings: {
+        system: { executionMode: "chat", workdir: "", selectedSystemTools: [] },
+        chatRuntimeControls: {},
+      },
+      currentConversationId: "conversation-owner",
+      currentConversationIdRef: { current: "conversation-owner" },
+      conversationRuntimeCacheRef: { current: new Map() },
+      buildRuntimeEntryFromVisibleState() {
+        return { workdir: "" };
+      },
+      isConversationRunning() {
+        return false;
+      },
+      runningConversationIds: new Set(),
+      getConversationAbortController() {
+        return null;
+      },
+      setConversationAbortController() {},
+      setConversationSendingState() {},
+      requestConversationStop() {
+        return false;
+      },
+      getConversationStopRequestVersion() {
+        return 0;
+      },
+      isConversationStopRequested() {
+        return false;
+      },
+      consumeConversationStop() {
+        return false;
+      },
+      hasConversationStopHandler: () => false,
+      requestActiveConversationStop() {
+        return false;
+      },
+      getConversationLiveTranscriptStore: createLiveTranscriptStoreStub(),
+      captureAbortSnapshot() {},
+      updateToolStatus() {},
+      composerRef: { current: null },
+      pendingUploadedFiles: [],
+      setPendingUploadsForConversation() {},
+      clearCachedComposerDraft() {},
+      displayedConversationWorkdir: "",
+      sendActionRef: { current: async () => true },
+    }),
+  );
+
+  await flushPromises();
+  assert.equal(listeners.has("gateway:chat-queue-request"), true);
+  assert.deepEqual(responses, []);
+  assert.deepEqual(answerCalls, []);
+
+  hookHarness.cleanup();
+});
+
+test("slow chat finalization cannot delay synchronous UI release", async () => {
+  const loader = createTsModuleLoader();
+  const { releaseChatRunUi, settleChatRunFinalization } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  const gate = deferred();
+  const released = [];
+
+  releaseChatRunUi({
+    clearAbortController() {
+      released.push("controller");
+    },
+    clearSendingState() {
+      released.push("sending");
+    },
+    clearToolStatus() {
+      released.push("tool");
+    },
+  });
+  const settling = settleChatRunFinalization(gate.promise, 20);
+
+  assert.deepEqual(released, ["controller", "sending", "tool"]);
+  assert.equal(await settling, "timed_out");
+  gate.resolve();
+});
+
+test("finalization flushes the gateway stream only after history persists", async () => {
+  const loader = createTsModuleLoader();
+  const { finalizeChatRunInOrder } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  const persistGate = deferred();
+  const closeGate = deferred();
+  const events = [];
+
+  const finalization = finalizeChatRunInOrder({
+    waitForPersistBarrier: async () => {
+      events.push("persist:start");
+      await persistGate.promise;
+      events.push("persist:done");
+    },
+    closeBridge: async () => {
+      events.push("close:start");
+      await closeGate.promise;
+      events.push("close:done");
+    },
+    finishRuntimeRun: async () => {
+      events.push("finish");
+    },
+  });
+  await flushPromises();
+
+  // The 26f2561 invariant: the stream close / terminal snapshot must never
+  // overtake history persistence, or a WebUI client can hydrate a truncated
+  // conversation.
+  assert.deepEqual(events, ["persist:start"], "flushes must wait for the persist barrier");
+
+  persistGate.resolve();
+  await flushPromises();
+  assert.deepEqual(
+    events,
+    ["persist:start", "persist:done", "close:start"],
+    "terminal checkpoint must wait for the final delta flush",
+  );
+  closeGate.resolve();
+  await finalization;
+  assert.deepEqual(events, ["persist:start", "persist:done", "close:start", "close:done", "finish"]);
+});
+
+test("a failing persist barrier still lets the finalization flushes run", async () => {
+  const loader = createTsModuleLoader();
+  const { finalizeChatRunInOrder } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  const events = [];
+
+  await finalizeChatRunInOrder({
+    waitForPersistBarrier: async () => {
+      throw new Error("persist failed");
+    },
+    closeBridge: async () => {
+      events.push("close");
+    },
+    finishRuntimeRun: async () => {
+      events.push("finish");
+    },
+  });
+
+  assert.deepEqual(events, ["close", "finish"]);
+});
+
+test("terminal history persistence marks both false results and thrown errors", async () => {
+  const loader = createTsModuleLoader();
+  const { trackTerminalHistoryPersist } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  let failures = 0;
+  const noRetry = { maxAttempts: 1, retryDelayMs: 0 };
+
+  assert.equal(
+    await trackTerminalHistoryPersist(
+      async () => false,
+      () => {
+        failures += 1;
+      },
+      noRetry,
+    ),
+    false,
+  );
+  await assert.rejects(
+    trackTerminalHistoryPersist(
+      async () => {
+        throw new Error("history database unavailable");
+      },
+      () => {
+        failures += 1;
+      },
+      noRetry,
+    ),
+    /history database unavailable/,
+  );
+  assert.equal(failures, 2);
+});
+
+test("a stopped new conversation keeps its sidebar row once the user turn persisted (#945)", async () => {
+  const loader = createTsModuleLoader();
+  const { shouldKeepPendingRowAfterAbort } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+
+  assert.equal(await shouldKeepPendingRowAfterAbort(null), false);
+  assert.equal(await shouldKeepPendingRowAfterAbort(Promise.resolve(true)), true);
+  assert.equal(await shouldKeepPendingRowAfterAbort(Promise.resolve(false)), false);
+  assert.equal(
+    await shouldKeepPendingRowAfterAbort(Promise.reject(new Error("history database unavailable"))),
+    false,
+  );
+
+  // 落库完成前按停止：必须等落库结果，而不是立即删除占位行。
+  let resolvePersist;
+  const pending = new Promise((resolve) => {
+    resolvePersist = resolve;
+  });
+  let settled = false;
+  const decision = shouldKeepPendingRowAfterAbort(pending).then((keep) => {
+    settled = true;
+    return keep;
+  });
+  await Promise.resolve();
+  assert.equal(settled, false);
+  resolvePersist(true);
+  assert.equal(await decision, true);
+});
+
+test("terminal history persistence retries transient failures before succeeding", async () => {
+  const loader = createTsModuleLoader();
+  const { persistTerminalHistoryWithRetry, trackTerminalHistoryPersist } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  const attempts = [];
+  const sleeps = [];
+
+  const persisted = await persistTerminalHistoryWithRetry(
+    async () => {
+      attempts.push("try");
+      if (attempts.length < 3) {
+        throw new Error(`transient-${attempts.length}`);
+      }
+      return true;
+    },
+    {
+      maxAttempts: 3,
+      retryDelayMs: 5,
+      sleep: async (ms) => {
+        sleeps.push(ms);
+      },
+    },
+  );
+
+  assert.equal(persisted, true);
+  assert.equal(attempts.length, 3);
+  assert.deepEqual(sleeps, [5, 10]);
+
+  let failures = 0;
+  let tries = 0;
+  assert.equal(
+    await trackTerminalHistoryPersist(
+      async () => {
+        tries += 1;
+        return tries >= 2;
+      },
+      () => {
+        failures += 1;
+      },
+      {
+        maxAttempts: 3,
+        retryDelayMs: 0,
+      },
+    ),
+    true,
+  );
+  assert.equal(tries, 2);
+  assert.equal(failures, 0);
+});
+
+test("terminal history persistence exhausts retries then marks failure", async () => {
+  const loader = createTsModuleLoader();
+  const { trackTerminalHistoryPersist } = loader.loadModule(
+    "src/pages/chat/runtime/chatRunFinalization.ts",
+  );
+  let failures = 0;
+  let tries = 0;
+
+  await assert.rejects(
+    trackTerminalHistoryPersist(
+      async () => {
+        tries += 1;
+        throw new Error("still busy");
+      },
+      () => {
+        failures += 1;
+      },
+      {
+        maxAttempts: 3,
+        retryDelayMs: 0,
+      },
+    ),
+    /still busy/,
+  );
+  assert.equal(tries, 3);
+  assert.equal(failures, 1);
+});
+
+function loadQueueForSettleTest(hookHarness) {
+  const loader = createTsModuleLoader({
+    mocks: {
+      react: hookHarness.react,
+      "@tauri-apps/api/core": { async invoke() {} },
+      "@tauri-apps/api/event": { async listen() { return () => undefined; } },
+      "../../../lib/settings": {
+        isAgentExecutionMode: () => false,
+        normalizeChatRuntimeControls: (value) => value ?? {},
+        normalizeSystemToolSelection: (value) => (Array.isArray(value) ? value : []),
+      },
+      "../../../lib/tools/askUserQuestionTools": {
+        answerAskUserQuestion: () => ({ ok: false, message: "not pending" }),
+      },
+      "../composer/composerDraftText": {
+        createTextComposerDraft: (text) => ({ text, isEmpty: !text.trim(), segments: [{ type: "text", text }] }),
+      },
+      "../gateway/gatewayBridgeTypes": {
+        gatewayComposerTurnCommand: () => undefined,
+        normalizeGatewayCommandSafetyMode: (value) => value,
+        normalizeGatewayExecutionMode: (value) => value,
+        normalizeGatewayWorkdir: (value) => value,
+      },
+    },
+  });
+  return loader.loadModule("src/pages/chat/queue/useChatTurnQueue.ts").useChatTurnQueue;
+}
+
+function renderSettleQueue(hookHarness, state) {
+  const useChatTurnQueue = loadQueueForSettleTest(hookHarness);
+  return hookHarness.render(() =>
+    useChatTurnQueue({
+      settings: { system: { executionMode: "chat", workdir: "", commandSafetyMode: "sandboxOffline" }, chatRuntimeControls: {} },
+      currentConversationId: "conversation-1",
+      currentConversationIdRef: { current: "conversation-1" },
+      conversationRuntimeCacheRef: { current: new Map() },
+      buildRuntimeEntryFromVisibleState: () => ({ workdir: "" }),
+      isConversationRunning: () => state.running,
+      runningConversationIds: new Set(),
+      getConversationAbortController: () => null,
+      setConversationAbortController() {},
+      setConversationSendingState() {},
+      requestConversationStop: () => false,
+      getConversationStopRequestVersion: () => 0,
+      isConversationStopRequested: () => state.stopRequested,
+      consumeConversationStop: () => true,
+      hasConversationStopHandler: () => state.previousRunAlive,
+      requestActiveConversationStop: () => true,
+      getConversationLiveTranscriptStore: createLiveTranscriptStoreStub(),
+      captureAbortSnapshot() {},
+      updateToolStatus() {},
+      composerRef: {
+        current: {
+          getDraft: () => ({ text: "queued", isEmpty: false, segments: [{ type: "text", text: "queued" }] }),
+          clear() {},
+          focus() {},
+        },
+      },
+      pendingUploadedFiles: [],
+      setPendingUploadsForConversation() {},
+      clearCachedComposerDraft() {},
+      displayedConversationWorkdir: "",
+      sendActionRef: {
+        current: async (overrides) => {
+          state.sends.push(overrides);
+          return true;
+        },
+      },
+    }),
+  );
+}
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+test("a queued turn waits for a force-stopped run to finish settling before it sends", async () => {
+  const hookHarness = createHookHarness();
+  const state = { running: false, stopRequested: false, previousRunAlive: true, sends: [] };
+  const queue = renderSettleQueue(hookHarness, state);
+  assert.equal(queue.enqueueCurrentComposerTurn("end"), true);
+  queue.requestQueuedChatTurnProcessing("conversation-1");
+  await sleep(350);
+  assert.equal(state.sends.length, 0, "the interrupted run still owns the live transcript");
+  assert.equal(queue.queuedChatTurnsRef.current.length, 1, "the turn stays at the head of the queue");
+  state.previousRunAlive = false;
+  await sleep(250);
+  assert.equal(state.sends.length, 1);
+  assert.equal(queue.queuedChatTurnsRef.current.length, 0);
+  hookHarness.cleanup();
+});
+
+test("stopping again while the previous run settles keeps the queued turn", async () => {
+  const hookHarness = createHookHarness();
+  const state = { running: false, stopRequested: false, previousRunAlive: true, sends: [] };
+  const queue = renderSettleQueue(hookHarness, state);
+  assert.equal(queue.enqueueCurrentComposerTurn("end"), true);
+  queue.requestQueuedChatTurnProcessing("conversation-1");
+  await sleep(150);
+  queue.stopConversation("conversation-1");
+  state.previousRunAlive = false;
+  await sleep(250);
+  assert.equal(state.sends.length, 0);
+  assert.equal(queue.queuedChatTurnsRef.current.length, 1);
+  hookHarness.cleanup();
+});

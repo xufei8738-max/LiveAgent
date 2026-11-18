@@ -1,0 +1,1950 @@
+import {
+  DEFAULT_WORKSPACE_PROJECT_ID,
+  type WorkspaceProject,
+  workspaceProjectPathKey,
+} from "@liveagent/app/lib/settings";
+import {
+  Archive,
+  ArchiveRestore,
+  Check,
+  ChevronRight,
+  Columns2,
+  Folder,
+  FolderClosed,
+  FolderOpen,
+  FolderTree,
+  GitBranch,
+  ListChecks,
+  Loader2,
+  MessageSquare,
+  MoreHorizontal,
+  Pin,
+  PinOff,
+  Settings,
+  Share2,
+  SquarePen,
+  Trash2,
+  X,
+} from "@liveagent/ui/components/IconSet";
+import { Button } from "@liveagent/ui/components/ui/button";
+import { ContextMenuPopup } from "@liveagent/ui/components/ui/context-menu";
+import {
+  Dialog,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@liveagent/ui/components/ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
+} from "@liveagent/ui/components/ui/dropdown-menu";
+import { Input } from "@liveagent/ui/components/ui/input";
+import { ShortcutTooltip } from "@liveagent/ui/components/ui/shortcut-tooltip";
+import { Tooltip, TooltipContent, TooltipTrigger } from "@liveagent/ui/components/ui/tooltip";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import {
+  clearActiveConversationReferenceDrag,
+  writeConversationReferenceDragPayload,
+} from "@liveagent/ui/lib/chat/conversationReferenceDrag";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import {
+  memo,
+  type DragEvent as ReactDragEvent,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+} from "react";
+import { type SidebarConversation, sameExternalRun } from "../../lib/sidebar/types";
+import type { SidebarReorderPointer } from "../../lib/sidebar/useSidebarReorderDrag";
+import type { WorkspaceProjectGroup } from "../../lib/workspaceProjectTypes";
+import { SidebarMenuAction, SidebarMenuButton } from "../ui/sidebar";
+import {
+  HISTORY_RENAME_INPUT_CLASS,
+  PROJECT_ICON_BUTTON_CLASS,
+  SIDEBAR_CONTEXT_MENU_CLASS,
+} from "./ChatHistorySidebarStyles";
+
+export type WorkspaceProjectRemoveOptions = {
+  deleteWorktree?: boolean;
+  deleteBranch?: boolean;
+};
+
+type PendingWorkspaceProjectAction = {
+  projectId: string;
+  mode: "remove" | "deleteWorktree";
+};
+
+const CONVERSATION_MENU_ITEM_CLASS = "gap-2 text-xs";
+const CONVERSATION_MENU_ICON_CLASS = "size-3.5 shrink-0";
+
+const MOBILE_MENU_LONG_PRESS_MS = 520;
+const MOBILE_MENU_MOVE_TOLERANCE_PX = 10;
+
+function SidebarDropIndicator({ position }: { position?: "before" | "after" }) {
+  if (!position) return null;
+  return (
+    <span
+      aria-hidden="true"
+      data-sidebar-drop-indicator={position}
+      className={cn(
+        "pointer-events-none absolute inset-x-3 z-20 h-0.5 bg-blue-500",
+        position === "before" ? "-top-px" : "-bottom-px",
+      )}
+    >
+      <span
+        className={cn(
+          "absolute left-0 top-1/2 size-2 -translate-x-1/2 -translate-y-1/2",
+          "rounded-full border-2 border-blue-500 bg-settings-rail",
+        )}
+      />
+    </span>
+  );
+}
+
+type HistoryRowProps = {
+  reorderKey?: string;
+  onReorderPointerDown?: (key: string, event: SidebarReorderPointer) => void;
+  isDragging?: boolean;
+  dropPosition?: "before" | "after";
+
+  showIcon?: boolean;
+  item: SidebarConversation;
+  /** Source of a branched conversation when it is loaded in the sidebar. */
+  forkSource?: { id: string; title: string } | null;
+  isActive: boolean;
+  isBusy: boolean;
+  isRunning: boolean;
+  needsApproval: boolean;
+  hasPendingQuestion: boolean;
+  /** Run finished while the user was elsewhere; cleared on open. */
+  isUnread?: boolean;
+  isDeleteDisabled: boolean;
+  canShareConversation: boolean;
+  isRenaming: boolean;
+  isPendingDelete: boolean;
+  isSelectionMode: boolean;
+  isSelected: boolean;
+  isSelectionDisabled: boolean;
+  isInteractionDisabled: boolean;
+  isMobileMenuLayout: boolean;
+  renameDraft: string;
+  onSelectConversation: (id: string) => void;
+  onStartRenaming: (item: SidebarConversation) => void;
+  onRenameDraftChange: (value: string) => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
+  onSetPinned: (id: string, isPinned: boolean) => void;
+  /** Present when the backend can archive conversations. */
+  onSetArchived?: (id: string, archived: boolean) => void;
+  onMoveToWorkspace: (id: string, cwd: string) => void;
+  moveWorkspaces: readonly WorkspaceProject[];
+  onShareConversation: (item: SidebarConversation) => void;
+  onDeleteConversation: (id: string) => void;
+  onSetPendingDelete: (id: string | null) => void;
+  onSelectForBulk: (id: string, modifiers: { shiftKey: boolean; toggleKey: boolean }) => void;
+  onEnterSelectionMode: (id: string) => void;
+  menuOpen: boolean;
+  menuSide: "bottom" | "right";
+  onMenuOpenChange: (id: string, open: boolean) => void;
+  /**
+   * Workbench pointer-drag intent from the row title area (desktop only).
+   * The drag session activates after a movement threshold, so plain clicks
+   * keep their existing select semantics.
+   */
+  onWorkbenchDragIntent?: (
+    item: SidebarConversation,
+    event: {
+      pointerId: number;
+      clientX: number;
+      clientY: number;
+      currentTarget?: EventTarget | null;
+    },
+  ) => void;
+  /** Menu alternative to dragging: open the conversation in a split pane. */
+  onOpenInWorkbenchSplit?: (item: SidebarConversation) => void;
+};
+
+function areRenderedHistoryItemsEqual(previous: SidebarConversation, next: SidebarConversation) {
+  return (
+    previous.id === next.id &&
+    previous.title === next.title &&
+    previous.providerId === next.providerId &&
+    previous.model === next.model &&
+    previous.cwd === next.cwd &&
+    previous.isPinned === next.isPinned &&
+    previous.isShared === next.isShared &&
+    previous.forkedFromSessionId === next.forkedFromSessionId &&
+    sameExternalRun(previous.externalRun, next.externalRun) &&
+    previous.isPending === next.isPending
+  );
+}
+
+function areHistoryRowPropsEqual(previous: HistoryRowProps, next: HistoryRowProps) {
+  return (
+    areRenderedHistoryItemsEqual(previous.item, next.item) &&
+    previous.forkSource?.id === next.forkSource?.id &&
+    previous.forkSource?.title === next.forkSource?.title &&
+    previous.showIcon === next.showIcon &&
+    previous.reorderKey === next.reorderKey &&
+    previous.onReorderPointerDown === next.onReorderPointerDown &&
+    previous.isDragging === next.isDragging &&
+    previous.dropPosition === next.dropPosition &&
+    previous.isActive === next.isActive &&
+    previous.isBusy === next.isBusy &&
+    previous.isRunning === next.isRunning &&
+    previous.needsApproval === next.needsApproval &&
+    previous.hasPendingQuestion === next.hasPendingQuestion &&
+    previous.isDeleteDisabled === next.isDeleteDisabled &&
+    previous.canShareConversation === next.canShareConversation &&
+    previous.isRenaming === next.isRenaming &&
+    previous.isPendingDelete === next.isPendingDelete &&
+    previous.isSelectionMode === next.isSelectionMode &&
+    previous.isSelected === next.isSelected &&
+    previous.isSelectionDisabled === next.isSelectionDisabled &&
+    previous.isInteractionDisabled === next.isInteractionDisabled &&
+    previous.isMobileMenuLayout === next.isMobileMenuLayout &&
+    previous.renameDraft === next.renameDraft &&
+    previous.menuOpen === next.menuOpen &&
+    previous.menuSide === next.menuSide &&
+    previous.onSelectConversation === next.onSelectConversation &&
+    previous.onStartRenaming === next.onStartRenaming &&
+    previous.onRenameDraftChange === next.onRenameDraftChange &&
+    previous.onCommitRename === next.onCommitRename &&
+    previous.onCancelRename === next.onCancelRename &&
+    previous.onSetPinned === next.onSetPinned &&
+    previous.onSetArchived === next.onSetArchived &&
+    previous.onMoveToWorkspace === next.onMoveToWorkspace &&
+    previous.moveWorkspaces === next.moveWorkspaces &&
+    previous.onShareConversation === next.onShareConversation &&
+    previous.onDeleteConversation === next.onDeleteConversation &&
+    previous.onSetPendingDelete === next.onSetPendingDelete &&
+    previous.onSelectForBulk === next.onSelectForBulk &&
+    previous.onEnterSelectionMode === next.onEnterSelectionMode &&
+    previous.onMenuOpenChange === next.onMenuOpenChange &&
+    previous.onWorkbenchDragIntent === next.onWorkbenchDragIntent &&
+    previous.onOpenInWorkbenchSplit === next.onOpenInWorkbenchSplit
+  );
+}
+
+export const HistoryRow = memo(function HistoryRow(props: HistoryRowProps) {
+  const {
+    item,
+    forkSource,
+    isActive,
+    isBusy,
+    isRunning,
+    needsApproval,
+    hasPendingQuestion,
+    isUnread = false,
+    isDeleteDisabled,
+    canShareConversation,
+    isRenaming,
+    isPendingDelete,
+    isSelectionMode,
+    isSelected,
+    isSelectionDisabled,
+    isInteractionDisabled,
+    isMobileMenuLayout,
+    renameDraft,
+    onSelectConversation,
+    onStartRenaming,
+    onRenameDraftChange,
+    onCommitRename,
+    onCancelRename,
+    onSetPinned,
+    onSetArchived,
+    onMoveToWorkspace,
+    moveWorkspaces,
+    onShareConversation,
+    onDeleteConversation,
+    onSetPendingDelete,
+    onSelectForBulk,
+    onEnterSelectionMode,
+    menuOpen,
+    menuSide,
+    onMenuOpenChange,
+    onWorkbenchDragIntent,
+    onOpenInWorkbenchSplit,
+  } = props;
+  const { t } = useLocale();
+  const isBranch = Boolean(item.forkedFromSessionId);
+  const branchHint = isBranch
+    ? forkSource
+      ? t("chat.conversationBranchFrom").replace("{title}", forkSource.title)
+      : t("chat.conversationBranchSourceMissing")
+    : null;
+  // Either blocked state replaces the spinner: the turn is suspended on the
+  // user, not working. Approval wins when both are pending — it is the harder
+  // block and the row has room for only one pill.
+  const blockedBadgeLabel = needsApproval
+    ? t("chat.toolApproval.sidebarStatus")
+    : hasPendingQuestion
+      ? t("chat.askUser.sidebarStatus")
+      : null;
+  const showRunningIndicator = isRunning && !blockedBadgeLabel;
+
+  const inputRef = useRef<HTMLInputElement | null>(null);
+  const titleButtonRef = useRef<HTMLButtonElement | null>(null);
+  const [contextPoint, setContextPoint] = useState<{ x: number; y: number } | null>(null);
+  // A menu opening a dialog must not reclaim the dialog's initial focus.
+  const suppressMenuReturnFocusRef = useRef(false);
+  const longPressTimerRef = useRef<number | null>(null);
+  const longPressStartRef = useRef<{ x: number; y: number } | null>(null);
+  const longPressTriggeredRef = useRef(false);
+  const longPressCancelledRef = useRef(false);
+  const [isLongPressActive, setIsLongPressActive] = useState(false);
+
+  const handleSelect = useCallback(
+    (
+      modifiers: { shiftKey: boolean; toggleKey: boolean } = {
+        shiftKey: false,
+        toggleKey: false,
+      },
+    ) => {
+      if (isInteractionDisabled) {
+        return;
+      }
+      if (isSelectionMode || modifiers.shiftKey || modifiers.toggleKey) {
+        if (!isSelectionDisabled) {
+          onSelectForBulk(item.id, modifiers);
+        }
+        return;
+      }
+      onSelectConversation(item.id);
+    },
+    [
+      isInteractionDisabled,
+      isSelectionDisabled,
+      isSelectionMode,
+      item.id,
+      onSelectConversation,
+      onSelectForBulk,
+    ],
+  );
+
+  const handleStartRenaming = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onMenuOpenChange(item.id, false);
+    setContextPoint(null);
+    onStartRenaming(item);
+  }, [isInteractionDisabled, item, onMenuOpenChange, onStartRenaming]);
+
+  const handleStartRenamingFromMenu = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    suppressMenuReturnFocusRef.current = true;
+    onMenuOpenChange(item.id, false);
+    setContextPoint(null);
+    onStartRenaming(item);
+  }, [isInteractionDisabled, item, onMenuOpenChange, onStartRenaming]);
+
+  const handleRequestDelete = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onSetPendingDelete(item.id);
+  }, [isInteractionDisabled, item.id, onSetPendingDelete]);
+
+  const handleEnterSelectionMode = useCallback(() => {
+    if (!isInteractionDisabled && !isSelectionDisabled) {
+      onEnterSelectionMode(item.id);
+    }
+  }, [isInteractionDisabled, isSelectionDisabled, item.id, onEnterSelectionMode]);
+
+  const handleTogglePinned = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onSetPinned(item.id, item.isPinned !== true);
+  }, [isInteractionDisabled, item.id, item.isPinned, onSetPinned]);
+
+  const handleArchive = useCallback(() => {
+    if (!isInteractionDisabled) onSetArchived?.(item.id, true);
+  }, [isInteractionDisabled, item.id, onSetArchived]);
+
+  const handleMoveToWorkspace = useCallback(
+    (cwd: string) => {
+      if (!isInteractionDisabled) {
+        onMoveToWorkspace(item.id, cwd);
+      }
+    },
+    [isInteractionDisabled, item.id, onMoveToWorkspace],
+  );
+
+  const handleShare = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onShareConversation(item);
+  }, [isInteractionDisabled, item, onShareConversation]);
+
+  const handleConfirmDelete = useCallback(() => {
+    onSetPendingDelete(null);
+    if (isInteractionDisabled) {
+      return;
+    }
+    onDeleteConversation(item.id);
+  }, [isInteractionDisabled, item.id, onDeleteConversation, onSetPendingDelete]);
+
+  const handleCancelDelete = useCallback(() => {
+    onSetPendingDelete(null);
+  }, [onSetPendingDelete]);
+
+  const handleMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (open && isInteractionDisabled) {
+        return;
+      }
+      setContextPoint(null);
+      onMenuOpenChange(item.id, open);
+    },
+    [isInteractionDisabled, item.id, onMenuOpenChange],
+  );
+
+  const clearLongPressTimer = useCallback(() => {
+    if (longPressTimerRef.current !== null) {
+      window.clearTimeout(longPressTimerRef.current);
+      longPressTimerRef.current = null;
+    }
+  }, []);
+
+  const resetLongPressState = useCallback(() => {
+    clearLongPressTimer();
+    longPressStartRef.current = null;
+    longPressTriggeredRef.current = false;
+    longPressCancelledRef.current = false;
+    setIsLongPressActive(false);
+  }, [clearLongPressTimer]);
+
+  const cancelLongPressGesture = useCallback(() => {
+    clearLongPressTimer();
+    longPressStartRef.current = null;
+    longPressCancelledRef.current = true;
+    setIsLongPressActive(false);
+  }, [clearLongPressTimer]);
+
+  const openMobileMenuFromLongPress = useCallback(() => {
+    clearLongPressTimer();
+
+    if (isInteractionDisabled || isSelectionMode || !isMobileMenuLayout || isBusy) {
+      setIsLongPressActive(false);
+      longPressCancelledRef.current = true;
+      return;
+    }
+
+    longPressTriggeredRef.current = true;
+    setIsLongPressActive(false);
+    onMenuOpenChange(item.id, true);
+  }, [
+    clearLongPressTimer,
+    isBusy,
+    isInteractionDisabled,
+    isSelectionMode,
+    isMobileMenuLayout,
+    item.id,
+    onMenuOpenChange,
+  ]);
+
+  const handleTitlePointerDown = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (
+        props.onReorderPointerDown &&
+        props.reorderKey &&
+        !event.altKey &&
+        !isMobileMenuLayout &&
+        !isInteractionDisabled &&
+        !isSelectionMode &&
+        !isRenaming &&
+        !isPendingDelete &&
+        !menuOpen &&
+        event.pointerType !== "touch" &&
+        event.button === 0 &&
+        !item.isPending
+      ) {
+        props.onReorderPointerDown(props.reorderKey, event);
+        return;
+      }
+      // Desktop: arm a workbench pane drag from the title area. Touch keeps
+      // the long-press menu; renaming/selection/menu states never drag.
+      if (
+        onWorkbenchDragIntent &&
+        !isMobileMenuLayout &&
+        !isInteractionDisabled &&
+        !isSelectionMode &&
+        !isRenaming &&
+        !isPendingDelete &&
+        !menuOpen &&
+        event.pointerType !== "touch" &&
+        event.button === 0 &&
+        !item.isPending
+      ) {
+        onWorkbenchDragIntent(item, {
+          pointerId: event.pointerId,
+          clientX: event.clientX,
+          clientY: event.clientY,
+          currentTarget: event.currentTarget,
+        });
+      }
+      if (isInteractionDisabled || isSelectionMode || !isMobileMenuLayout || isBusy) {
+        return;
+      }
+      if (event.pointerType === "mouse" && event.button !== 0) {
+        return;
+      }
+
+      clearLongPressTimer();
+      longPressTriggeredRef.current = false;
+      longPressCancelledRef.current = false;
+      setIsLongPressActive(true);
+      longPressStartRef.current = { x: event.clientX, y: event.clientY };
+      longPressTimerRef.current = window.setTimeout(
+        openMobileMenuFromLongPress,
+        MOBILE_MENU_LONG_PRESS_MS,
+      );
+    },
+    [
+      props.onReorderPointerDown,
+      props.reorderKey,
+      clearLongPressTimer,
+      isBusy,
+      isInteractionDisabled,
+      isPendingDelete,
+      isRenaming,
+      isSelectionMode,
+      isMobileMenuLayout,
+      item,
+      menuOpen,
+      onWorkbenchDragIntent,
+      openMobileMenuFromLongPress,
+    ],
+  );
+
+  const handleTitlePointerMove = useCallback(
+    (event: ReactPointerEvent<HTMLButtonElement>) => {
+      if (!isMobileMenuLayout || longPressStartRef.current === null) {
+        return;
+      }
+
+      const deltaX = Math.abs(event.clientX - longPressStartRef.current.x);
+      const deltaY = Math.abs(event.clientY - longPressStartRef.current.y);
+      if (deltaX > MOBILE_MENU_MOVE_TOLERANCE_PX || deltaY > MOBILE_MENU_MOVE_TOLERANCE_PX) {
+        cancelLongPressGesture();
+      }
+    },
+    [cancelLongPressGesture, isMobileMenuLayout],
+  );
+
+  const handleTitlePointerUp = useCallback(() => {
+    if (!isMobileMenuLayout || isInteractionDisabled) {
+      resetLongPressState();
+      return;
+    }
+
+    // In selection mode the click handler is the single tap path. Handling
+    // pointerup as well would toggle twice and leave the row unselected.
+    if (isSelectionMode) {
+      resetLongPressState();
+      return;
+    }
+
+    const shouldSelect = !longPressTriggeredRef.current && !longPressCancelledRef.current;
+    resetLongPressState();
+
+    if (shouldSelect && !isBusy) {
+      handleSelect();
+    }
+  }, [
+    handleSelect,
+    isBusy,
+    isInteractionDisabled,
+    isMobileMenuLayout,
+    isSelectionMode,
+    resetLongPressState,
+  ]);
+
+  const handleTitlePointerCancel = useCallback(() => {
+    if (!isMobileMenuLayout) {
+      return;
+    }
+    cancelLongPressGesture();
+  }, [cancelLongPressGesture, isMobileMenuLayout]);
+
+  const handleTitleClick = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      if (isMobileMenuLayout) {
+        // Selection mode has no long-press menu. Use the native click as the
+        // mobile fallback because some WebViews do not deliver pointerup for a tap.
+        if (isSelectionMode) {
+          if (event.detail > 1) return;
+          handleSelect({
+            shiftKey: event.shiftKey,
+            toggleKey: event.ctrlKey || event.metaKey,
+          });
+        } else {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+        return;
+      }
+      if (event.detail > 1) return;
+      handleSelect({
+        shiftKey: event.shiftKey,
+        toggleKey: event.ctrlKey || event.metaKey,
+      });
+    },
+    [handleSelect, isMobileMenuLayout, isSelectionMode],
+  );
+
+  const handleTitleKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLButtonElement>) => {
+      if (!isMobileMenuLayout) {
+        if (
+          (event.key === "ContextMenu" || (event.shiftKey && event.key === "F10")) &&
+          !isInteractionDisabled &&
+          !isSelectionMode &&
+          !isRenaming
+        ) {
+          event.preventDefault();
+          const bounds = event.currentTarget.getBoundingClientRect();
+          setContextPoint({ x: bounds.left, y: bounds.bottom });
+          onMenuOpenChange(item.id, true);
+        }
+        return;
+      }
+
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        handleSelect();
+      }
+    },
+    [
+      handleSelect,
+      isMobileMenuLayout,
+      isInteractionDisabled,
+      isSelectionMode,
+      isRenaming,
+      item.id,
+      onMenuOpenChange,
+    ],
+  );
+
+  const handleTitleContextMenu = useCallback(
+    (event: ReactMouseEvent<HTMLButtonElement>) => {
+      event.preventDefault();
+      event.stopPropagation();
+      setIsLongPressActive(false);
+      if (isMobileMenuLayout || isInteractionDisabled || isSelectionMode || isRenaming) return;
+      setContextPoint({ x: event.clientX, y: event.clientY });
+      onMenuOpenChange(item.id, true);
+    },
+    [
+      isMobileMenuLayout,
+      isInteractionDisabled,
+      isSelectionMode,
+      isRenaming,
+      item.id,
+      onMenuOpenChange,
+    ],
+  );
+
+  const handleNativeConversationDragStart = useCallback(
+    (event: ReactDragEvent<HTMLButtonElement>) => {
+      if (
+        onWorkbenchDragIntent ||
+        isInteractionDisabled ||
+        isSelectionMode ||
+        isRenaming ||
+        isPendingDelete ||
+        menuOpen ||
+        item.isPending
+      ) {
+        event.preventDefault();
+        return;
+      }
+      if (
+        !writeConversationReferenceDragPayload(event.dataTransfer, {
+          id: item.id,
+          title: item.title,
+          cwd: item.cwd,
+          updatedAt: item.updatedAt,
+        })
+      ) {
+        event.preventDefault();
+      }
+    },
+    [
+      isInteractionDisabled,
+      isPendingDelete,
+      isRenaming,
+      isSelectionMode,
+      item,
+      menuOpen,
+      onWorkbenchDragIntent,
+    ],
+  );
+
+  const shouldShowMobilePressFeedback = isMobileMenuLayout && (isLongPressActive || menuOpen);
+
+  useEffect(() => {
+    if (!isInteractionDisabled) {
+      return;
+    }
+    resetLongPressState();
+    onMenuOpenChange(item.id, false);
+  }, [isInteractionDisabled, item.id, onMenuOpenChange, resetLongPressState]);
+
+  useEffect(() => () => clearLongPressTimer(), [clearLongPressTimer]);
+
+  const menuItems = (
+    <>
+      {!item.isPending ? (
+        <DropdownMenuItem
+          disabled={isInteractionDisabled}
+          onSelect={handleTogglePinned}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          {item.isPinned ? (
+            <PinOff className={CONVERSATION_MENU_ICON_CLASS} />
+          ) : (
+            <Pin className={CONVERSATION_MENU_ICON_CLASS} />
+          )}
+          {item.isPinned ? t("chat.conversationUnpin") : t("chat.conversationPin")}
+        </DropdownMenuItem>
+      ) : null}
+      {onSetArchived && !item.isPending ? (
+        <DropdownMenuItem
+          disabled={isInteractionDisabled || isRunning || isBusy}
+          onSelect={handleArchive}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          <Archive className={CONVERSATION_MENU_ICON_CLASS} />
+          {t("chat.conversationArchive")}
+        </DropdownMenuItem>
+      ) : null}
+      <DropdownMenuItem
+        disabled={isInteractionDisabled || isRunning || isBusy}
+        onSelect={handleEnterSelectionMode}
+        className={CONVERSATION_MENU_ITEM_CLASS}
+      >
+        <ListChecks className={CONVERSATION_MENU_ICON_CLASS} />
+        {t("chat.conversationBulkSelect")}
+      </DropdownMenuItem>
+      {forkSource && !item.isPending ? (
+        <DropdownMenuItem
+          disabled={isInteractionDisabled}
+          onSelect={() => onSelectConversation(forkSource.id)}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          <GitBranch className={CONVERSATION_MENU_ICON_CLASS} />
+          {t("chat.conversationOpenBranchSource")}
+        </DropdownMenuItem>
+      ) : null}
+      {onOpenInWorkbenchSplit && !item.isPending ? (
+        <DropdownMenuItem
+          disabled={isInteractionDisabled}
+          onSelect={() => onOpenInWorkbenchSplit(item)}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          <Columns2 className={CONVERSATION_MENU_ICON_CLASS} />
+          {t("workbench.openInSplit")}
+        </DropdownMenuItem>
+      ) : null}
+      <DropdownMenuItem
+        disabled={isInteractionDisabled}
+        onSelect={handleStartRenamingFromMenu}
+        className={CONVERSATION_MENU_ITEM_CLASS}
+      >
+        <SquarePen className={CONVERSATION_MENU_ICON_CLASS} />
+        {t("chat.conversationRename")}
+      </DropdownMenuItem>
+      <DropdownMenuSub>
+        <DropdownMenuSubTrigger
+          disabled={isInteractionDisabled || isRunning || isBusy || moveWorkspaces.length === 0}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          <Folder className={CONVERSATION_MENU_ICON_CLASS} />
+          {t("chat.conversationMoveToWorkspace")}
+        </DropdownMenuSubTrigger>
+        <DropdownMenuSubContent
+          variant="soft"
+          className={cn(SIDEBAR_CONTEXT_MENU_CLASS, "max-h-72")}
+        >
+          {moveWorkspaces.map((workspace) => (
+            <DropdownMenuItem
+              key={workspace.id}
+              disabled={isInteractionDisabled || isRunning || isBusy || workspace.path === item.cwd}
+              onSelect={() => handleMoveToWorkspace(workspace.path)}
+              className={CONVERSATION_MENU_ITEM_CLASS}
+            >
+              <FolderClosed className={CONVERSATION_MENU_ICON_CLASS} />
+              <span className="min-w-0 truncate font-medium">{workspace.name}</span>
+              <span className="min-w-0 truncate text-xs text-muted-foreground">
+                ({workspace.path})
+              </span>
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuSubContent>
+      </DropdownMenuSub>
+      {canShareConversation && !item.isPending ? (
+        <DropdownMenuItem
+          disabled={isInteractionDisabled}
+          onSelect={handleShare}
+          className={CONVERSATION_MENU_ITEM_CLASS}
+        >
+          <Share2 className={CONVERSATION_MENU_ICON_CLASS} />
+          {t("chat.conversationShare")}
+        </DropdownMenuItem>
+      ) : null}
+      <DropdownMenuItem
+        disabled={isInteractionDisabled || isDeleteDisabled}
+        onSelect={handleRequestDelete}
+        className={cn(
+          CONVERSATION_MENU_ITEM_CLASS,
+          "text-destructive focus:bg-destructive/10 focus:text-destructive",
+        )}
+      >
+        <Trash2 className={CONVERSATION_MENU_ICON_CLASS} />
+        {t("chat.conversationDelete")}
+      </DropdownMenuItem>
+    </>
+  );
+
+  if (isPendingDelete) {
+    return (
+      <div
+        className={cn(
+          "chat-history-row rounded-2xl border border-border/70 bg-background px-3 py-2.5",
+          "shadow-xs shadow-black/5 [contain:layout_paint_style]",
+        )}
+      >
+        <p className="truncate text-sm leading-5 text-foreground/80">
+          {t("chat.conversationDeleteConfirm").replace("{title}", item.title)}
+        </p>
+        <p className="mt-0.5 text-xs leading-4 text-muted-foreground">
+          {t("chat.conversationDeleteWarning")}
+        </p>
+        <div className="mt-2 grid grid-cols-2 gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleCancelDelete}
+            disabled={isInteractionDisabled}
+            className="h-7 rounded-xl border-border/60 text-xs font-normal text-muted-foreground hover:text-foreground"
+          >
+            {t("chat.cancel")}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleConfirmDelete}
+            disabled={isInteractionDisabled || isBusy || isDeleteDisabled}
+            className="h-7 rounded-xl bg-destructive text-xs font-medium text-destructive-foreground hover:bg-destructive/90"
+          >
+            {t("chat.delete")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      data-conversation-id={item.id}
+      data-sidebar-reorder-key={props.reorderKey}
+      // Paint containment normally clips this row. The insertion circle extends
+      // across its edge, so let only the active drop target paint outside it.
+      style={props.dropPosition ? { contain: "layout style", zIndex: 1 } : undefined}
+      className={cn(
+        props.isDragging && "opacity-35",
+        "chat-history-row group/item relative grid sidebar-list-row grid-cols-[minmax(0,1fr)_auto] items-center rounded-md",
+        "pl-1 transition-colors [contain:layout_paint_style]",
+        isSelectionMode && isSelected
+          ? "bg-primary/10 text-foreground hover:bg-primary/[0.14]"
+          : isActive
+            ? "bg-settings-active font-medium text-foreground hover:bg-settings-active"
+            : "text-foreground/75 hover:bg-settings-tile-hover hover:text-foreground",
+        isSelectionMode && isSelectionDisabled && "opacity-50",
+        !isSelectionMode && shouldShowMobilePressFeedback && "bg-foreground/[0.09] text-foreground",
+      )}
+    >
+      <SidebarDropIndicator position={props.dropPosition} />
+      <DropdownMenu
+        open={
+          !isInteractionDisabled && !isSelectionMode && !isRenaming && !contextPoint && menuOpen
+        }
+        onOpenChange={handleMenuOpenChange}
+        modal={false}
+      >
+        {/* biome-ignore lint/complexity/noUselessFragments: DropdownMenu keeps trigger and popup siblings under one provider child */}
+        <>
+          <div className="relative min-w-0">
+            {isMobileMenuLayout && !isSelectionMode ? (
+              <DropdownMenuTrigger
+                render={
+                  <button
+                    type="button"
+                    aria-hidden="true"
+                    tabIndex={-1}
+                    className="chat-history-row-title-menu-anchor absolute inset-0 size-full rounded-2xl opacity-0 pointer-events-none"
+                  />
+                }
+              />
+            ) : null}
+
+            <SidebarMenuButton
+              isActive={isActive}
+              ref={titleButtonRef}
+              type="button"
+              draggable={!props.onReorderPointerDown && !onWorkbenchDragIntent && !item.isPending}
+              onDragStart={handleNativeConversationDragStart}
+              onDragEnd={clearActiveConversationReferenceDrag}
+              onClick={handleTitleClick}
+              onMouseDown={(event) => {
+                if (event.shiftKey) event.preventDefault();
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                if (!isSelectionMode && !isMobileMenuLayout && !isRunning && !isBusy) {
+                  handleStartRenaming();
+                }
+              }}
+              onContextMenu={handleTitleContextMenu}
+              onKeyDown={handleTitleKeyDown}
+              onPointerDown={handleTitlePointerDown}
+              onPointerMove={handleTitlePointerMove}
+              onPointerUp={handleTitlePointerUp}
+              onPointerCancel={handleTitlePointerCancel}
+              onPointerLeave={handleTitlePointerCancel}
+              aria-current={isActive ? "page" : undefined}
+              aria-pressed={isSelectionMode ? isSelected : undefined}
+              disabled={isInteractionDisabled || (isSelectionMode && isSelectionDisabled)}
+              className={cn(
+                "flex sidebar-list-row w-full min-w-0 items-center gap-2 rounded-md px-2 py-0",
+                "bg-transparent hover:bg-transparent active:bg-transparent data-active:bg-transparent",
+                "text-left outline-hidden transition-colors",
+                "focus-visible:ring-2 focus-visible:ring-ring web:max-820:[-webkit-touch-callout:none] web:max-820:select-none web:max-820:touch-pan-y",
+              )}
+              title={branchHint ? [item.title, branchHint].join("\n") : item.title}
+            >
+              {isSelectionMode ? (
+                <span
+                  aria-hidden="true"
+                  className={cn(
+                    "flex size-4 shrink-0 items-center justify-center rounded-xs border transition-colors",
+                    isSelected
+                      ? "border-primary bg-primary text-primary-foreground"
+                      : "border-muted-foreground/45 bg-background/50",
+                  )}
+                >
+                  {isSelected ? <Check className="size-3" /> : null}
+                </span>
+              ) : null}
+              {!isSelectionMode && props.showIcon ? (
+                <span
+                  aria-hidden="true"
+                  className="flex size-4 shrink-0 items-center justify-center"
+                >
+                  <MessageSquare className="size-4 text-muted-foreground" />
+                </span>
+              ) : null}
+              {!isSelectionMode && branchHint ? (
+                <GitBranch
+                  role="img"
+                  aria-label={branchHint}
+                  className="size-3.5 shrink-0 text-muted-foreground"
+                />
+              ) : null}
+              <span className="[mask-image:var(--mask-image-sidebar-project-name-fade)] min-w-0 flex-1 overflow-hidden whitespace-nowrap text-sm font-normal leading-5">
+                {item.title}
+              </span>
+              {!isSelectionMode && blockedBadgeLabel ? (
+                <span
+                  className={cn(
+                    "inline-flex h-5 shrink-0 items-center rounded-full bg-emerald-500/[0.14] px-2",
+                    "text-tiny font-medium leading-none text-emerald-700 dark:bg-emerald-400/[0.13] dark:text-emerald-300",
+                  )}
+                >
+                  {blockedBadgeLabel}
+                </span>
+              ) : null}
+              {!isSelectionMode && isUnread && !blockedBadgeLabel && !isRunning ? (
+                <span
+                  role="img"
+                  aria-label={t("chat.conversationUnread")}
+                  title={t("chat.conversationUnread")}
+                  data-sidebar-unread-dot=""
+                  className="size-2 shrink-0 rounded-full bg-sky-500 dark:bg-sky-400"
+                />
+              ) : null}
+            </SidebarMenuButton>
+          </div>
+
+          <div
+            className={cn(
+              "relative flex items-center justify-end overflow-hidden transition-[max-width,opacity] duration-200 ease-out",
+              isSelectionMode && "hidden",
+              showRunningIndicator
+                ? // Mobile rows render no inline action buttons, so this flex
+                  // box has zero content width AND zero height — max-w alone
+                  // leaves the absolutely-positioned spinner fully clipped by
+                  // overflow-hidden. Reserve the spinner slot explicitly
+                  // (both axes) and skip the hover/focus swap.
+                  isMobileMenuLayout
+                  ? "size-7 opacity-100"
+                  : "max-w-7 opacity-100 group-hover/item:max-w-16 group-focus-within/item:max-w-16"
+                : "max-w-0 opacity-0 group-hover/item:max-w-16 group-hover/item:opacity-100 group-focus-within/item:max-w-16 group-focus-within/item:opacity-100",
+              menuOpen && "max-w-16 opacity-100",
+            )}
+          >
+            {showRunningIndicator ? (
+              <span
+                role="img"
+                aria-label={t("chat.statusRunningReply")}
+                title={t("chat.statusRunningReply")}
+                className={cn(
+                  "pointer-events-none absolute right-1.5 flex size-4 items-center justify-center text-muted-foreground",
+                  "transition-opacity duration-200",
+                  isMobileMenuLayout
+                    ? "opacity-100"
+                    : [
+                        "opacity-100 group-hover/item:opacity-0 group-focus-within/item:opacity-0",
+                        menuOpen && "opacity-0",
+                      ],
+                )}
+              >
+                <Loader2 className="size-4 animate-spin [animation-duration:var(--ui-duration-1600ms)] motion-reduce:animate-none" />
+              </span>
+            ) : null}
+            <div
+              className={cn(
+                "flex items-center gap-0.5 transition-opacity duration-200",
+                showRunningIndicator
+                  ? "opacity-0 group-hover/item:opacity-100 group-focus-within/item:opacity-100"
+                  : "opacity-100",
+                menuOpen && "opacity-100",
+              )}
+            >
+              {!isMobileMenuLayout ? (
+                <>
+                  <SidebarMenuAction
+                    type="button"
+                    className={cn(PROJECT_ICON_BUTTON_CLASS, "static after:hidden")}
+                    title={item.isPinned ? t("chat.conversationUnpin") : t("chat.conversationPin")}
+                    aria-label={
+                      item.isPinned ? t("chat.conversationUnpin") : t("chat.conversationPin")
+                    }
+                    onClick={handleTogglePinned}
+                    disabled={isInteractionDisabled || isBusy || item.isPending}
+                  >
+                    {item.isPinned ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
+                  </SidebarMenuAction>
+                  <DropdownMenuTrigger
+                    render={
+                      <SidebarMenuAction
+                        type="button"
+                        className={cn(PROJECT_ICON_BUTTON_CLASS, "static after:hidden")}
+                        disabled={isInteractionDisabled || isBusy}
+                        title={t("chat.conversationMore")}
+                        aria-label={t("chat.conversationMore")}
+                        onPointerDown={(event) => event.stopPropagation()}
+                        onClick={(event) => event.stopPropagation()}
+                      />
+                    }
+                  >
+                    <MoreHorizontal className="size-3.5" />
+                  </DropdownMenuTrigger>
+                </>
+              ) : null}
+            </div>
+          </div>
+
+          <DropdownMenuContent
+            variant="soft"
+            side={menuSide}
+            align="start"
+            sideOffset={8}
+            collisionPadding={12}
+            finalFocus={() => {
+              if (suppressMenuReturnFocusRef.current) {
+                suppressMenuReturnFocusRef.current = false;
+                return false;
+              }
+              return true;
+            }}
+            className={cn(SIDEBAR_CONTEXT_MENU_CLASS, "min-w-40")}
+          >
+            {menuItems}
+          </DropdownMenuContent>
+        </>
+      </DropdownMenu>
+      {contextPoint && menuOpen && !isRenaming && !isSelectionMode && !isInteractionDisabled ? (
+        <ContextMenuPopup
+          point={contextPoint}
+          onClose={() => handleMenuOpenChange(false)}
+          variant="soft"
+          finalFocus={() => {
+            if (suppressMenuReturnFocusRef.current) {
+              suppressMenuReturnFocusRef.current = false;
+              return false;
+            }
+            return titleButtonRef.current;
+          }}
+          className={cn(SIDEBAR_CONTEXT_MENU_CLASS, "min-w-40")}
+        >
+          {menuItems}
+        </ContextMenuPopup>
+      ) : null}
+      {isRenaming ? (
+        <Dialog
+          open
+          onOpenChange={(open) => {
+            if (!open) onCancelRename();
+          }}
+        >
+          <DialogContent
+            className="max-w-md"
+            showCloseButton
+            closeLabel={t("chat.cancel")}
+            initialFocus={inputRef}
+            finalFocus={titleButtonRef}
+          >
+            <form
+              onSubmit={(event) => {
+                event.preventDefault();
+                if (renameDraft.trim() && !isInteractionDisabled && !isBusy) onCommitRename();
+              }}
+            >
+              <DialogHeader>
+                <DialogTitle>{t("chat.conversationRenameTitle")}</DialogTitle>
+                <DialogDescription>{t("chat.conversationRenameHint")}</DialogDescription>
+              </DialogHeader>
+              <DialogBody>
+                <Input
+                  ref={inputRef}
+                  variant="plain"
+                  aria-label={t("chat.conversationRenameTitle")}
+                  value={renameDraft}
+                  onFocus={(event) => event.currentTarget.select()}
+                  onChange={(event) => onRenameDraftChange(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && event.nativeEvent.isComposing)
+                      event.preventDefault();
+                  }}
+                  disabled={isInteractionDisabled || isBusy}
+                />
+              </DialogBody>
+              <DialogFooter>
+                <Button type="button" variant="outline" onClick={onCancelRename}>
+                  {t("chat.cancel")}
+                </Button>
+                <Button
+                  type="submit"
+                  disabled={!renameDraft.trim() || isInteractionDisabled || isBusy}
+                >
+                  {t("chat.conversationRenameSave")}
+                </Button>
+              </DialogFooter>
+            </form>
+          </DialogContent>
+        </Dialog>
+      ) : null}
+    </div>
+  );
+}, areHistoryRowPropsEqual);
+
+// 项目分组标题行：折叠切换、成员计数、重命名与删除。
+export function ProjectGroupHeader(props: {
+  group: WorkspaceProjectGroup;
+  memberCount: number;
+  isRenaming: boolean;
+  renameDraft: string;
+  onRenameDraftChange: (value: string) => void;
+  onCommitRename: () => void;
+  onCancelRename: () => void;
+  onToggleCollapsed: () => void;
+  onStartRename: () => void;
+  onDelete: () => void;
+}) {
+  const {
+    group,
+    memberCount,
+    isRenaming,
+    renameDraft,
+    onRenameDraftChange,
+    onCommitRename,
+    onCancelRename,
+    onToggleCollapsed,
+    onStartRename,
+    onDelete,
+  } = props;
+  const { t } = useLocale();
+  const renameInputRef = useRef<HTMLInputElement | null>(null);
+  // Opening an inline input from a menu must not restore focus to the trigger:
+  // "Rename" unmounts this menu in the commit that mounts the input, and the
+  // trigger takes focus back before the input's ref attaches, so the blur
+  // committed the untouched name. finalFocus consumes the one-shot flag and the
+  // effect below owns focus placement.
+  const suppressMenuReturnFocusRef = useRef(false);
+  const skipNextBlurCommitRef = useRef(false);
+
+  useEffect(() => {
+    if (!isRenaming) return;
+    skipNextBlurCommitRef.current = false;
+    renameInputRef.current?.focus();
+    renameInputRef.current?.select();
+  }, [isRenaming]);
+
+  if (isRenaming) {
+    return (
+      // Same geometry as the non-renaming header below, chevron included, so
+      // the name stays put when the row flips into and out of edit mode.
+      <div className="flex sidebar-list-row items-center rounded-lg pl-1">
+        <div className="flex sidebar-list-row min-w-0 flex-1 items-center gap-2 px-2">
+          <span className="flex size-4 shrink-0 items-center justify-center">
+            <ChevronRight
+              aria-hidden="true"
+              className={cn(
+                "size-3.5 text-muted-foreground transition-transform duration-200",
+                group.collapsed ? "" : "rotate-90",
+              )}
+            />
+          </span>
+          <Input
+            ref={renameInputRef}
+            value={renameDraft}
+            onChange={(event) => onRenameDraftChange(event.currentTarget.value)}
+            onBlur={() => {
+              if (skipNextBlurCommitRef.current) {
+                skipNextBlurCommitRef.current = false;
+                return;
+              }
+              onCommitRename();
+            }}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") {
+                event.preventDefault();
+                skipNextBlurCommitRef.current = true;
+                onCommitRename();
+              } else if (event.key === "Escape") {
+                event.preventDefault();
+                skipNextBlurCommitRef.current = true;
+                onCancelRename();
+              }
+            }}
+            className={HISTORY_RENAME_INPUT_CLASS}
+          />
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="group/project-group flex sidebar-list-row items-center rounded-lg pl-1 transition-colors hover:bg-settings-tile-hover">
+      <button
+        type="button"
+        className={cn(
+          "flex sidebar-list-row min-w-0 flex-1 items-center gap-2 rounded-md px-2",
+          "text-left outline-hidden transition-colors",
+          "hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring",
+        )}
+        onClick={onToggleCollapsed}
+        title={t("chat.workspaceGroupToggle")}
+      >
+        {/* 14px chevron in a 16px slot: the slot has to match ProjectRow's
+            folder icon so group names and workspace names share a left edge. */}
+        <span className="flex size-4 shrink-0 items-center justify-center">
+          <ChevronRight
+            aria-hidden="true"
+            className={cn(
+              "size-3.5 text-muted-foreground transition-transform duration-200",
+              group.collapsed ? "" : "rotate-90",
+            )}
+          />
+        </span>
+        <span className="min-w-0 flex-1 truncate text-sm font-semibold leading-5">
+          {group.name}
+        </span>
+        <span className="shrink-0 rounded-full bg-muted px-1.5 py-px text-tiny leading-4 text-muted-foreground">
+          {memberCount}
+        </span>
+      </button>
+      <DropdownMenu>
+        <DropdownMenuTrigger
+          render={
+            <button
+              type="button"
+              className={cn(
+                "flex size-7 shrink-0 items-center justify-center rounded-lg text-muted-foreground transition-colors",
+                "hover:bg-foreground/[0.06] hover:text-foreground",
+              )}
+            />
+          }
+          aria-label={t("chat.workspaceGroupActions")}
+          title={t("chat.workspaceGroupActions")}
+        >
+          <MoreHorizontal className="size-3.5" />
+        </DropdownMenuTrigger>
+        <DropdownMenuContent
+          variant="soft"
+          className="min-w-40"
+          finalFocus={() => {
+            if (suppressMenuReturnFocusRef.current) {
+              suppressMenuReturnFocusRef.current = false;
+              return false;
+            }
+            return true;
+          }}
+        >
+          <DropdownMenuItem
+            onSelect={() => {
+              suppressMenuReturnFocusRef.current = true;
+              onStartRename();
+            }}
+            className="gap-2"
+          >
+            <SquarePen className="size-3.5" />
+            <span>{t("chat.workspaceGroupRename")}</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            onSelect={onDelete}
+            className="gap-2 text-destructive focus:bg-destructive/10 focus:text-destructive"
+          >
+            <Trash2 className="size-3.5" />
+            <span>{t("chat.workspaceGroupDelete")}</span>
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
+    </div>
+  );
+}
+
+export const ProjectRow = memo(function ProjectRow(props: {
+  expanded?: boolean;
+  onNewConversation?: (project: WorkspaceProject) => void;
+  reorderKey?: string;
+  onReorderPointerDown?: (key: string, event: SidebarReorderPointer) => void;
+  isDragging?: boolean;
+  dropPosition?: "before" | "after";
+  onToggleExpanded?: (project: WorkspaceProject) => void;
+  project: WorkspaceProject;
+  isActive: boolean;
+  isMissing: boolean;
+  isRunning: boolean;
+  pendingAction: PendingWorkspaceProjectAction["mode"] | null;
+  isInteractionDisabled: boolean;
+  onSelectProject: (project: WorkspaceProject) => void;
+  onBrowseProjectInFileTree?: (project: WorkspaceProject) => void;
+  onConfigureProject: (project: WorkspaceProject) => void;
+  onBrowseProjectInSystemFileManager?: (project: WorkspaceProject) => void;
+  onSetProjectPinned: (project: WorkspaceProject, isPinned: boolean) => void;
+  onRemoveProject: (project: WorkspaceProject, options?: WorkspaceProjectRemoveOptions) => void;
+  // Archived rows render disabled: no selection (so no new conversations),
+  // no pin — but rename/remove/browse stay available from the menu.
+  isArchived: boolean;
+  // Offered only while at least one other non-archived workspace remains.
+  canArchive: boolean;
+  onArchiveProject: (project: WorkspaceProject) => void;
+  onUnarchiveProject: (project: WorkspaceProject) => void;
+  onSetPendingAction: (action: PendingWorkspaceProjectAction | null) => void;
+  // 分组内的项目行：相对组头缩进，形成层级视觉。
+  indented?: boolean;
+  // 分组归属：菜单中提供“移动到分组”子菜单。
+  workspaceProjectGroups?: WorkspaceProjectGroup[];
+  onMoveProjectToGroup?: (projectPath: string, groupId: string | null) => void;
+  menuOpen: boolean;
+  onMenuOpenChange: (projectId: string, open: boolean) => void;
+  /**
+   * Workbench pointer-drag intent from the project title (desktop only):
+   * dragging a workspace into the pane canvas creates a new conversation for
+   * it at the drop position. Never armed for archived or missing projects.
+   */
+  onWorkbenchDragIntent?: (
+    project: WorkspaceProject,
+    event: {
+      pointerId: number;
+      clientX: number;
+      clientY: number;
+      currentTarget?: EventTarget | null;
+    },
+  ) => void;
+}) {
+  const {
+    project,
+    isActive,
+    isMissing,
+    isRunning,
+    pendingAction,
+    isInteractionDisabled,
+    onSelectProject,
+    onBrowseProjectInFileTree,
+    onConfigureProject,
+    onBrowseProjectInSystemFileManager,
+    onSetProjectPinned,
+    onRemoveProject,
+    isArchived,
+    canArchive,
+    onArchiveProject,
+    onUnarchiveProject,
+    onSetPendingAction,
+    indented = false,
+    workspaceProjectGroups = [],
+    onMoveProjectToGroup,
+    menuOpen,
+    onMenuOpenChange,
+    onWorkbenchDragIntent,
+  } = props;
+  const { t } = useLocale();
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const isDefaultProject = project.id === DEFAULT_WORKSPACE_PROJECT_ID;
+  const isPinned = project.isPinned === true;
+  const [deleteBranchWithWorktree, setDeleteBranchWithWorktree] = useState(false);
+  const currentGroupId = workspaceProjectGroups.find((group) =>
+    group.projectPaths.some(
+      (path) => workspaceProjectPathKey(path) === workspaceProjectPathKey(project.path),
+    ),
+  )?.id;
+  const ProjectFolderIcon = (props.expanded ?? isActive) ? FolderOpen : FolderClosed;
+
+  useEffect(() => {
+    if (pendingAction !== "deleteWorktree") {
+      setDeleteBranchWithWorktree(false);
+    }
+  }, [pendingAction]);
+
+  const handleRequestRemove = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onSetPendingAction({ projectId: project.id, mode: "remove" });
+  }, [isInteractionDisabled, onSetPendingAction, project.id]);
+
+  const handleRequestDeleteWorktree = useCallback(() => {
+    if (isInteractionDisabled || !project.worktree) {
+      return;
+    }
+    onSetPendingAction({ projectId: project.id, mode: "deleteWorktree" });
+  }, [isInteractionDisabled, onSetPendingAction, project.id, project.worktree]);
+
+  const handleConfirmPendingAction = useCallback(() => {
+    const mode = pendingAction;
+    onSetPendingAction(null);
+    if (isInteractionDisabled || !mode) {
+      return;
+    }
+    onRemoveProject(
+      project,
+      mode === "deleteWorktree"
+        ? { deleteWorktree: true, deleteBranch: deleteBranchWithWorktree }
+        : undefined,
+    );
+  }, [
+    deleteBranchWithWorktree,
+    isInteractionDisabled,
+    onRemoveProject,
+    onSetPendingAction,
+    pendingAction,
+    project,
+  ]);
+
+  const handleCancelPendingAction = useCallback(() => {
+    onSetPendingAction(null);
+  }, [onSetPendingAction]);
+
+  const handleTogglePinned = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onSetProjectPinned(project, !isPinned);
+  }, [isInteractionDisabled, isPinned, onSetProjectPinned, project]);
+
+  const handleBrowseInFileTree = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onBrowseProjectInFileTree?.(project);
+  }, [isInteractionDisabled, onBrowseProjectInFileTree, project]);
+
+  const handleBrowseInSystemFileManager = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onBrowseProjectInSystemFileManager?.(project);
+  }, [isInteractionDisabled, onBrowseProjectInSystemFileManager, project]);
+
+  const handleArchive = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onArchiveProject(project);
+  }, [isInteractionDisabled, onArchiveProject, project]);
+
+  const handleUnarchive = useCallback(() => {
+    if (isInteractionDisabled) {
+      return;
+    }
+    onUnarchiveProject(project);
+  }, [isInteractionDisabled, onUnarchiveProject, project]);
+
+  const handleMenuOpenChange = useCallback(
+    (open: boolean) => {
+      if (open && isInteractionDisabled) {
+        return;
+      }
+      onMenuOpenChange(project.id, open);
+    },
+    [isInteractionDisabled, onMenuOpenChange, project.id],
+  );
+
+  if (pendingAction) {
+    const deletingWorktree = pendingAction === "deleteWorktree" && Boolean(project.worktree);
+    return (
+      <div
+        className={cn(
+          "rounded-lg border border-destructive/25 bg-destructive/5 px-3 py-2.5",
+          "text-sm text-destructive shadow-xs shadow-black/5",
+        )}
+      >
+        <p className="truncate font-medium leading-5 text-destructive">
+          {t(
+            deletingWorktree
+              ? "chat.workspaceDeleteWorktreeConfirm"
+              : "chat.workspaceRemoveConfirm",
+          ).replace("{name}", project.name)}
+        </p>
+        <p className="mt-0.5 text-xs leading-4 text-destructive/75">
+          {isRunning
+            ? t("chat.workspaceRemoveRunning")
+            : t(
+                deletingWorktree
+                  ? "chat.workspaceDeleteWorktreeDescription"
+                  : "chat.workspaceRemoveDescription",
+              )}
+        </p>
+        {deletingWorktree ? (
+          <>
+            <p className="mt-1 break-all font-mono text-tiny leading-4 text-destructive/70">
+              {project.path}
+            </p>
+            {project.worktree?.branch ? (
+              <label className="mt-2 flex cursor-pointer items-start gap-2 text-xs leading-4 text-foreground">
+                <input
+                  type="checkbox"
+                  checked={deleteBranchWithWorktree}
+                  onChange={(event) => setDeleteBranchWithWorktree(event.currentTarget.checked)}
+                  disabled={isInteractionDisabled || isRunning}
+                  className="mt-0.5 size-3.5 rounded border-border accent-destructive"
+                />
+                <span>
+                  {t("chat.workspaceDeleteWorktreeBranch").replace(
+                    "{branch}",
+                    project.worktree.branch,
+                  )}
+                </span>
+              </label>
+            ) : null}
+          </>
+        ) : null}
+        <div className="mt-2 grid grid-cols-2 gap-1.5">
+          <Button
+            type="button"
+            variant="outline"
+            size="sm"
+            onClick={handleCancelPendingAction}
+            disabled={isInteractionDisabled}
+            className="h-7 rounded-xl border-border/60 bg-background text-xs font-normal text-muted-foreground hover:text-foreground"
+          >
+            {t("chat.cancel")}
+          </Button>
+          <Button
+            type="button"
+            size="sm"
+            onClick={handleConfirmPendingAction}
+            disabled={isInteractionDisabled || isRunning}
+            className="h-7 rounded-xl bg-destructive text-xs font-medium text-destructive-foreground hover:bg-destructive/90"
+          >
+            {t(deletingWorktree ? "chat.workspaceDeleteWorktree" : "chat.remove")}
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    // biome-ignore lint/a11y/useSemanticElements: this group contains navigation actions, not form fields.
+    <div
+      ref={rowRef}
+      role="group"
+      aria-label={project.name}
+      data-sidebar-reorder-key={props.reorderKey}
+      className={cn(
+        props.isDragging && "opacity-35",
+        "group/project relative grid sidebar-list-row grid-cols-[minmax(0,1fr)_auto] items-center rounded-md pl-1",
+        "transition-colors",
+        indented && "pl-5",
+        isMissing
+          ? "text-destructive hover:bg-destructive/10"
+          : isArchived
+            ? "text-muted-foreground/60 hover:bg-foreground/[0.03]"
+            : isActive
+              ? "bg-settings-active font-medium text-foreground hover:bg-settings-active"
+              : "text-foreground/75 hover:bg-settings-tile-hover hover:text-foreground",
+      )}
+    >
+      <SidebarDropIndicator position={props.dropPosition} />
+      <Tooltip disabled={isInteractionDisabled || props.isDragging}>
+        <TooltipTrigger
+          delay={0}
+          closeOnClick
+          render={
+            <SidebarMenuButton
+              isActive={isActive}
+              type="button"
+              aria-current={isActive ? "page" : undefined}
+              aria-disabled={isArchived || undefined}
+              aria-expanded={props.onToggleExpanded ? props.expanded : undefined}
+              draggable={false}
+              className={cn(
+                "flex sidebar-list-row min-w-0 items-center gap-2 rounded-md px-2 py-0",
+                "bg-transparent hover:bg-transparent active:bg-transparent data-active:bg-transparent",
+                "text-left outline-hidden transition-colors focus-visible:ring-2 focus-visible:ring-ring",
+                isMissing
+                  ? "hover:text-destructive focus-visible:bg-destructive/10"
+                  : isArchived
+                    ? "cursor-default"
+                    : "hover:text-foreground focus-visible:bg-foreground/[0.06]",
+              )}
+              onClick={() => {
+                // Archived workspaces cannot be selected, so no new
+                // conversations can start in them.
+                if (!isArchived) {
+                  props.onToggleExpanded?.(project);
+                  onSelectProject(project);
+                }
+              }}
+              onPointerDown={(event) => {
+                if (
+                  props.onReorderPointerDown &&
+                  props.reorderKey &&
+                  !event.altKey &&
+                  !isArchived &&
+                  !isInteractionDisabled &&
+                  !menuOpen &&
+                  pendingAction === null &&
+                  event.pointerType !== "touch" &&
+                  event.button === 0
+                ) {
+                  props.onReorderPointerDown(props.reorderKey, event);
+                  return;
+                }
+                if (
+                  !onWorkbenchDragIntent ||
+                  isArchived ||
+                  isMissing ||
+                  isInteractionDisabled ||
+                  menuOpen ||
+                  pendingAction !== null ||
+                  event.pointerType === "touch" ||
+                  event.button !== 0
+                ) {
+                  return;
+                }
+                onWorkbenchDragIntent(project, {
+                  pointerId: event.pointerId,
+                  clientX: event.clientX,
+                  clientY: event.clientY,
+                  currentTarget: event.currentTarget,
+                });
+              }}
+              onDoubleClick={(event) => {
+                event.preventDefault();
+                if (!isInteractionDisabled) {
+                  onConfigureProject(project);
+                }
+              }}
+              disabled={isInteractionDisabled}
+            >
+              <ProjectFolderIcon
+                className={cn(
+                  "size-4 shrink-0 transition-colors",
+                  isMissing
+                    ? "text-destructive"
+                    : isArchived
+                      ? "text-muted-foreground/40"
+                      : "text-foreground/65",
+                )}
+              />
+              <span
+                className={cn(
+                  "[mask-image:var(--mask-image-sidebar-project-name-fade)] min-w-0 flex-1 overflow-hidden whitespace-nowrap text-sm font-normal leading-5",
+                  isMissing ? "text-destructive" : undefined,
+                )}
+              >
+                {project.name}
+              </span>
+            </SidebarMenuButton>
+          }
+        />
+        <TooltipContent
+          anchor={rowRef}
+          side="right"
+          sideOffset={10}
+          className="w-64 rounded-xl px-3 py-2.5"
+        >
+          <p className="truncate text-sm font-semibold leading-5">{project.name}</p>
+          <p className="mt-1 break-all text-xs leading-4 text-muted-foreground">{project.path}</p>
+        </TooltipContent>
+      </Tooltip>
+      <div
+        className={cn(
+          "relative flex items-center justify-end overflow-hidden transition-[max-width,opacity] duration-200 ease-out",
+          isMissing
+            ? "max-w-8 opacity-100"
+            : isRunning
+              ? "max-w-7 opacity-100 group-hover/project:max-w-16 group-focus-within/project:max-w-16"
+              : "max-w-0 opacity-0 group-hover/project:max-w-16 group-hover/project:opacity-100 group-focus-within/project:max-w-16 group-focus-within/project:opacity-100",
+          menuOpen && "max-w-16 opacity-100",
+        )}
+      >
+        {isRunning && !isMissing ? (
+          <span
+            role="img"
+            aria-label={t("chat.statusRunningReply")}
+            title={t("chat.statusRunningReply")}
+            className={cn(
+              "pointer-events-none absolute right-1.5 flex size-4 items-center justify-center text-muted-foreground",
+              "transition-opacity duration-200",
+              "opacity-100 group-hover/project:opacity-0 group-focus-within/project:opacity-0",
+              menuOpen && "opacity-0",
+            )}
+          >
+            <Loader2 className="size-4 animate-spin [animation-duration:var(--ui-duration-1600ms)] motion-reduce:animate-none" />
+          </span>
+        ) : null}
+        <div
+          className={cn(
+            "flex items-center gap-0.5 transition-opacity duration-200",
+            isRunning && !isMissing
+              ? "opacity-0 group-hover/project:opacity-100 group-focus-within/project:opacity-100"
+              : "opacity-100",
+            menuOpen && "opacity-100",
+          )}
+        >
+          {isMissing && !isArchived ? (
+            !isDefaultProject ? (
+              <Button
+                type="button"
+                variant="ghost"
+                size="icon"
+                className={cn(
+                  PROJECT_ICON_BUTTON_CLASS,
+                  "text-destructive hover:!bg-transparent hover:text-destructive",
+                )}
+                title={t("chat.workspaceRemove")}
+                aria-label={t("chat.workspaceRemove")}
+                onClick={handleRequestRemove}
+                disabled={isInteractionDisabled}
+              >
+                <Trash2 className="size-3.5" />
+              </Button>
+            ) : null
+          ) : (
+            <>
+              {!isArchived ? (
+                <ShortcutTooltip
+                  label={t("chat.newConversation")}
+                  triggerDisabled={isInteractionDisabled || !props.onNewConversation}
+                >
+                  <SidebarMenuAction
+                    type="button"
+                    className={cn(PROJECT_ICON_BUTTON_CLASS, "static after:hidden")}
+                    aria-label={t("chat.newConversation")}
+                    onClick={() => props.onNewConversation?.(project)}
+                    disabled={isInteractionDisabled || !props.onNewConversation}
+                  >
+                    <SquarePen className="size-3.5" />
+                  </SidebarMenuAction>
+                </ShortcutTooltip>
+              ) : null}
+              <DropdownMenu
+                open={!isInteractionDisabled && menuOpen}
+                onOpenChange={handleMenuOpenChange}
+                modal={false}
+              >
+                <DropdownMenuTrigger
+                  render={
+                    <SidebarMenuAction
+                      type="button"
+                      className={cn(PROJECT_ICON_BUTTON_CLASS, "static after:hidden")}
+                      title={t("chat.workspaceMore")}
+                      aria-label={t("chat.workspaceMore")}
+                      disabled={isInteractionDisabled}
+                    />
+                  }
+                >
+                  <MoreHorizontal className="size-3.5" />
+                </DropdownMenuTrigger>
+                <DropdownMenuContent
+                  variant="soft"
+                  side="right"
+                  align="start"
+                  sideOffset={6}
+                  className={SIDEBAR_CONTEXT_MENU_CLASS}
+                >
+                  {!isArchived && (
+                    <DropdownMenuItem
+                      disabled={isInteractionDisabled}
+                      onSelect={handleTogglePinned}
+                      className="gap-2"
+                    >
+                      {isPinned ? <PinOff className="size-3.5" /> : <Pin className="size-3.5" />}
+                      {isPinned ? t("chat.workspaceUnpin") : t("chat.workspacePin")}
+                    </DropdownMenuItem>
+                  )}
+                  {/* 第一组：管理 —— 配置、分组归属、归档状态。 */}
+                  <DropdownMenuItem
+                    disabled={isInteractionDisabled}
+                    onSelect={() => onConfigureProject(project)}
+                    className="gap-2"
+                  >
+                    <Settings className="size-3.5 text-muted-foreground" />
+                    {t("chat.workspaceConfigure")}
+                  </DropdownMenuItem>
+                  {/* 无任何分组时隐藏“移动到分组”，避免展开空的子菜单。 */}
+                  {onMoveProjectToGroup && workspaceProjectGroups.length > 0 ? (
+                    <DropdownMenuSub>
+                      <DropdownMenuSubTrigger disabled={isInteractionDisabled} className="gap-2">
+                        <Folder className="size-3.5 text-muted-foreground" />
+                        <span className="min-w-0 flex-1">{t("chat.workspaceGroupMove")}</span>
+                        <ChevronRight className="size-3.5 text-muted-foreground" />
+                      </DropdownMenuSubTrigger>
+                      <DropdownMenuSubContent
+                        variant="soft"
+                        side="right"
+                        align="start"
+                        sideOffset={6}
+                        className="min-w-40"
+                      >
+                        {workspaceProjectGroups.map((group) => (
+                          <DropdownMenuItem
+                            key={group.id}
+                            disabled={group.id === currentGroupId}
+                            onSelect={() => onMoveProjectToGroup(project.path, group.id)}
+                            className="gap-2"
+                          >
+                            {group.id === currentGroupId ? (
+                              <Check className="size-3.5" />
+                            ) : (
+                              <Folder className="size-3.5 text-muted-foreground" />
+                            )}
+                            <span className="min-w-0 flex-1 truncate">{group.name}</span>
+                          </DropdownMenuItem>
+                        ))}
+                        {currentGroupId ? (
+                          <>
+                            <DropdownMenuSeparator />
+                            <DropdownMenuItem
+                              onSelect={() => onMoveProjectToGroup(project.path, null)}
+                              className="gap-2"
+                            >
+                              <X className="size-3.5 text-muted-foreground" />
+                              <span>{t("chat.workspaceGroupUngroup")}</span>
+                            </DropdownMenuItem>
+                          </>
+                        ) : null}
+                      </DropdownMenuSubContent>
+                    </DropdownMenuSub>
+                  ) : null}
+                  {!isArchived && canArchive ? (
+                    <DropdownMenuItem
+                      disabled={isInteractionDisabled}
+                      onSelect={handleArchive}
+                      className="gap-2"
+                    >
+                      <Archive className="size-3.5 text-muted-foreground" />
+                      {t("chat.workspaceArchive")}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {isArchived ? (
+                    <DropdownMenuItem
+                      disabled={isInteractionDisabled}
+                      onSelect={handleUnarchive}
+                      className="gap-2"
+                    >
+                      <ArchiveRestore className="size-3.5 text-muted-foreground" />
+                      {t("chat.workspaceUnarchive")}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {/* 第二组：浏览定位 —— 在文件树 / 系统资源管理器中打开。 */}
+                  {onBrowseProjectInFileTree || onBrowseProjectInSystemFileManager ? (
+                    <DropdownMenuSeparator />
+                  ) : null}
+                  {onBrowseProjectInFileTree ? (
+                    <DropdownMenuItem
+                      disabled={isInteractionDisabled}
+                      onSelect={handleBrowseInFileTree}
+                      className="gap-2"
+                    >
+                      <FolderTree className="size-3.5 text-muted-foreground" />
+                      {t("chat.workspaceBrowseInFileTree")}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {onBrowseProjectInSystemFileManager ? (
+                    <DropdownMenuItem
+                      disabled={isInteractionDisabled}
+                      onSelect={handleBrowseInSystemFileManager}
+                      className="gap-2"
+                    >
+                      <FolderOpen className="size-3.5 text-muted-foreground" />
+                      {t("chat.workspaceBrowseInSystemFileManager")}
+                    </DropdownMenuItem>
+                  ) : null}
+                  {/* 第三组：危险操作 —— 固定在菜单底部并以分隔线隔开。 */}
+                  {!isDefaultProject ? (
+                    <>
+                      <DropdownMenuSeparator />
+                      <DropdownMenuItem
+                        disabled={isInteractionDisabled}
+                        onSelect={handleRequestRemove}
+                        className="gap-2 text-destructive focus:bg-destructive/10 focus:text-destructive"
+                      >
+                        <X className="size-3.5" />
+                        {t("chat.workspaceRemoveOnly")}
+                      </DropdownMenuItem>
+                      {project.worktree ? (
+                        <DropdownMenuItem
+                          disabled={isInteractionDisabled}
+                          onSelect={handleRequestDeleteWorktree}
+                          className="gap-2 text-destructive focus:bg-destructive/10 focus:text-destructive"
+                        >
+                          <Trash2 className="size-3.5" />
+                          {t("chat.workspaceDeleteWorktree")}
+                        </DropdownMenuItem>
+                      ) : null}
+                    </>
+                  ) : null}
+                </DropdownMenuContent>
+              </DropdownMenu>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+});

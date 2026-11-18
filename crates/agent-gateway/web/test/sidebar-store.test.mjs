@@ -1,0 +1,746 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+
+import { fileURLToPath } from "node:url";
+
+import { createWebModuleLoader } from "../../test/helpers/load-web-module.mjs";
+
+const loader = createWebModuleLoader({
+  rootDir: fileURLToPath(new URL("../", import.meta.url)),
+});
+const { createSidebarStore } = loader.loadModule("@liveagent/ui/lib/sidebar/store.ts");
+
+const tick = () => new Promise((resolve) => setTimeout(resolve, 0));
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+function conversation(id, overrides = {}) {
+  return {
+    id,
+    title: overrides.title ?? id,
+    providerId: "provider",
+    model: "model",
+    cwd: overrides.cwd,
+    createdAt: overrides.createdAt ?? 1,
+    updatedAt: overrides.updatedAt ?? 1,
+    isPinned: overrides.isPinned,
+    pinnedAt: overrides.pinnedAt,
+    isPending: overrides.isPending,
+  };
+}
+
+function createFakeBackend() {
+  const state = {
+    pages: new Map(), // scopeKey -> items
+    totalCount: 0,
+    listError: null,
+    workdirs: [],
+    workdirsError: null,
+    calls: {
+      list: [],
+      workdirs: 0,
+      rename: [],
+      pin: [],
+      move: [],
+      delete: [],
+      subscribes: 0,
+      unsubscribes: 0,
+    },
+    listeners: new Set(),
+    connectionListeners: new Set(),
+    protectedIds: [],
+    listImpl: null,
+    renameImpl: null,
+    moveImpl: null,
+    deleteImpl: null,
+  };
+
+  const scopeKeyOf = (scope) =>
+    scope.kind === "workdir" ? `cwd:${scope.cwd}` : scope.kind === "unscoped" ? "cwd-empty" : "none";
+
+  const backend = {
+    listConversations: async (page, pageSize, scope) => {
+      state.calls.list.push({ page, pageSize, scope });
+      if (state.listImpl) {
+        return state.listImpl(page, pageSize, scope);
+      }
+      if (state.listError) {
+        throw new Error(state.listError);
+      }
+      const all = state.pages.get(scopeKeyOf(scope)) ?? [];
+      const start = (page - 1) * pageSize;
+      return {
+        items: all.slice(start, start + pageSize),
+        totalCount: state.totalCount || all.length,
+      };
+    },
+    listWorkdirs: async () => {
+      state.calls.workdirs += 1;
+      if (state.workdirsError) {
+        throw new Error(state.workdirsError);
+      }
+      return state.workdirs;
+    },
+    renameConversation: async (id, title) => {
+      state.calls.rename.push({ id, title });
+      if (state.renameImpl) {
+        return state.renameImpl(id, title);
+      }
+      return conversation(id, { title, updatedAt: 999 });
+    },
+    setConversationPinned: async (id, isPinned) => {
+      state.calls.pin.push({ id, isPinned });
+      return conversation(id, { isPinned, pinnedAt: isPinned ? 500 : null });
+    },
+    setConversationCwd: async (id, cwd) => {
+      state.calls.move.push({ id, cwd });
+      if (state.moveImpl) {
+        return state.moveImpl(id, cwd);
+      }
+      return conversation(id, { cwd });
+    },
+    deleteConversation: async (id) => {
+      state.calls.delete.push(id);
+      if (state.deleteImpl) {
+        return state.deleteImpl(id);
+      }
+    },
+    subscribeEvents: (listener) => {
+      state.calls.subscribes += 1;
+      state.listeners.add(listener);
+      return () => {
+        state.calls.unsubscribes += 1;
+        state.listeners.delete(listener);
+      };
+    },
+    subscribeConnection: (listener) => {
+      state.connectionListeners.add(listener);
+      return () => {
+        state.connectionListeners.delete(listener);
+      };
+    },
+    getProtectedConversationIds: () => state.protectedIds,
+  };
+
+  return {
+    state,
+    backend,
+    emit: (event) => {
+      for (const listener of state.listeners) listener(event);
+    },
+    setConnected: (connected) => {
+      for (const listener of state.connectionListeners) listener(connected);
+    },
+  };
+}
+
+const SCOPE_A = { kind: "workdir", cwd: "/tmp/a" };
+const SCOPE_B = { kind: "workdir", cwd: "/tmp/b" };
+
+test("initial load fills the list and fetches workdirs exactly once", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("one", { cwd: "/tmp/a", updatedAt: 20 }),
+    conversation("two", { cwd: "/tmp/a", updatedAt: 10 }),
+  ]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  const snapshot = store.getSnapshot();
+  assert.deepEqual(
+    snapshot.conversations.map((item) => item.id),
+    ["one", "two"],
+  );
+  assert.equal(snapshot.listStatus, "ready");
+  assert.equal(snapshot.totalCount, 2);
+  assert.equal(snapshot.hasMore, false);
+  assert.equal(fake.state.calls.workdirs, 1);
+  store.stop();
+});
+
+test("global workdirs survive startup scope assignment and later project switches", async (t) => {
+  const fake = createFakeBackend();
+  let resolveWorkdirs;
+  fake.backend.listWorkdirs = () => new Promise((resolve) => { resolveWorkdirs = resolve; });
+  const store = createSidebarStore(fake.backend);
+  t.after(() => store.stop());
+  store.start();
+  store.setScope({ kind: "all" });
+  store.setScope(SCOPE_A);
+  const workdirs = [{ path: "/tmp/a", conversationCount: 5, updatedAt: 100 }];
+  resolveWorkdirs(workdirs);
+  await tick();
+  assert.deepEqual(store.getSnapshot().workdirs, workdirs);
+  assert.equal(store.getSnapshot().workdirActivity.get("/tmp/a"), 100);
+  assert.equal(store.getSnapshot().scopeKey, "cwd:/tmp/a");
+});
+
+for (const outcome of ["resolve", "reject"]) {
+  test(`workdirs discard stale ${outcome} but drain the restart refresh`, async (t) => {
+    const fake = createFakeBackend();
+    const requests = [];
+    fake.backend.listWorkdirs = () => new Promise((resolve, reject) => {
+      requests.push({ resolve, reject });
+    });
+    const store = createSidebarStore(fake.backend);
+    t.after(() => store.stop());
+    store.start();
+    store.stop();
+    store.start();
+    store.setScope({ kind: "all" });
+    if (outcome === "resolve") requests[0].resolve([{ path: "/stale", conversationCount: 1, updatedAt: 1 }]);
+    else requests[0].reject(new Error("old connection"));
+    await tick();
+    assert.deepEqual(store.getSnapshot().workdirs, []);
+    assert.equal(requests.length, 2);
+    const workdirs = [{ path: "/fresh", conversationCount: 5, updatedAt: 100 }];
+    requests[1].resolve(workdirs);
+    await tick();
+    assert.deepEqual(store.getSnapshot().workdirs, workdirs);
+  });
+}
+
+test("a failed refresh keeps the visible list and sets an error code", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("one", { cwd: "/tmp/a" })]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  assert.equal(store.getSnapshot().conversations.length, 1);
+
+  fake.state.listError = "boom";
+  await store.refresh();
+  const snapshot = store.getSnapshot();
+  assert.equal(snapshot.conversations.length, 1);
+  assert.equal(snapshot.listError, "listFailed");
+  assert.equal(snapshot.listErrorDetail, "boom");
+  assert.equal(snapshot.listStatus, "ready");
+  store.stop();
+});
+
+test("scope switch paints the cached slice immediately without a wipe", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("a1", { cwd: "/tmp/a", updatedAt: 5 })]);
+  fake.state.pages.set("cwd:/tmp/b", [conversation("b1", { cwd: "/tmp/b", updatedAt: 7 })]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  // An event for scope B lands in the byId cache without touching scope A.
+  fake.emit({
+    kind: "upsert",
+    conversationId: "b1",
+    conversation: conversation("b1", { cwd: "/tmp/b", updatedAt: 7 }),
+  });
+  assert.deepEqual(
+    store.getSnapshot().conversations.map((item) => item.id),
+    ["a1"],
+  );
+
+  store.setScope(SCOPE_B);
+  const switched = store.getSnapshot();
+  assert.deepEqual(
+    switched.conversations.map((item) => item.id),
+    ["b1"],
+  );
+  assert.equal(switched.listStatus, "syncing");
+
+  await tick();
+  assert.equal(store.getSnapshot().listStatus, "ready");
+  store.stop();
+});
+
+test("scope none resolves empty locally without a backend call", async () => {
+  const fake = createFakeBackend();
+  const store = createSidebarStore(fake.backend);
+  store.setScope({ kind: "none" });
+  store.start();
+  await tick();
+  const snapshot = store.getSnapshot();
+  assert.equal(snapshot.listStatus, "ready");
+  assert.equal(snapshot.conversations.length, 0);
+  assert.equal(fake.state.calls.list.length, 0);
+  store.stop();
+});
+
+test("reconnect reconciles ghosts away but keeps pending drafts", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("stays", { cwd: "/tmp/a", updatedAt: 30 }),
+    conversation("ghost", { cwd: "/tmp/a", updatedAt: 20 }),
+  ]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  store.upsertLocal(conversation("draft", { cwd: "/tmp/a", updatedAt: 40, isPending: true }));
+  assert.equal(store.getSnapshot().conversations.length, 3);
+
+  // The other client deletes "ghost" while this one is offline.
+  fake.state.pages.set("cwd:/tmp/a", [conversation("stays", { cwd: "/tmp/a", updatedAt: 30 })]);
+  const workdirCallsBefore = fake.state.calls.workdirs;
+  fake.setConnected(false);
+  fake.setConnected(true);
+  await tick();
+
+  const snapshot = store.getSnapshot();
+  assert.deepEqual(
+    snapshot.conversations.map((item) => item.id),
+    ["draft", "stays"],
+  );
+  assert.equal(fake.state.calls.workdirs, workdirCallsBefore + 1);
+  store.stop();
+});
+
+test("optimistic rename rolls back and records a mutation error on failure", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("one", { cwd: "/tmp/a", title: "before", updatedAt: 10 }),
+  ]);
+  fake.state.renameImpl = () => {
+    throw new Error("rename failed");
+  };
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  const renamed = await store.rename("one", "after");
+  assert.equal(renamed, false);
+  const snapshot = store.getSnapshot();
+  assert.equal(snapshot.conversations[0].title, "before");
+  assert.equal(snapshot.mutationErrors.get("one"), "renameFailed");
+  assert.equal(snapshot.mutations.size, 0);
+  store.stop();
+});
+
+test("rename is blocked for a running conversation without a backend call", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("one", { cwd: "/tmp/a" })]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  store.applyRunningPatch({ conversationId: "one", running: true, workdir: "/tmp/a" });
+  const renamed = await store.rename("one", "nope");
+  assert.equal(renamed, false);
+  assert.equal(store.getSnapshot().mutationErrors.get("one"), "renameBlockedRunning");
+  assert.equal(fake.state.calls.rename.length, 0);
+
+  store.applyRunningPatch({ conversationId: "one", running: false });
+  assert.equal(store.getSnapshot().runningConversationIds.size, 0);
+  store.stop();
+});
+
+test("move leaves the current scope optimistically, rolls back on failure, and blocks running rows", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("one", { cwd: "/tmp/a", updatedAt: 20 }),
+    conversation("two", { cwd: "/tmp/a", updatedAt: 10 }),
+  ]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  let resolveMove;
+  fake.state.moveImpl = (id, cwd) =>
+    new Promise((resolve) => {
+      resolveMove = () => resolve(conversation(id, { cwd }));
+    });
+  const moving = store.setCwd("one", "/tmp/b");
+  assert.deepEqual(
+    store.getSnapshot().conversations.map((item) => item.id),
+    ["two"],
+  );
+  assert.equal(store.getSnapshot().mutations.get("one"), "move");
+  resolveMove();
+  assert.equal(await moving, true);
+  assert.deepEqual(fake.state.calls.move, [{ id: "one", cwd: "/tmp/b" }]);
+
+  fake.state.moveImpl = () => Promise.reject(new Error("move failed"));
+  assert.equal(await store.setCwd("two", "/tmp/b"), false);
+  assert.equal(store.getSnapshot().conversations[0].cwd, "/tmp/a");
+  assert.equal(store.getSnapshot().mutationErrors.get("two"), "moveFailed");
+
+  store.applyRunningPatch({ conversationId: "two", running: true, workdir: "/tmp/a" });
+  assert.equal(await store.setCwd("two", "/tmp/b"), false);
+  assert.equal(store.getSnapshot().mutationErrors.get("two"), "moveBlockedRunning");
+  assert.equal(fake.state.calls.move.length, 2);
+  store.stop();
+});
+
+test("idle tombstone rejects stale running snapshots", () => {
+  const fake = createFakeBackend();
+  const store = createSidebarStore(fake.backend, { now: () => 999 });
+
+  store.applyRunningPatch({
+    conversationId: "one",
+    running: true,
+    workdir: "/tmp/a",
+    updatedAt: 100,
+  });
+  store.applyRunningPatch({ conversationId: "one", running: false, updatedAt: 200 });
+
+  for (const updatedAt of [150, 200, undefined]) {
+    store.hydrateRunning([{ conversationId: "one", workdir: "/tmp/a", updatedAt }]);
+    assert.equal(
+      store.getSnapshot().runningConversationIds.has("one"),
+      false,
+      "an older, equal, or unversioned snapshot must not revive a terminal run",
+    );
+  }
+
+  store.hydrateRunning([{ conversationId: "one", workdir: "/tmp/a", updatedAt: 201 }]);
+  assert.equal(store.getSnapshot().runningConversationIds.has("one"), true);
+});
+
+test("mutations are tracked per row, not globally", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("one", { cwd: "/tmp/a" }),
+    conversation("two", { cwd: "/tmp/a" }),
+  ]);
+  let resolveRename;
+  fake.state.renameImpl = () =>
+    new Promise((resolve) => {
+      resolveRename = () => resolve(conversation("one", { title: "renamed", cwd: "/tmp/a" }));
+    });
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  const renamePromise = store.rename("one", "renamed");
+  await tick();
+  assert.equal(store.getSnapshot().mutations.get("one"), "rename");
+  assert.equal(store.getSnapshot().mutations.has("two"), false);
+  resolveRename();
+  await renamePromise;
+  assert.equal(store.getSnapshot().mutations.size, 0);
+  store.stop();
+});
+
+test("delete refreshes workdirs; unseen cwd upserts trigger a debounced refresh", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("one", { cwd: "/tmp/a" })]);
+  fake.state.workdirs = [{ path: "/tmp/a", conversationCount: 1, updatedAt: 10 }];
+  const store = createSidebarStore(fake.backend, { workdirsDebounceMs: 5 });
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  assert.equal(fake.state.calls.workdirs, 1);
+
+  // Upsert for a known cwd: no workdirs refresh.
+  fake.emit({
+    kind: "upsert",
+    conversationId: "one",
+    conversation: conversation("one", { cwd: "/tmp/a", updatedAt: 50 }),
+  });
+  await sleep(15);
+  assert.equal(fake.state.calls.workdirs, 1);
+
+  // Upsert for an unseen cwd: debounced refresh.
+  fake.emit({
+    kind: "upsert",
+    conversationId: "fresh",
+    conversation: conversation("fresh", { cwd: "/tmp/new", updatedAt: 60 }),
+  });
+  await sleep(15);
+  assert.equal(fake.state.calls.workdirs, 2);
+
+  await store.remove("one");
+  assert.equal(fake.state.calls.workdirs, 3);
+  store.stop();
+});
+
+test("workdir activity is maintained incrementally from events", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", []);
+  const store = createSidebarStore(fake.backend, { workdirsDebounceMs: 1_000 });
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  fake.emit({
+    kind: "upsert",
+    conversationId: "one",
+    conversation: conversation("one", { cwd: "/tmp/a", updatedAt: 123 }),
+  });
+  const activity = store.getSnapshot().workdirActivity;
+  const key = Array.from(activity.keys())[0];
+  assert.equal(activity.get(key), 123);
+
+  fake.emit({ kind: "running", conversationId: "one", workdir: "/tmp/a", updatedAt: 456 });
+  const after = store.getSnapshot();
+  assert.equal(after.workdirActivity.get(key), 456);
+  assert.equal(after.runningConversationIds.has("one"), true);
+  assert.equal(after.runningWorkdirPathKeys.size, 1);
+  store.stop();
+});
+
+test("StrictMode start/stop/start keeps exactly one live subscription", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("one", { cwd: "/tmp/a" })]);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  store.stop();
+  store.start();
+  await tick();
+
+  assert.equal(fake.state.listeners.size, 1);
+  assert.equal(fake.state.calls.subscribes, 2);
+  assert.equal(fake.state.calls.unsubscribes, 1);
+
+  fake.emit({
+    kind: "upsert",
+    conversationId: "two",
+    conversation: conversation("two", { cwd: "/tmp/a", updatedAt: 99 }),
+  });
+  assert.deepEqual(
+    store.getSnapshot().conversations.map((item) => item.id),
+    ["two", "one"],
+  );
+  store.stop();
+  assert.equal(fake.state.listeners.size, 0);
+});
+
+test("loadMore appends the next page and updates hasMore", async () => {
+  const fake = createFakeBackend();
+  const items = [];
+  for (let index = 0; index < 5; index += 1) {
+    items.push(conversation(`c${index}`, { cwd: "/tmp/a", updatedAt: 100 - index }));
+  }
+  fake.state.pages.set("cwd:/tmp/a", items);
+  const store = createSidebarStore(fake.backend, { pageSize: 2 });
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  assert.equal(store.getSnapshot().conversations.length, 2);
+  assert.equal(store.getSnapshot().hasMore, true);
+
+  await store.loadMore();
+  assert.equal(store.getSnapshot().conversations.length, 4);
+  assert.equal(store.getSnapshot().hasMore, true);
+
+  await store.loadMore();
+  assert.equal(store.getSnapshot().conversations.length, 5);
+  assert.equal(store.getSnapshot().hasMore, false);
+  store.stop();
+});
+
+test("reconnect success is not overwritten by a stale loadMore failure", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("one", { cwd: "/tmp/a", updatedAt: 20 }),
+    conversation("two", { cwd: "/tmp/a", updatedAt: 10 }),
+  ]);
+  fake.state.totalCount = 2;
+  const store = createSidebarStore(fake.backend, { pageSize: 1 });
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  let rejectStaleLoadMore;
+  let pageTwoCalls = 0;
+  fake.state.listImpl = (page, pageSize, scope) => {
+    if (page === 2) {
+      pageTwoCalls += 1;
+      if (pageTwoCalls === 1) {
+        return new Promise((_, reject) => {
+          rejectStaleLoadMore = reject;
+        });
+      }
+    }
+    const all = fake.state.pages.get(`cwd:${scope.cwd}`) ?? [];
+    const start = (page - 1) * pageSize;
+    return {
+      items: all.slice(start, start + pageSize),
+      totalCount: fake.state.totalCount,
+    };
+  };
+
+  const loadMorePromise = store.loadMore();
+  await tick();
+  assert.equal(store.getSnapshot().isLoadingMore, true);
+
+  // The reconnect's fresh first page succeeds while the pre-disconnect
+  // pagination request is still unresolved.
+  fake.setConnected(false);
+  fake.setConnected(true);
+  await tick();
+  assert.equal(store.getSnapshot().listError, null);
+  assert.equal(store.getSnapshot().isLoadingMore, false);
+  assert.deepEqual(
+    store.getSnapshot().conversations.map((item) => item.id),
+    ["one"],
+  );
+
+  // The obsolete request no longer owns the in-flight gate; page 2 can be
+  // loaded immediately from the recovered generation.
+  await store.loadMore();
+  assert.equal(pageTwoCalls, 2);
+  assert.deepEqual(
+    store.getSnapshot().conversations.map((item) => item.id),
+    ["one", "two"],
+  );
+
+  rejectStaleLoadMore(new Error("stale pagination transport failed"));
+  await loadMorePromise;
+
+  const snapshot = store.getSnapshot();
+  assert.equal(snapshot.listError, null);
+  assert.equal(snapshot.listErrorDetail, null);
+  assert.equal(snapshot.totalCount, 2);
+  assert.equal(snapshot.hasMore, false);
+  store.stop();
+});
+
+test("stale loadMore success cannot restore rows removed by reconnect", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [
+    conversation("keep", { cwd: "/tmp/a", updatedAt: 20 }),
+    conversation("ghost", { cwd: "/tmp/a", updatedAt: 10 }),
+  ]);
+  fake.state.totalCount = 2;
+  const store = createSidebarStore(fake.backend, { pageSize: 1 });
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  let resolveStaleLoadMore;
+  fake.state.listImpl = (page) => {
+    if (page === 2) {
+      return new Promise((resolve) => {
+        resolveStaleLoadMore = resolve;
+      });
+    }
+    return {
+      items: [conversation("keep", { cwd: "/tmp/a", updatedAt: 20 })],
+      totalCount: 1,
+    };
+  };
+
+  const staleLoadMorePromise = store.loadMore();
+  await tick();
+
+  // The authoritative post-reconnect page no longer contains "ghost".
+  fake.state.pages.set("cwd:/tmp/a", [conversation("keep", { cwd: "/tmp/a", updatedAt: 20 })]);
+  fake.state.totalCount = 1;
+  fake.setConnected(false);
+  fake.setConnected(true);
+  await tick();
+
+  resolveStaleLoadMore({
+    items: [conversation("ghost", { cwd: "/tmp/a", updatedAt: 10 })],
+    totalCount: 2,
+  });
+  await staleLoadMorePromise;
+
+  const snapshot = store.getSnapshot();
+  assert.deepEqual(
+    snapshot.conversations.map((item) => item.id),
+    ["keep"],
+  );
+  assert.equal(snapshot.totalCount, 1);
+  assert.equal(snapshot.hasMore, false);
+  assert.equal(snapshot.listError, null);
+  store.stop();
+});
+
+test("upsertLocal and removeLocal manage pending drafts", async () => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", []);
+  const store = createSidebarStore(fake.backend);
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+
+  store.upsertLocal(conversation("draft", { cwd: "/tmp/a", isPending: true, updatedAt: 10 }));
+  assert.equal(store.getSnapshot().conversations.length, 1);
+  assert.equal(store.getSnapshot().totalCount, 0);
+  assert.equal(store.peek("draft").isPending, true);
+
+  store.removeLocal("draft");
+  assert.equal(store.getSnapshot().conversations.length, 0);
+  assert.equal(store.peek("draft"), undefined);
+  store.stop();
+});
+
+test("remote events preserve an in-flight optimistic rename and failure restores latest remote", async (t) => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("one", { cwd: "/tmp/a", title: "before" })]);
+  let rejectRename;
+  fake.state.renameImpl = () => new Promise((_, reject) => { rejectRename = reject; });
+  const store = createSidebarStore(fake.backend);
+  t.after(() => store.stop());
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  const mutation = store.rename("one", "my title");
+  fake.emit({ kind: "upsert", conversationId: "one", conversation: conversation("one", { cwd: "/tmp/a", title: "remote title", updatedAt: 42 }) });
+  assert.equal(store.getSnapshot().byId.get("one").title, "my title");
+  rejectRename(new Error("not accepted"));
+  assert.equal(await mutation, false);
+  assert.equal(store.getSnapshot().byId.get("one").title, "remote title");
+});
+
+test("authoritative sync reset drops absent cached aliases but retains pending drafts", async (t) => {
+  const fake = createFakeBackend();
+  fake.state.pages.set("cwd:/tmp/a", [conversation("stale", { cwd: "/tmp/a" })]);
+  const store = createSidebarStore(fake.backend);
+  t.after(() => store.stop());
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  store.upsertLocal(conversation("draft", { cwd: "/tmp/a", isPending: true }));
+  fake.emit({ kind: "reset", conversations: [conversation("fresh", { cwd: "/tmp/a" })], workdirs: [{ path: "/tmp/a", conversationCount: 1, updatedAt: 2 }] });
+  assert.equal(store.getSnapshot().byId.has("stale"), false);
+  assert.equal(store.getSnapshot().byId.has("draft"), true);
+  assert.equal(store.getSnapshot().byId.has("fresh"), true);
+  assert.equal(store.getSnapshot().workdirs[0].conversationCount, 1);
+});
+
+test("healthy event sync can disable periodic list reads and restore them after failure", async (t) => {
+  const fake = createFakeBackend();
+  const healthListeners = new Set();
+  let healthy = true;
+  fake.backend.getReconcileIntervalMs = () => healthy ? null : 15;
+  fake.backend.subscribeSyncState = (listener) => { healthListeners.add(listener); return () => healthListeners.delete(listener); };
+  const store = createSidebarStore(fake.backend, { reconcileIntervalMs: 15 });
+  t.after(() => store.stop());
+  store.setScope(SCOPE_A);
+  store.start();
+  await tick();
+  const initial = fake.state.calls.list.length;
+  await sleep(45);
+  assert.equal(fake.state.calls.list.length, initial);
+  healthy = false;
+  for (const listener of healthListeners) listener();
+  await sleep(35);
+  assert.ok(fake.state.calls.list.length > initial);
+});
+
+test("a mutation response from a replaced source cannot restore its old alias", async (t) => {
+ const fake=createFakeBackend(); fake.state.pages.set("cwd:/tmp/a",[conversation("old",{cwd:"/tmp/a"})]);
+ let finish;fake.state.renameImpl=()=>new Promise(resolve=>finish=resolve);
+ const store=createSidebarStore(fake.backend); t.after(()=>store.stop());store.setScope(SCOPE_A);store.start();await tick();
+ fake.emit({kind:"reset",sourceIdentity:"source-one",conversations:[conversation("old",{cwd:"/tmp/a"})]});
+ const mutation=store.rename("old","optimistic");
+ fake.emit({kind:"reset",sourceIdentity:"source-two",conversations:[conversation("new",{cwd:"/tmp/a"})]});
+ finish(conversation("old",{cwd:"/tmp/a",title:"late"}));
+ assert.equal(await mutation,false);assert.equal(store.getSnapshot().byId.has("old"),false);assert.equal(store.getSnapshot().byId.has("new"),true);
+ assert.equal(store.getSnapshot().mutations.size,0);
+});
+
+test("a mutation resolving after stop cannot change a restarted store",async(t)=>{
+ const fake=createFakeBackend();fake.state.pages.set("cwd:/tmp/a",[conversation("one",{cwd:"/tmp/a",title:"old"})]);let finish;fake.state.renameImpl=()=>new Promise(resolve=>finish=resolve);
+ const store=createSidebarStore(fake.backend);t.after(()=>store.stop());store.setScope(SCOPE_A);store.start();await tick();
+ const mutation=store.rename("one","pending");store.stop();fake.state.pages.set("cwd:/tmp/a",[conversation("one",{cwd:"/tmp/a",title:"fresh"})]);store.start();await tick();
+ finish(conversation("one",{cwd:"/tmp/a",title:"late"}));assert.equal(await mutation,false);assert.equal(store.getSnapshot().byId.get("one").title,"fresh");
+});

@@ -1,0 +1,1309 @@
+import { EditDiffView } from "@liveagent/ui/components/chat/EditDiffView";
+import { FileToolArgsDisplay } from "@liveagent/ui/components/chat/FileToolArgs";
+import {
+  type MetaTag,
+  MetaTags,
+  PathDisplay,
+  ToolFactGrid,
+  ToolScrollablePre,
+  ToolSurface,
+  ToolSurfaceLabel,
+} from "@liveagent/ui/components/chat/ToolSurfaces";
+import { Markdown } from "@liveagent/ui/components/Markdown";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import {
+  type BrowserResultDetails,
+  type DeleteResultDetails,
+  deriveFileToolPreview,
+  type EditResultDetails,
+  type GlobResultDetails,
+  type GrepResultDetails,
+  isDynamicMcpToolName,
+  type ListResultDetails,
+  type McpManagerResultDetails,
+  previewText,
+  type ReadDocumentResultDetails,
+  type ReadImageResultDetails,
+  type ReadNotebookResultDetails,
+  type ReadPdfResultDetails,
+  type ReadTextResultDetails,
+  type SkillsManagerResultDetails,
+  safeStringify,
+  type ToolResultMessage,
+  type ToolTraceItem,
+  toolCallArgsForDisplay,
+  toolResultMessageToText,
+  type WriteResultDetails,
+} from "@liveagent/ui/lib/chat/assistantBubbleAdapter";
+import { formatLiveShellOutput } from "@liveagent/ui/lib/chat/liveShellOutput";
+import { withoutMcpElicitationDetails } from "@liveagent/ui/lib/chat/mcpElicitation";
+import {
+  formatToolRunInfo,
+  readToolRunInfo,
+  withoutToolRunInfo,
+} from "@liveagent/ui/lib/chat/toolRunInfo";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import type {
+  SubagentBatchDetails,
+  SubagentCardDetails,
+  SubagentMessageDetails,
+} from "@liveagent/ui/lib/subagents/protocol";
+import { useEffect, useLayoutEffect, useMemo, useRef } from "react";
+import { Search } from "../../IconSet";
+import {
+  displayString,
+  getBuiltinResultKind,
+  getStableValueSignature,
+  getSubagentTask,
+  isSubagentCardToolCall,
+  shouldShowSubagentApplyStatus,
+  shouldShowSubagentCleanupStatus,
+  shouldShowSubagentWorktreeLocation,
+} from "./assistantBubbleUtils";
+import { getSshManagerResultView } from "./SshManagerResult";
+import { getToolResultImages, ToolResultImagePreview } from "./ToolImages";
+
+// 距底部不超过这么多像素视为“跟随最新输出”；用户上翻查看时不抢滚动位置。
+const LIVE_OUTPUT_STICK_THRESHOLD_PX = 24;
+
+type ShellResultDetails = {
+  exit_code: number;
+  shell: string;
+  stdout: string;
+  stderr: string;
+  stdout_truncated: boolean;
+  stderr_truncated: boolean;
+  timed_out: boolean;
+  cancelled?: boolean;
+  effective_timeout_ms?: number;
+  duration_ms: number;
+};
+
+type ShellSessionResultDetails = {
+  session_id: string;
+  status: string;
+  cursor?: number;
+  has_more?: boolean;
+  exit_code?: number | null;
+  duration_ms: number;
+  shell?: string;
+  timeout_ms?: number | null;
+  output_truncated?: boolean;
+  output?: Array<{
+    stream?: string;
+    text?: string;
+  }>;
+};
+
+function isShellResultDetails(value: unknown): value is ShellResultDetails {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.exit_code === "number" &&
+    typeof candidate.shell === "string" &&
+    typeof candidate.stdout === "string" &&
+    typeof candidate.stderr === "string" &&
+    typeof candidate.stdout_truncated === "boolean" &&
+    typeof candidate.stderr_truncated === "boolean" &&
+    typeof candidate.timed_out === "boolean" &&
+    typeof candidate.duration_ms === "number"
+  );
+}
+
+function isShellSessionResultDetails(value: unknown): value is ShellSessionResultDetails {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.session_id === "string" &&
+    typeof candidate.status === "string" &&
+    typeof candidate.duration_ms === "number"
+  );
+}
+
+function buildPagedResultTags(params: {
+  label: string;
+  returned: number;
+  total: number;
+  offset: number;
+  hasMore: boolean;
+}) {
+  const { label, returned, total, offset, hasMore } = params;
+  return [
+    { label, value: `${returned}/${total}` },
+    ...(offset > 0 ? [{ label: "offset", value: String(offset) }] : []),
+    { label: "state", value: hasMore ? "partial" : "complete" },
+  ];
+}
+
+// Longest string that still reads well inside a fact-grid cell (~3 wrapped
+// lines); longer values switch the whole display to the complete JSON view.
+const GENERIC_GRID_VALUE_MAX_CHARS = 200;
+
+/** Extract tool-specific display info */
+function getToolDisplay(toolCall: ToolTraceItem["toolCall"]) {
+  const args = toolCall.arguments || {};
+  const name = toolCall.name;
+  const path = typeof args.path === "string" ? (args.path as string) : null;
+  const pattern = typeof args.pattern === "string" ? (args.pattern as string) : null;
+  const tags: MetaTag[] = [];
+
+  // Dynamic MCP tools carry arbitrary commands and nested payloads; their
+  // expanded view must show the complete (display-sanitized) arguments, not
+  // the primitive-only fact grid (#444).
+  if (isDynamicMcpToolName(name)) {
+    return { type: "raw" as const, path: null, pattern: null, tags };
+  }
+
+  switch (name) {
+    case "Read":
+      if (typeof args.start_line === "number")
+        tags.push({ label: "start", value: String(args.start_line) });
+      if (typeof args.limit === "number") tags.push({ label: "limit", value: String(args.limit) });
+      if (typeof args.page_start === "number")
+        tags.push({ label: "page", value: String(args.page_start) });
+      if (typeof args.page_limit === "number")
+        tags.push({ label: "pages", value: String(args.page_limit) });
+      if (typeof args.cell_start === "number")
+        tags.push({ label: "cell", value: String(args.cell_start) });
+      if (typeof args.cell_limit === "number")
+        tags.push({ label: "cells", value: String(args.cell_limit) });
+      return { type: "file" as const, path, tags };
+    case "SkillsManager":
+      if (typeof args.offset === "number")
+        tags.push({ label: "start", value: String(args.offset + 1) });
+      if (typeof args.length === "number")
+        tags.push({ label: "limit", value: String(args.length) });
+      return { type: "file" as const, path, tags };
+    case "MemoryManager":
+      if (typeof args.action === "string")
+        tags.push({ label: "action", value: args.action as string });
+      if (typeof args.slug === "string") tags.push({ label: "slug", value: args.slug as string });
+      if (typeof args.scope === "string")
+        tags.push({ label: "scope", value: args.scope as string });
+      if (typeof args.type === "string") tags.push({ label: "type", value: args.type as string });
+      return { type: "generic" as const, path: null, pattern: null, tags };
+    case "McpManager":
+      if (typeof args.action === "string")
+        tags.push({ label: "action", value: args.action as string });
+      if (typeof args.server_id === "string")
+        tags.push({ label: "server", value: args.server_id as string });
+      if (Array.isArray(args.server_ids))
+        tags.push({ label: "servers", value: String(args.server_ids.length) });
+      if (typeof args.conflict === "string")
+        tags.push({ label: "conflict", value: args.conflict as string });
+      if (args.include_schema === true) tags.push({ label: "schema", value: "true" });
+      return { type: "generic" as const, path: null, pattern: null, tags };
+    case "SendMessage":
+      if (typeof args.to === "string") tags.push({ label: "to", value: args.to as string });
+      if (typeof args.channel === "string")
+        tags.push({ label: "channel", value: args.channel as string });
+      if (typeof args.subject === "string")
+        tags.push({ label: "subject", value: args.subject as string });
+      if (typeof args.summary === "string" && typeof args.subject !== "string")
+        tags.push({ label: "subject", value: args.summary as string });
+      if (typeof args.message === "string")
+        tags.push({ label: "message", value: `${(args.message as string).length} chars` });
+      return { type: "generic" as const, path: null, pattern: null, tags };
+    case "Delete":
+      return { type: "file" as const, path, tags };
+    case "List":
+      if (typeof args.depth === "number") tags.push({ label: "depth", value: String(args.depth) });
+      if (typeof args.offset === "number")
+        tags.push({ label: "offset", value: String(args.offset) });
+      if (typeof args.max_results === "number")
+        tags.push({ label: "max", value: String(args.max_results) });
+      return { type: "file" as const, path: path || "/", tags };
+    case "Glob":
+      if (typeof args.offset === "number")
+        tags.push({ label: "offset", value: String(args.offset) });
+      if (typeof args.max_results === "number")
+        tags.push({ label: "max", value: String(args.max_results) });
+      return { type: "search" as const, path, pattern, tags };
+    case "Grep":
+      if (typeof args.file_pattern === "string")
+        tags.push({ label: "filter", value: args.file_pattern as string });
+      if (typeof args.output_mode === "string")
+        tags.push({ label: "mode", value: args.output_mode as string });
+      if (typeof args.ignore_case === "boolean" && args.ignore_case)
+        tags.push({ label: "flag", value: "-i" });
+      if (typeof args.context === "number" && args.context > 0)
+        tags.push({ label: "ctx", value: String(args.context) });
+      if (typeof args.head_limit === "number")
+        tags.push({ label: "head", value: String(args.head_limit) });
+      if (args.multiline === true) tags.push({ label: "multi", value: "true" });
+      return { type: "search" as const, path, pattern, tags };
+    case "Bash":
+      return { type: "bash" as const, path: null, pattern: null, tags };
+    case "ManagedProcess": {
+      if (typeof args.action === "string") tags.push({ label: "action", value: args.action });
+      if (typeof args.process_id === "string")
+        tags.push({ label: "process", value: args.process_id as string });
+      if (typeof args.label === "string")
+        tags.push({ label: "label", value: args.label as string });
+      if (typeof args.cwd === "string") tags.push({ label: "cwd", value: args.cwd as string });
+      if (args.isolated === true) tags.push({ label: "isolated", value: "true" });
+      if (typeof args.max_bytes === "number")
+        tags.push({ label: "max_bytes", value: String(args.max_bytes) });
+      const command = typeof args.command === "string" ? (args.command as string).trim() : "";
+      return command
+        ? { type: "bash" as const, path: null, pattern: null, tags }
+        : { type: "generic" as const, path: null, pattern: null, tags };
+    }
+    default: {
+      // Generic args: short primitives keep the compact fact grid; anything
+      // long or nested falls through to the complete JSON view — the expanded
+      // area must never lose argument content irreversibly (#444). Iterating
+      // the display projection keeps synthetic __-keys hidden and oversized
+      // strings capped with an explicit length marker.
+      const entries: MetaTag[] = [];
+      for (const [key, value] of Object.entries(toolCallArgsForDisplay(toolCall))) {
+        if (typeof value === "string") {
+          if (value.length > GENERIC_GRID_VALUE_MAX_CHARS) {
+            return { type: "raw" as const, path: null, pattern: null, tags };
+          }
+          entries.push({ label: key, value });
+        } else if (typeof value === "number" || typeof value === "boolean") {
+          entries.push({ label: key, value: String(value) });
+        } else if (value !== null && value !== undefined) {
+          return { type: "raw" as const, path: null, pattern: null, tags };
+        }
+      }
+      return { type: "generic" as const, path: null, pattern: null, tags: entries };
+    }
+  }
+}
+
+/** Expanded args display — tool-aware layout */
+export function ToolArgsDisplay({ item }: { item: ToolTraceItem }) {
+  const toolCall = item.toolCall;
+
+  const filePreview = deriveFileToolPreview(toolCall);
+  if (filePreview) {
+    return <FileToolArgsDisplay preview={filePreview} />;
+  }
+
+  const display = getToolDisplay(toolCall);
+
+  if (isSubagentCardToolCall(toolCall)) {
+    const args = toolCall.arguments || {};
+    const name = displayString(args.name) || displayString(args.id);
+    const role = displayString(args.role);
+    const task = displayString(args.prompt);
+
+    return (
+      <div className="flex flex-col gap-2">
+        {name ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="agent" />
+            <div className="break-words text-xs font-semibold leading-1p55 text-foreground/86">
+              {name}
+            </div>
+          </ToolSurface>
+        ) : null}
+        {role ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="role" />
+            <div className="break-words text-xs leading-1p55 text-foreground/78">{role}</div>
+          </ToolSurface>
+        ) : null}
+        {task ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="task" />
+            <div className="break-words text-xs leading-1p6 text-foreground/82">{task}</div>
+          </ToolSurface>
+        ) : null}
+      </div>
+    );
+  }
+
+  // Bash / ManagedProcess(start): terminal block
+  if (display.type === "bash") {
+    const cmd =
+      typeof toolCall.arguments?.command === "string"
+        ? (toolCall.arguments.command as string).trim()
+        : "";
+    if (!cmd) return null;
+    return (
+      <div className="flex flex-col gap-2">
+        <ToolScrollablePre className="max-h-44 bg-zinc-950/90 text-emerald-300/90 dark:bg-zinc-950/90">
+          <span className="mr-1 select-none text-emerald-500/30">$</span>
+          {cmd}
+        </ToolScrollablePre>
+        {display.tags.length > 0 ? <MetaTags tags={display.tags} /> : null}
+      </div>
+    );
+  }
+
+  // File tools: target path + compact request facts
+  if (display.type === "file" && (display.path || display.tags.length > 0)) {
+    return (
+      <div className="flex flex-col gap-2">
+        {display.path ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="path" />
+            <PathDisplay
+              path={display.path}
+              className="block min-w-0 break-all font-mono text-xs leading-1p6"
+            />
+          </ToolSurface>
+        ) : null}
+        {display.tags.length > 0 ? <MetaTags tags={display.tags} /> : null}
+      </div>
+    );
+  }
+
+  // Search tools: query, scope, and request facts
+  if (display.type === "search" && (display.pattern || display.path || display.tags.length > 0)) {
+    return (
+      <div className="flex flex-col gap-2">
+        {display.pattern ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="query" />
+            <div className="flex items-start gap-2">
+              <Search className="mt-2px size-3.5 shrink-0 text-muted-foreground/35" />
+              <span className="min-w-0 break-all font-mono text-xs leading-1p6 text-foreground/82">
+                {display.pattern}
+              </span>
+            </div>
+          </ToolSurface>
+        ) : null}
+        {display.path ? (
+          <ToolSurface>
+            <ToolSurfaceLabel label="scope" />
+            <PathDisplay
+              path={display.path}
+              className="block min-w-0 break-all font-mono text-xs leading-1p6"
+            />
+          </ToolSurface>
+        ) : null}
+        {display.tags.length > 0 ? <MetaTags tags={display.tags} /> : null}
+      </div>
+    );
+  }
+
+  // Generic: key-value grid
+  if (display.type === "generic" && display.tags.length > 0) {
+    return <ToolFactGrid tags={display.tags} />;
+  }
+
+  // Fallback: complete JSON — dynamic MCP tools and generic args carrying
+  // long or nested values. The surface is height-bounded and wraps long
+  // lines; oversized fields arrive pre-capped with an explicit marker from
+  // toolCallArgsForDisplay. Cached by argument identity — settled tool args
+  // are immutable, so virtualizer remounts reuse the stringified form.
+  return (
+    <ToolSurface className="overflow-hidden p-0">
+      <ToolScrollablePre className="max-h-56 whitespace-pre-wrap break-words rounded-none">
+        {getRawArgsDisplayText(toolCall)}
+      </ToolScrollablePre>
+    </ToolSurface>
+  );
+}
+
+const rawArgsDisplayCache = new WeakMap<object, string>();
+
+function getRawArgsDisplayText(toolCall: ToolTraceItem["toolCall"]) {
+  const cacheKey = toolCall.arguments;
+  if (!cacheKey || typeof cacheKey !== "object") {
+    return safeStringify(toolCallArgsForDisplay(toolCall));
+  }
+  const cached = rawArgsDisplayCache.get(cacheKey);
+  if (cached !== undefined) return cached;
+  const text = safeStringify(toolCallArgsForDisplay(toolCall));
+  rawArgsDisplayCache.set(cacheKey, text);
+  return text;
+}
+
+function extractResultText(result?: ToolResultMessage) {
+  return result ? toolResultMessageToText(result) : "";
+}
+
+function stripShellSessionEnvelope(text: string) {
+  const outputMarker = /\n(?:stdout|stderr|output)(?: \(truncated\))?:\n/g;
+  const firstMarker = outputMarker.exec(text);
+  if (!firstMarker) {
+    return text.trimStart().startsWith("# Shell Session") ? "" : text.trimEnd();
+  }
+
+  return text
+    .slice(firstMarker.index + firstMarker[0].length)
+    .replace(/\n(?:stdout|stderr|output)(?: \(truncated\))?:\n/g, "\n")
+    .replace(/\n\n(?:Command is still running\.|More buffered output is available\.)[\s\S]*$/, "")
+    .trimEnd();
+}
+
+export function getShellDisplayOutput(result?: ToolResultMessage) {
+  if (!result) return "";
+
+  if (isShellSessionResultDetails(result.details) && Array.isArray(result.details.output)) {
+    return result.details.output
+      .map((chunk) => (typeof chunk?.text === "string" ? chunk.text : ""))
+      .join("")
+      .trimEnd();
+  }
+
+  if (isShellResultDetails(result.details)) {
+    return [result.details.stdout, result.details.stderr].filter(Boolean).join("\n").trimEnd();
+  }
+
+  return stripShellSessionEnvelope(extractResultText(result));
+}
+
+export function ShellToolDisplay({
+  item,
+  result,
+}: {
+  item: ToolTraceItem;
+  result: ToolResultMessage | undefined;
+}) {
+  const { t } = useLocale();
+  const command =
+    item.toolCall.name === "Bash" && typeof item.toolCall.arguments?.command === "string"
+      ? item.toolCall.arguments.command.trim()
+      : "";
+  const output = getShellDisplayOutput(result);
+  // 尚无结果时展示后端推送的输出尾部（编译进度等，#975）；结果到达后由最终输出取代。
+  const rawLiveOutput = result ? "" : (item.liveOutput ?? "");
+  const liveOutput = useMemo(() => formatLiveShellOutput(rawLiveOutput), [rawLiveOutput]);
+  const isLive = liveOutput !== "";
+  const preRef = useRef<HTMLPreElement>(null);
+  const followRef = useRef(true);
+  useEffect(() => {
+    const element = preRef.current;
+    if (!element || !isLive) return;
+    const onScroll = () => {
+      followRef.current =
+        element.scrollHeight - element.scrollTop - element.clientHeight <=
+        LIVE_OUTPUT_STICK_THRESHOLD_PX;
+    };
+    element.addEventListener("scroll", onScroll, { passive: true });
+    return () => element.removeEventListener("scroll", onScroll);
+  }, [isLive]);
+  useLayoutEffect(() => {
+    const element = preRef.current;
+    if (!element || !liveOutput || !followRef.current) return;
+    element.scrollTop = element.scrollHeight;
+  }, [liveOutput]);
+  const body = output ? previewText(output, 6000) : liveOutput;
+  const runInfo = formatToolRunInfo(readToolRunInfo(result?.details), {
+    exitCode: t("chat.tool.run.exitCode"),
+    timedOut: t("chat.tool.run.timedOut"),
+  });
+  if (!command && !body) return null;
+
+  return (
+    <section
+      className="overflow-hidden rounded-xl border border-border/75 bg-foreground/[0.025] dark:bg-white/[0.035]"
+      aria-label="Shell"
+      data-shell-tool-display=""
+    >
+      <div className="flex items-baseline justify-between gap-3 px-3 pb-0.5 pt-2.5 text-xs font-medium text-muted-foreground/75">
+        <span>Shell</span>
+        {runInfo ? (
+          <span
+            className={cn(
+              "shrink-0 font-mono text-[11px] font-normal tabular-nums text-muted-foreground/60",
+              result?.isError && "text-red-700/75 dark:text-red-300/75",
+            )}
+            data-shell-run-info=""
+          >
+            {runInfo}
+          </span>
+        ) : null}
+      </div>
+      <ToolScrollablePre
+        ref={preRef}
+        className={cn(
+          "max-h-72 rounded-none bg-transparent px-3 pb-3 pt-1.5 text-foreground/78",
+          result?.isError && "text-red-700/90 dark:text-red-300/90",
+        )}
+      >
+        {command ? (
+          <>
+            <span className="select-none text-muted-foreground/45">$ </span>
+            {command}
+            {body ? "\n" : null}
+          </>
+        ) : null}
+        {isLive && !output ? (
+          <span className="text-foreground/62" data-shell-live-output="">
+            {liveOutput}
+          </span>
+        ) : (
+          body || null
+        )}
+      </ToolScrollablePre>
+    </section>
+  );
+}
+
+function extractReadBody(text: string) {
+  const marker = text.indexOf("\n\n");
+  return marker >= 0 ? text.slice(marker + 2) : text;
+}
+
+function CodePreview(props: { text: string; maxChars?: number }) {
+  const { text, maxChars = 4000 } = props;
+  if (!/\S/.test(text)) return null;
+  return (
+    <ToolScrollablePre className="max-h-56 bg-black/[0.02] dark:bg-white/[0.03]">
+      {previewText(text, maxChars)}
+    </ToolScrollablePre>
+  );
+}
+
+// Render-layer tolerance for historical messages: current details carry
+// `scope` ("workspace" | "skill" | "external"), while old sessions may still
+// carry the legacy `root` ("workspace" | "skills") or unknown scope values
+// such as "temp"/"artifact". Degrade at the read site — unknown values are
+// displayed verbatim; "workspace" (the default) is hidden.
+function resolveFileToolScope(details: unknown): string | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const record = details as Record<string, unknown>;
+  const scope =
+    typeof record.scope === "string" && record.scope.trim() ? record.scope.trim() : undefined;
+  const legacyRoot =
+    typeof record.root === "string" && record.root.trim() ? record.root.trim() : undefined;
+  const resolved = scope ?? (legacyRoot === "skills" ? "skill" : legacyRoot);
+  return resolved && resolved !== "workspace" ? resolved : undefined;
+}
+
+function fileScopeTags(details: unknown): MetaTag[] {
+  const scope = resolveFileToolScope(details);
+  return scope ? [{ label: "scope", value: scope }] : [];
+}
+
+export function ToolResultDisplay({
+  item,
+  result,
+  readOnly = false,
+}: {
+  item: ToolTraceItem;
+  result: ToolResultMessage;
+  readOnly?: boolean;
+}) {
+  const kind = getBuiltinResultKind(result);
+  const text = extractResultText(result);
+  const images = getToolResultImages(result);
+  const isShellSessionTool =
+    item.toolCall.name === "Bash" ||
+    item.toolCall.name === "ProcessWait" ||
+    item.toolCall.name === "ProcessStop";
+
+  if (isShellSessionTool) return null;
+
+  const sshView = getSshManagerResultView(item.toolCall.name, text, result.isError);
+  if (sshView) return sshView;
+
+  if (kind === "read_text") {
+    const details = result.details as ReadTextResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              {
+                label: "lines",
+                value:
+                  details.numLines > 0
+                    ? `${details.startLine}-${details.startLine + details.numLines - 1}/${details.totalLines}`
+                    : `empty/${details.totalLines}`,
+              },
+              { label: "view", value: details.isPartialView ? "partial" : "full" },
+              ...(details.truncated ? [{ label: "truncated", value: "true" }] : []),
+              ...(details.reusedExisting ? [{ label: "cache", value: "unchanged" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {!details.reusedExisting ? (
+          <CodePreview text={extractReadBody(text)} maxChars={8000} />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (kind === "read_skill") {
+    const details = result.details as SkillsManagerResultDetails;
+    if (details.kind !== "read_skill") return null;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              {
+                label: "lines",
+                value:
+                  details.numLines > 0
+                    ? `${details.startLine}-${details.startLine + details.numLines - 1}`
+                    : `empty @ ${details.startLine}`,
+              },
+              ...(details.truncated ? [{ label: "truncated", value: "true" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        <CodePreview text={extractReadBody(text)} maxChars={8000} />
+      </div>
+    );
+  }
+
+  if (kind === "manage_skill") {
+    const details = result.details as Extract<SkillsManagerResultDetails, { kind: "manage_skill" }>;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              { label: "action", value: details.action },
+              { label: "root", value: details.rootDir },
+              ...(typeof details.skillsCount === "number"
+                ? [{ label: "skills", value: String(details.skillsCount) }]
+                : []),
+              ...(typeof details.installedCount === "number"
+                ? [{ label: "installed", value: String(details.installedCount) }]
+                : []),
+              ...(details.createdName ? [{ label: "created", value: details.createdName }] : []),
+              ...(typeof details.clawhubResultCount === "number"
+                ? [{ label: "clawhub", value: String(details.clawhubResultCount) }]
+                : []),
+              ...(details.clawhubSlug ? [{ label: "slug", value: details.clawhubSlug }] : []),
+              ...(typeof details.validationOk === "boolean"
+                ? [{ label: "valid", value: details.validationOk ? "true" : "false" }]
+                : []),
+              ...(details.packageArchive
+                ? [{ label: "archive", value: details.packageArchive }]
+                : []),
+              ...(details.clawhubNextCursor
+                ? [{ label: "cursor", value: details.clawhubNextCursor }]
+                : []),
+              ...(typeof details.invalidCount === "number" && details.invalidCount > 0
+                ? [{ label: "invalid", value: String(details.invalidCount) }]
+                : []),
+              ...(details.backup ? [{ label: "backup", value: details.backup }] : []),
+            ]}
+          />
+        </ToolSurface>
+        <CodePreview text={text} maxChars={8000} />
+      </div>
+    );
+  }
+
+  if (kind === "manage_mcp") {
+    const details = result.details as McpManagerResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              { label: "action", value: details.action },
+              ...(details.serverId ? [{ label: "server", value: details.serverId }] : []),
+              ...(details.transport ? [{ label: "transport", value: details.transport }] : []),
+              ...(typeof details.ok === "boolean"
+                ? [{ label: "ok", value: details.ok ? "true" : "false" }]
+                : []),
+              ...(details.phase ? [{ label: "phase", value: details.phase }] : []),
+              ...(typeof details.serverCount === "number"
+                ? [{ label: "servers", value: String(details.serverCount) }]
+                : []),
+              ...(typeof details.enabledCount === "number"
+                ? [{ label: "enabled", value: String(details.enabledCount) }]
+                : []),
+              ...(typeof details.toolsCount === "number"
+                ? [{ label: "tools", value: String(details.toolsCount) }]
+                : []),
+              ...(typeof details.changed === "boolean"
+                ? [{ label: "changed", value: details.changed ? "true" : "false" }]
+                : []),
+              ...(typeof details.stopped === "boolean"
+                ? [{ label: "stopped", value: details.stopped ? "true" : "false" }]
+                : []),
+            ]}
+          />
+        </ToolSurface>
+        <CodePreview text={text} maxChars={8000} />
+      </div>
+    );
+  }
+
+  if (kind === "read_image") {
+    const details = result.details as ReadImageResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              { label: "mime", value: details.mimeType },
+              { label: "size", value: `${details.sizeBytes} bytes` },
+              ...(details.reusedExisting ? [{ label: "cache", value: "unchanged" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {!details.reusedExisting && images.length > 0 ? (
+          <div className="overflow-hidden rounded-lg border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
+            {images.map((image, index) => (
+              <ToolResultImagePreview
+                // biome-ignore lint/suspicious/noArrayIndexKey: 同一结果可含重复图片（内容签名会撞 key）；列表随结果整体重建，索引 key 稳定唯一。
+                key={`${details.path}-${index}`}
+                id={`${details.path}-${index}`}
+                image={image}
+                alt={details.path}
+                sizeBytes={details.sizeBytes}
+                readOnly={readOnly}
+              />
+            ))}
+          </div>
+        ) : null}
+      </div>
+    );
+  }
+
+  if (kind === "read_pdf") {
+    const details = result.details as ReadPdfResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              {
+                label: "pages",
+                value:
+                  details.numPages > 0
+                    ? `${details.pageStart}-${details.pageStart + details.numPages - 1}/${details.totalPages}`
+                    : `empty/${details.totalPages}`,
+              },
+              ...(details.truncated ? [{ label: "truncated", value: "true" }] : []),
+              ...(details.reusedExisting ? [{ label: "cache", value: "unchanged" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {!details.reusedExisting ? (
+          <CodePreview text={extractReadBody(text)} maxChars={8000} />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (kind === "read_notebook") {
+    const details = result.details as ReadNotebookResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              {
+                label: "cells",
+                value:
+                  details.numCells > 0
+                    ? `${details.cellStart}-${details.cellStart + details.numCells - 1}/${details.totalCells}`
+                    : `empty/${details.totalCells}`,
+              },
+              ...(details.truncated ? [{ label: "truncated", value: "true" }] : []),
+              ...(details.reusedExisting ? [{ label: "cache", value: "unchanged" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {!details.reusedExisting ? (
+          <CodePreview text={extractReadBody(text)} maxChars={8000} />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (kind === "read_word" || kind === "read_spreadsheet" || kind === "read_archive") {
+    const details = result.details as ReadDocumentResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              ...(details.mimeType ? [{ label: "mime", value: details.mimeType }] : []),
+              ...(typeof details.sizeBytes === "number"
+                ? [{ label: "size", value: `${details.sizeBytes} bytes` }]
+                : []),
+              ...(details.truncated ? [{ label: "truncated", value: "true" }] : []),
+              ...(details.reusedExisting ? [{ label: "cache", value: "unchanged" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {!details.reusedExisting ? (
+          <CodePreview text={extractReadBody(text)} maxChars={8000} />
+        ) : null}
+      </div>
+    );
+  }
+
+  if (kind === "write") {
+    const details = result.details as WriteResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              { label: "target", value: details.existedBefore ? "existing" : "new" },
+              { label: "bytes", value: String(details.bytesWritten) },
+              { label: "lines", value: String(details.totalLines) },
+            ]}
+          />
+        </ToolSurface>
+        <CodePreview text={details.preview} />
+      </div>
+    );
+  }
+
+  if (kind === "edit") {
+    const details = result.details as EditResultDetails;
+    return (
+      <EditDiffView
+        beforeText={details.oldPreview}
+        afterText={details.newPreview}
+        filePath={
+          details.displayPath ||
+          (resolveFileToolScope(details) === "skill" ? `skills:${details.path}` : details.path)
+        }
+      />
+    );
+  }
+
+  if (kind === "delete") {
+    const details = result.details as DeleteResultDetails;
+    return (
+      <ToolSurface>
+        <MetaTags
+          tags={[...fileScopeTags(details), { label: "kind", value: details.targetKind }]}
+        />
+      </ToolSurface>
+    );
+  }
+
+  if (kind === "list") {
+    const details = result.details as ListResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={buildPagedResultTags({
+              label: "items",
+              returned: details.entries.length,
+              total: details.total,
+              offset: details.offset,
+              hasMore: details.hasMore,
+            }).concat(fileScopeTags(details))}
+          />
+        </ToolSurface>
+        <ToolSurface className="max-h-56 overflow-auto">
+          <div className="space-y-1">
+            {details.entries.map((entry) => (
+              <div
+                key={`${entry.kind}-${entry.path}`}
+                className={cn(
+                  "flex items-start gap-2 rounded-md px-1.5 py-1 text-xs leading-1p5",
+                  "even:bg-black/[0.02] dark:even:bg-white/[0.03]",
+                )}
+              >
+                <span className="mt-1px shrink-0 text-tiny font-semibold uppercase text-muted-foreground/35">
+                  {entry.kind}
+                </span>
+                <PathDisplay path={entry.path} className="min-w-0 break-all font-mono text-xs" />
+              </div>
+            ))}
+          </div>
+        </ToolSurface>
+      </div>
+    );
+  }
+
+  if (kind === "glob") {
+    const details = result.details as GlobResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={buildPagedResultTags({
+              label: "matches",
+              returned: details.paths.length,
+              total: details.total,
+              offset: details.offset,
+              hasMore: details.hasMore,
+            }).concat(fileScopeTags(details))}
+          />
+        </ToolSurface>
+        <ToolSurface className="max-h-56 overflow-auto">
+          <div className="space-y-1">
+            {details.paths.map((entry) => (
+              <PathDisplay
+                key={entry}
+                path={entry}
+                className={cn(
+                  "block rounded-md px-1.5 py-1",
+                  "break-all font-mono text-xs leading-1p5 even:bg-black/[0.02] dark:even:bg-white/[0.03]",
+                )}
+              />
+            ))}
+          </div>
+        </ToolSurface>
+      </div>
+    );
+  }
+
+  if (kind === "grep") {
+    const details = result.details as GrepResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              ...fileScopeTags(details),
+              { label: "mode", value: details.outputMode },
+              { label: "matches", value: String(details.matchCount) },
+              { label: "files", value: String(details.fileCount) },
+              ...(details.offset > 0 ? [{ label: "offset", value: String(details.offset) }] : []),
+              { label: "state", value: details.hasMore ? "partial" : "complete" },
+            ]}
+          />
+        </ToolSurface>
+        {details.outputMode === "count" ? null : details.outputMode === "files" ? (
+          <ToolSurface className="max-h-56 overflow-auto">
+            <div className="space-y-1.5">
+              {details.files.map((file) => (
+                <div
+                  key={file.path}
+                  className="space-y-1 rounded-md px-1.5 py-1 even:bg-black/[0.02] dark:even:bg-white/[0.03]"
+                >
+                  <PathDisplay
+                    path={file.path}
+                    className="block break-all font-mono text-xs leading-1p5"
+                  />
+                  <MetaTags
+                    tags={[
+                      { label: "count", value: String(file.count) },
+                      ...(typeof file.firstLine === "number"
+                        ? [{ label: "first", value: String(file.firstLine) }]
+                        : []),
+                    ]}
+                  />
+                </div>
+              ))}
+            </div>
+          </ToolSurface>
+        ) : (
+          <ToolSurface className="max-h-64 overflow-auto space-y-2">
+            {details.matches.map((match, index) => (
+              <div
+                // biome-ignore lint/suspicious/noArrayIndexKey: multiline grep 同一行可命中多次产生字段全同的 match；列表随结果整体重建，索引 key 稳定唯一。
+                key={`${match.path}:${match.line}:${index}`}
+                className="rounded-md border border-black/[0.05] bg-white/[0.55] p-2 dark:border-white/[0.06] dark:bg-white/[0.03]"
+              >
+                <div className="flex items-start gap-2">
+                  <PathDisplay
+                    path={match.path}
+                    className="min-w-0 break-all font-mono text-xs leading-1p5"
+                  />
+                  <span
+                    className={cn(
+                      "shrink-0 rounded bg-black/[0.04] px-1.5 py-1px",
+                      "text-tiny font-semibold text-muted-foreground/60 dark:bg-white/[0.05]",
+                    )}
+                  >
+                    line {match.line}
+                  </span>
+                </div>
+                {match.before.length > 0 ? (
+                  <CodePreview text={match.before.join("\n")} maxChars={1500} />
+                ) : null}
+                <CodePreview text={match.text} maxChars={1500} />
+                {match.after.length > 0 ? (
+                  <CodePreview text={match.after.join("\n")} maxChars={1500} />
+                ) : null}
+              </div>
+            ))}
+          </ToolSurface>
+        )}
+      </div>
+    );
+  }
+
+  if (kind === "subagent_batch") {
+    const details = result.details as SubagentBatchDetails;
+    if (details.status !== "rejected" && result.isError !== true) {
+      // The successful parent batch is rendered as per-agent cards.
+      return null;
+    }
+    const issues = details.issues ?? [];
+    return (
+      <ToolSurface className="space-y-2">
+        <MetaTags
+          tags={[
+            { label: "agent", value: "rejected" },
+            { label: "issues", value: String(issues.length) },
+          ]}
+        />
+        <div className="text-xs font-semibold leading-1p45 text-foreground/90">
+          Agent call rejected — no subagents were started
+        </div>
+        {issues.length > 0 ? (
+          <CodePreview
+            text={issues
+              .map(
+                (item, index) =>
+                  `${index + 1}. [${item.code}]${item.agentId ? ` agent=${item.agentId}` : ""} ${item.message}`,
+              )
+              .join("\n")}
+            maxChars={2400}
+          />
+        ) : (
+          <CodePreview
+            text={result.content
+              .map((block) => (block.type === "text" ? block.text : ""))
+              .join("\n")}
+            maxChars={2400}
+          />
+        )}
+      </ToolSurface>
+    );
+  }
+
+  if (kind === "subagent_card") {
+    const details = result.details as SubagentCardDetails;
+    const agent = details.agent;
+    const agentDisplayName = agent.name || agent.id;
+    const agentTask = getSubagentTask(agent);
+    const tags: MetaTag[] = [
+      { label: "agent", value: `${details.index + 1}/${details.total}` },
+      { label: "status", value: agent.status },
+    ];
+    if (agent.mode === "worktree") {
+      tags.push({ label: "mode", value: agent.mode });
+    }
+    if (shouldShowSubagentApplyStatus(agent) && agent.applyStatus) {
+      tags.push({ label: "apply", value: agent.applyStatus });
+    }
+    if (shouldShowSubagentCleanupStatus(agent) && agent.worktreeCleanupStatus) {
+      tags.push({ label: "cleanup", value: agent.worktreeCleanupStatus });
+    }
+
+    const untrackedFiles = agent.untrackedFiles ?? [];
+    const candidateArtifacts = agent.candidateArtifacts ?? [];
+    const showUntrackedFiles = agent.applyStatus !== "applied" && untrackedFiles.length > 0;
+    const showCandidateArtifacts = Boolean(
+      candidateArtifacts.length > 0 &&
+        agent.applySkippedReason &&
+        agent.applySkippedReason !== "no_changes",
+    );
+
+    return (
+      <ToolSurface className="space-y-2">
+        <MetaTags tags={tags} />
+        <div className="space-y-2">
+          <div className="text-xs font-semibold leading-1p45 text-foreground/90">
+            {agentDisplayName}
+          </div>
+          {agent.role ? (
+            <div className="text-xs font-medium leading-1p55 text-foreground/78">
+              <span className="text-muted-foreground">role</span> {agent.role}
+            </div>
+          ) : null}
+          {agentTask ? (
+            <div className="break-words text-xs font-medium leading-1p6 text-foreground/80">
+              <span className="text-muted-foreground">task</span> {agentTask}
+            </div>
+          ) : null}
+          {shouldShowSubagentWorktreeLocation(agent) ? (
+            <div className="break-all text-tiny text-muted-foreground/70">
+              {agent.branchName ? `${agent.branchName} | ` : ""}
+              {agent.worktreeRoot}
+            </div>
+          ) : null}
+          {agent.diffStat ? <CodePreview text={agent.diffStat} maxChars={1200} /> : null}
+          {showUntrackedFiles ? (
+            <CodePreview
+              text={`untracked:\n${untrackedFiles.map((file) => `- ${file}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.worktreeStatusError ? (
+            <CodePreview text={agent.worktreeStatusError} maxChars={1200} />
+          ) : null}
+          {agent.applyError ? (
+            <CodePreview text={`apply failed:\n${agent.applyError}`} maxChars={1200} />
+          ) : agent.applySkippedReason && agent.applySkippedReason !== "no_changes" ? (
+            <CodePreview text={`apply skipped: ${agent.applySkippedReason}`} maxChars={1200} />
+          ) : null}
+          {agent.applyFallbackReason ? (
+            <CodePreview text={`fallback reason:\n${agent.applyFallbackReason}`} maxChars={1200} />
+          ) : null}
+          {agent.applyCopiedFiles && agent.applyCopiedFiles.length > 0 ? (
+            <CodePreview
+              text={`copied:\n${agent.applyCopiedFiles.map((file) => `- ${file}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.applyDeletedFiles && agent.applyDeletedFiles.length > 0 ? (
+            <CodePreview
+              text={`deleted:\n${agent.applyDeletedFiles.map((file) => `- ${file}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.applyConflictFiles && agent.applyConflictFiles.length > 0 ? (
+            <CodePreview
+              text={`apply conflicts:\n${agent.applyConflictFiles.map((file) => `- ${file}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.worktreeCleanupError ? (
+            <CodePreview
+              text={`worktree cleanup failed:\n${agent.worktreeCleanupError}`}
+              maxChars={1200}
+            />
+          ) : agent.worktreeCleanupReason && agent.worktreeCleanupStatus === "retained" ? (
+            <CodePreview
+              text={`worktree retained: ${agent.worktreeCleanupReason}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {showCandidateArtifacts ? (
+            <CodePreview
+              text={`candidate artifacts:\n${candidateArtifacts.map((file) => `- ${file}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.persistenceWarnings && agent.persistenceWarnings.length > 0 ? (
+            <CodePreview
+              text={`persistence warning:\n${agent.persistenceWarnings.map((item) => `- ${item}`).join("\n")}`}
+              maxChars={1200}
+            />
+          ) : null}
+          {agent.error ? (
+            <CodePreview text={agent.error} maxChars={1200} />
+          ) : agent.summary ? (
+            <CodePreview text={agent.summary} maxChars={2400} />
+          ) : null}
+        </div>
+      </ToolSurface>
+    );
+  }
+
+  if (kind === "subagent_message") {
+    const details = result.details as SubagentMessageDetails;
+    const from = details.senderName || details.senderId;
+    const to = details.recipientName || details.recipientId;
+    return (
+      <ToolSurface className="space-y-2">
+        <MetaTags
+          tags={[
+            { label: "seq", value: String(details.seq) },
+            { label: "channel", value: details.channel },
+            { label: "from", value: from },
+            { label: "to", value: to },
+          ]}
+        />
+        {details.subject ? (
+          <div className="break-words text-xs font-semibold leading-1p5 text-foreground/86">
+            {details.subject}
+          </div>
+        ) : null}
+        {details.bodyPreview ? (
+          <div
+            className={cn(
+              "rounded-md border border-black/[0.05] bg-white/[0.45] px-2.5 py-2 text-xs leading-1p6",
+              "dark:border-white/[0.07] dark:bg-white/[0.03]",
+            )}
+          >
+            <Markdown content={details.bodyPreview} />
+          </div>
+        ) : null}
+      </ToolSurface>
+    );
+  }
+
+  if (images.length > 0) {
+    return (
+      <div className="space-y-2">
+        <div className="overflow-hidden rounded-lg border border-black/[0.06] bg-white/[0.55] p-2 dark:border-white/[0.08] dark:bg-white/[0.04]">
+          {images.map((image, index) => (
+            <ToolResultImagePreview
+              // biome-ignore lint/suspicious/noArrayIndexKey: 同一结果可含重复图片（内容签名会撞 key）；列表随结果整体重建，索引 key 稳定唯一。
+              key={`${item.toolCall.id}-${index}`}
+              id={`${item.toolCall.id}-${index}`}
+              image={image}
+              alt={item.toolCall.name}
+              readOnly={readOnly}
+            />
+          ))}
+        </div>
+        {/\S/.test(text) ? <CodePreview text={text} maxChars={3000} /> : null}
+      </div>
+    );
+  }
+
+  // Browser 非截图结果:MetaTags 概览 + 结果正文(Page 行 / eval 输出 / a11y
+  // snapshot)。截图结果在上面的 images 分支渲染(图 + 附带文本)。
+  if (kind === "browser") {
+    const details = result.details as BrowserResultDetails;
+    return (
+      <div className="space-y-2">
+        <ToolSurface>
+          <MetaTags
+            tags={[
+              { label: "action", value: details.action || "unknown" },
+              ...(details.url ? [{ label: "url", value: details.url }] : []),
+              ...(details.title ? [{ label: "title", value: details.title }] : []),
+              ...(details.hasSnapshot ? [{ label: "snapshot", value: "included" }] : []),
+            ]}
+          />
+        </ToolSurface>
+        {/\S/.test(text) ? <CodePreview text={text} maxChars={8000} /> : null}
+      </div>
+    );
+  }
+
+  // Error results (and blocked calls) carry an empty details object — showing
+  // a literal "{}" would bury the actual error text, which renders below.
+  // Run info (exit code, duration) shows as one line, never as raw JSON.
+  // Elicitation records render as their own cards below the tool row.
+  const otherDetails = withoutMcpElicitationDetails(withoutToolRunInfo(result.details));
+  const hasOtherDetails =
+    otherDetails !== null &&
+    typeof otherDetails === "object" &&
+    Object.keys(otherDetails).length > 0;
+  const runInfoLine = <ToolRunInfoLine details={result.details} isError={result.isError} />;
+  if (hasOtherDetails) {
+    return (
+      <div className="space-y-1.5">
+        {runInfoLine}
+        <ToolSurface className="overflow-hidden p-0">
+          <ToolScrollablePre className="max-h-32 rounded-none">
+            {getStableValueSignature(otherDetails)}
+          </ToolScrollablePre>
+        </ToolSurface>
+      </div>
+    );
+  }
+
+  return runInfoLine;
+}
+
+/** 通用工具结果的运行信息行（如 K-brain 原生 bash）：退出码、超时与耗时。 */
+function ToolRunInfoLine({ details, isError }: { details: unknown; isError?: boolean }) {
+  const { t } = useLocale();
+  const runInfo = formatToolRunInfo(readToolRunInfo(details), {
+    exitCode: t("chat.tool.run.exitCode"),
+    timedOut: t("chat.tool.run.timedOut"),
+  });
+  if (!runInfo) return null;
+  return (
+    <div
+      className={cn(
+        "font-mono text-[11px] tabular-nums text-muted-foreground/60",
+        isError && "text-red-700/75 dark:text-red-300/75",
+      )}
+      data-tool-run-info=""
+    >
+      {runInfo}
+    </div>
+  );
+}

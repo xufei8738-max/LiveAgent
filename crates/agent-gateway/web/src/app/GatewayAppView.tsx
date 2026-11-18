@@ -1,0 +1,2403 @@
+import { ApplicationView } from "@liveagent/ui/application/ApplicationView";
+import { AppWorkbenchChrome } from "@liveagent/ui/application/AppWorkbenchChrome";
+import { AppErrorBoundary } from "@liveagent/ui/components/AppErrorBoundary";
+import { ChangedFilesActionsProvider } from "@liveagent/ui/components/chat/ChangedFilesCard";
+import { ConversationViewTabs } from "@liveagent/ui/components/chat/ConversationViewTabs";
+import type {
+  ClarifyContext,
+  RunClarifyTurn,
+} from "@liveagent/ui/components/chat/clarify/clarifyTypes";
+import { FileDropOverlay } from "@liveagent/ui/components/chat/FileDropOverlay";
+import { HistoryShareModal } from "@liveagent/ui/components/chat/HistoryShareModal";
+import { SharedHistoryManagerModal } from "@liveagent/ui/components/chat/SharedHistoryManagerModal";
+import { TaskProgressBar } from "@liveagent/ui/components/chat/TaskProgressBar";
+import { WorkspaceCloneModal } from "@liveagent/ui/components/chat/WorkspaceCloneModal";
+import { WorkspaceCloneTaskOverlay } from "@liveagent/ui/components/chat/WorkspaceCloneTaskOverlay";
+import { WorkspaceProjectSettingsModal } from "@liveagent/ui/components/chat/WorkspaceProjectSettingsModal";
+import { ChevronDown } from "@liveagent/ui/components/IconSet";
+import { ProjectToolsPanelToggle } from "@liveagent/ui/components/project-tools/ProjectToolsPanelToggle";
+import { RightDockPanel } from "@liveagent/ui/components/project-tools/RightDockPanel";
+import {
+  WorkspaceMainPanel,
+  WorkspacePanelGroup,
+  WorkspaceToolsPanel,
+} from "@liveagent/ui/components/project-tools/WorkspacePanels";
+import { TrajectoryView } from "@liveagent/ui/components/trajectory/TrajectoryView";
+import { Button } from "@liveagent/ui/components/ui/button";
+import { ScrollArea } from "@liveagent/ui/components/ui/scroll-area";
+import { Toaster } from "@liveagent/ui/components/ui/toaster";
+import { PaneChrome } from "@liveagent/ui/components/workbench/PaneChrome";
+import {
+  type ProjectToolPaneEnvironment,
+  ProjectToolPaneHost,
+} from "@liveagent/ui/components/workbench/ProjectToolPaneHost";
+import { UnsupportedPaneSurface } from "@liveagent/ui/components/workbench/surfaces/UnsupportedPaneSurface";
+import { WorkbenchCanvas } from "@liveagent/ui/components/workbench/WorkbenchCanvas";
+import { WorkbenchEmptyState } from "@liveagent/ui/components/workbench/WorkbenchEmptyState";
+import { WorkspaceOverlayHost } from "@liveagent/ui/components/workspace-editor/WorkspaceOverlayHost";
+import { isWorkspacePreviewPath } from "@liveagent/ui/components/workspace-editor/workspaceImagePreview";
+import { LocaleContext, t as translate } from "@liveagent/ui/i18n/index";
+import {
+  type CheckpointRewindClient,
+  CheckpointRewindProvider,
+  type CheckpointRewoundInfo,
+  formatCheckpointRewoundNotification,
+} from "@liveagent/ui/lib/chat/checkpointRewind";
+import {
+  type CommandPaletteAction,
+  isMacLikePlatform,
+} from "@liveagent/ui/lib/chat/commandPalette";
+import {
+  buildCommandPaletteActions,
+  SHARED_COMMAND_PALETTE_SETTINGS_SECTIONS,
+} from "@liveagent/ui/lib/chat/commandPaletteActions";
+import type { ComposerCommandHost } from "@liveagent/ui/lib/chat/composerCommands";
+import { rememberSshHostNames } from "@liveagent/ui/lib/chat/sshManagerDisplay";
+import type { PendingUploadedFile } from "@liveagent/ui/lib/chat/uploadedFiles";
+import { mergePendingUploadedFiles } from "@liveagent/ui/lib/chat/uploadedFiles";
+import { parseModelValue } from "@liveagent/ui/lib/models/modelValue";
+import { kbrainResourceHostCapabilities } from "@liveagent/ui/lib/resourceHost";
+import { normalizeSidebarShortcuts } from "@liveagent/ui/lib/settings/sidebarShortcuts";
+import { cn } from "@liveagent/ui/lib/shared/utils";
+import { useSidebarSelector } from "@liveagent/ui/lib/sidebar/useSidebarSelector";
+import {
+  mergeTerminalSession,
+  reconcileSshTerminalSessions,
+  removeTerminalSession,
+} from "@liveagent/ui/lib/terminal/sessionStore";
+import { toTrajectoryMessages } from "@liveagent/ui/lib/trajectory/transcriptMessages";
+import { useConversationViewState } from "@liveagent/ui/lib/trajectory/useConversationViewState";
+import {
+  hitTestWorkbenchDrop,
+  leasedProjectToolKinds,
+  projectToolSurfaceTitleKey,
+} from "@liveagent/ui/lib/workbench/index";
+import {
+  isProjectToolSurface,
+  type PaneRecord,
+  PROJECT_TOOL_SURFACE_KINDS,
+} from "@liveagent/ui/lib/workbench/types";
+import { ChatComposerBar } from "@liveagent/ui/pages/chat/ChatComposerBar";
+import { FloorNavRail } from "@liveagent/ui/pages/chat/transcript/FloorNavRail";
+import {
+  CHAT_TRANSCRIPT_WIDTH_CSS_VAR,
+  TranscriptWidthControls,
+} from "@liveagent/ui/pages/chat/transcript/TranscriptWidthControls";
+import { SettingsPage } from "@liveagent/ui/pages/settings/SettingsPage";
+import {
+  type CSSProperties,
+  type DragEvent,
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+} from "react";
+import {
+  type TrustedGatewayImageIdentity,
+  useWebImageStudioHost,
+} from "@/agent-ui-adapters/imageStudio";
+import { createGatewayTrajectoryHost } from "@/agent-ui-adapters/trajectory";
+import { GatewayTranscript } from "@/components/GatewayTranscript";
+import { executeClarifyPromptTurn } from "@/lib/chat/clarifyPromptTurn";
+import { useSingleUserImageIdentity } from "@/lib/imageIdentity";
+import type { SttProviderId } from "@/lib/settings";
+import {
+  getNextTheme,
+  getRightDockFileTreeState,
+  getSshProjectHostIds,
+  openRightDockSingletonTab,
+  updateExecutionModeFromChatSelection,
+  updateRightDockFileTreeState,
+  updateSshProjectHostIds,
+  updateSystem,
+  updateWorkspaceResourceSettings,
+  workspaceProjectPathKey,
+} from "@/lib/settings";
+import { createWebSttSettingsService } from "@/lib/stt/webSttSettingsService";
+import { webSttTransport } from "@/lib/stt/webSttTransport";
+import {
+  liveTrajectoryAuthoritativeRevision,
+  liveTrajectoryEvents,
+  subscribeLiveTrajectory,
+} from "@/lib/trajectory/liveTrajectory";
+import {
+  GATEWAY_CHAT_FRAME_CLASS,
+  GATEWAY_MAIN_BACKDROP_CLASS,
+  GATEWAY_MAIN_SHELL_CLASS,
+  GATEWAY_SCROLL_TO_BOTTOM_CLASS,
+  GATEWAY_SETTINGS_OVERLAY_CLASS,
+  GATEWAY_SHELL_CLASS,
+  GATEWAY_TRANSCRIPT_SCROLL_CLASS,
+} from "@/lib/webStyleClasses";
+import { WorkdirPickerModal } from "@/pages/settings/WorkdirPickerModal";
+import { openUrl } from "@/shims/tauriOpener";
+import { settingsHostAdapter } from "../agent-ui-adapters/settingsExtension";
+import { AgentSelector } from "./AgentSelector";
+import { ConversationStatsBarHost } from "./ConversationStatsBarHost";
+import { asErrorMessage } from "./chatEventUtils";
+import { CHAT_RUNTIME_FOREGROUND_PREPARE_TIMEOUT_MS } from "./constants";
+import type { GatewayAppViewModel } from "./GatewayApp";
+import { isLocalDraftConversationId } from "./gatewayLocalDraft";
+import { HistorySwitchLoadingOverlay } from "./HistorySwitchLoadingOverlay";
+import { useWindowFileDropGuard } from "./hooks/useWindowFileDropGuard";
+import { sendComposerCommandTurn } from "./sendComposerCommandTurn";
+import { GatewaySidebarContainer } from "./sidebar/GatewaySidebarContainer";
+import { UserMenu } from "./UserMenu";
+import { WebGoalBarHost } from "./WebGoalBarHost";
+import { createWebComposerCommandHost } from "./webComposerCommandHost";
+import {
+  GatewayConversationPaneHost,
+  type GatewayConversationPaneHostContext,
+  type GatewayConversationPrimarySurface,
+} from "./workbench/GatewayConversationPaneHost";
+import { GatewayTerminalPaneHost } from "./workbench/GatewayTerminalPaneHost";
+import { sessionWorkbench } from "./workbench/sessionWorkbench";
+
+export function GatewayAppView({
+  viewModel,
+  imageStudioIdentity,
+}: {
+  viewModel: GatewayAppViewModel;
+  imageStudioIdentity?: TrustedGatewayImageIdentity;
+}) {
+  const verifiedImageIdentity = useSingleUserImageIdentity(
+    viewModel.imageStudioToken,
+    imageStudioIdentity,
+  );
+  const imageStudio = useWebImageStudioHost(
+    viewModel.imageStudioToken,
+    verifiedImageIdentity,
+    viewModel.activeWorkspaceProjectPath,
+    (key) => translate(key, viewModel.settings.locale),
+  );
+  const chatFrameRef = useRef<HTMLDivElement | null>(null);
+  useWindowFileDropGuard();
+  const {
+    activeFloorKey,
+    activeSelectedModel,
+    activeView,
+    activeWorkspaceProject,
+    activeWorkspaceProjectPath,
+    addNotify,
+    api,
+    approvalBar,
+    approvalConversationIds,
+    archivedWorkspaceProjectPathKeys,
+    associatedSshHostIds,
+    availableSkills,
+    branchPendingMessageId,
+    canDropUpload,
+    canShareHistory,
+    cancelChat,
+    changedFilesActions,
+    chatError,
+    chatProtocolIncompatibleMessage,
+    chatRuntimeControlsForCurrentProvider,
+    chatRuntimeReasoningOptions,
+    chatRuntimeThinkingAlwaysOn,
+    closeSettings,
+    codeReviewSkill,
+    cancelQueuedChatEdit,
+    commitQueuedChatEdit,
+    composerCompactionBlocked,
+    composerInputDisabled,
+    composerIsSending,
+    composerPlaceholder,
+    composerRef,
+    confirmDialog,
+    contextUsageTokensSource,
+    conversationOpenState,
+    currentChatProvider,
+    currentModelContextWindow,
+    currentModelLabel,
+    displayedConversationBusyRef,
+    displayedConversationId,
+    displayedConversationWorkdir,
+    displayedTranscript,
+    displayedTranscriptRowCount,
+    editQueuedTurn,
+    effectiveTheme,
+    enabledComposerSkills,
+    fileDropDescription,
+    fileDropLimitHint,
+    fileDropTitle,
+    fileInputRef,
+    folderInputRef,
+    gatewayConnectionLost,
+    getCachedComposerDraft,
+    getDisplayedConversationId,
+    getPendingUploadsForConversation,
+    subscribePendingUploads,
+    gitClient,
+    gitDisabledMessage,
+    gitReviewFocusRequest,
+    handleActiveAgentChange,
+    handleArchiveWorkspaceProject,
+    handleBranchConversation,
+    handleBrowseWorkspaceProjectInFileTree,
+    handleCancelWorkspaceCloneTask,
+    handleChatRuntimeControlsChange,
+    handleChatTranscriptWidthChange,
+    handleCloneWorkspaceProject,
+    handleCloseShareModal,
+    handleCommitWorkspaceProjectRename,
+    handleComposerBusyChange,
+    handleCreateWorkspaceGroup,
+    handleDeleteWorkspaceGroup,
+    handleDisableSharedHistory,
+    handleDismissWorkspaceCloneTask,
+    handleEmptyStateSuggestion,
+    handleFileDragEnter,
+    handleFileDragLeave,
+    handleFileDragOver,
+    handleFileDrop,
+    handleFloorJump,
+    handleGitReviewFocusRequestHandled,
+    handleImportReadableFiles,
+    handleImportSelectedDirectoryFiles,
+    handleInsertCodeMention,
+    handleLoadEarlierHistory,
+    handleLoadSharedHistoryStatus,
+    handleLoadUploadedImagePreview,
+    handleLoadWorkspaceRemoteBranches,
+    handleLogout,
+    handleManualCompact,
+    handleMoveWorkspaceProjectToGroup,
+    handleNewConversationForProject,
+    handleOpenChatFileLink,
+    handleOpenClonedWorkspace,
+    handleOpenCreateWorkspaceProject,
+    handleOpenShareModal,
+    handleOpenSharedHistoryManager,
+    handleOpenSftpFile,
+    handleOpenSshTerminal,
+    handleOpenWorkspaceFile,
+    handleOpenWorkspaceFolder,
+    handleOpenWorktree,
+    handleProjectTerminalSessionsChange,
+    updateProjectTerminalSessions,
+    handleRefreshSharedHistoryStatuses,
+    handleRemoveWorkspaceProject,
+    handleRenameWorkspaceGroup,
+    handleResendFromEdit,
+    handleRightDockClose,
+    handleRightDockFileTreeStateChange,
+    handleRightDockInsertCodeReviewSkill,
+    handleRightDockInsertCommitMention,
+    handleRightDockInsertComposerSegments,
+    handleRightDockInsertFileMention,
+    handleRightDockInsertGitFileMention,
+    handleRightDockProjectStateChange,
+    handleRightDockWidthChange,
+    handleSelectModel,
+    handleSelectWorkspaceProject,
+    handleSetShareRedactToolContent,
+    handleSetSharedHistoryRedactToolContent,
+    handleSetWorkspaceProjectPinned,
+    handleSettingsTransitionEnd,
+    handleSidebarConversationsRemoved,
+    handleSidebarLocalDraftDeleted,
+    handleSidebarNewConversation,
+    handleSidebarOpenResourceHub,
+    handleSidebarProjectsCollapsedChange,
+    handleSidebarRecentCollapsedChange,
+    handleSidebarSelectConversation,
+    handleSshProjectHostIdsChange,
+    handleToggleHistoryShare,
+    handleToggleWorkspaceGroupCollapsed,
+    handleUnarchiveWorkspaceProject,
+    handleWorkdirPickerSelect,
+    handleWorkspaceEditorClosed,
+    handleWorkspaceEditorHide,
+    handleWorkspaceFilePreviewClosed,
+    handleWorktreeRemoved,
+    hideWorkspaceSshTerminalOverlay,
+    historyDetailLoadingTitle,
+    historyShareToken,
+    importFilesForConversation,
+    isAgentDevExecutionMode,
+    isAgentMode,
+    isConversationBusy,
+    isFileDropActive,
+    isImportingPastedTextRef,
+    isUploadingFiles,
+    uploadingConversationId,
+    loadComposerHistoryPrompts,
+    loadingOlderHistory,
+    localeContextValue,
+    manualCompactPending,
+    manualCompactTransientConversations,
+    mentionableConversations,
+    searchMentionableConversations,
+    materializeComposerDraftForSend,
+    mentionApps,
+    missingWorkspaceProjectPathKeys,
+    modelOptions,
+    moveQueuedTurnUp,
+    openSettings,
+    openWorkspaceEditorFile,
+    openWorkspaceFilePreview,
+    overlay,
+    pendingUploadedFiles,
+    prepareChatRuntime,
+    projectPickerOpen,
+    projectTerminalSessions,
+    projectToolsDisabledMessage,
+    queuedChatEditSessionRef,
+    queuedChatTurnsForDisplayedConversation,
+    queuePaused,
+    queueControlPending,
+    handleQueuePausedChange,
+    removeQueuedTurn,
+    requestWorkspaceFilePreviewClose,
+    projectSettingsProject,
+    rightDockFileTreeState,
+    rightDockOpen,
+    rightDockProjectState,
+    runQueuedTurnNow,
+    selectedHistoryHasMore,
+    selectedValue,
+    selectionForConversation,
+    sendChat,
+    setActiveFloorKey,
+    setCachedComposerDraft,
+    setPendingUploadsForConversation,
+    setProjectPickerOpen,
+    setProjectSettingsProject,
+    setRightDockOpen,
+    setActiveView,
+    setSettings,
+    setSharedManagerOpen,
+    setSidebarOpen,
+    setTranscriptScrollAreaRoot,
+    setTranscriptViewport,
+    setUserMenuOpen,
+    setWorkspaceCreateModalOpen,
+    settings,
+    settingsOpen,
+    settingsProviderId,
+    settingsSaveState,
+    settingsSection,
+    settingsSyncError,
+    sftpClient,
+    shareConversation,
+    shareError,
+    shareLoading,
+    shareStatus,
+    shareUpdating,
+    sharedHistoryItems,
+    sharedHistoryListError,
+    sharedManagerErrors,
+    sharedManagerLoadingIds,
+    sharedManagerOpen,
+    sharedManagerStatuses,
+    sharedManagerUpdatingIds,
+    sidebarActionError,
+    sidebarOpen,
+    sidebarSectionsDisabled,
+    sidebarStore,
+    skillsRootDir,
+    status,
+    statusError,
+    submitCurrentComposerToGuiQueue,
+    submitInFlightRef,
+    taskProgressSnapshot,
+    terminalClient,
+    terminalDisabledMessage,
+    terminalProjectPath,
+    terminalProjectPathKey,
+    terminalSessions,
+    terminalSessionsLoaded,
+    transcriptBusy,
+    transcriptError,
+    transcriptFloors,
+    transcriptFollow,
+    transcriptFollowing,
+    transcriptHistoryLoading,
+    transcriptLiveStartIndex,
+    transcriptNavRef,
+    transcriptRows,
+    transcriptStageRef,
+    transcriptStoreRegistry,
+    transcriptToolStatus,
+    transcriptToolStatusIsCompaction,
+    transcriptViewport,
+    tunnelDisabledMessage,
+    tunnelEnabled,
+    updatePendingUploadsForConversation,
+    verifyTerminalSessionAlive,
+    userAvatarLabel,
+    userMenuLabel,
+    userMenuOpen,
+    workbenchController,
+    workdirForConversation,
+    workspaceActivityClient,
+    workspaceCloneTasks,
+    workspaceCreateModalOpen,
+    workspaceEditorCleanupPending,
+    workspaceEditorCloseRequestId,
+    workspaceEditorMounted,
+    workspaceEditorOpen,
+    workspaceEditorOpenRequest,
+    workspaceFilePreviewMounted,
+    workspaceFilePreviewOpen,
+    workspaceFilePreviewOpenRequest,
+    workspaceFolderDropActive,
+    workspaceFolderDropHandlers,
+    workspaceProjects,
+    workspaceProjectRootClient,
+    workspaceRootRevision,
+    workspaceSshTerminalMounted,
+    workspaceSshTerminalOpen,
+    workspaceSshTerminalOpenRequest,
+  } = viewModel;
+  // SSHManager rows name hosts by their configured name rather than the opaque id.
+  rememberSshHostNames(settings.ssh.hosts);
+  const [sttProviderOverride, setSttProviderOverride] = useState<SttProviderId | null>(null);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: Saved provider changes invalidate the temporary card selection.
+  useEffect(() => {
+    setSttProviderOverride(null);
+  }, [settings.stt.provider]);
+  const sttSettingsService = useMemo(
+    () =>
+      createWebSttSettingsService(async (sttSecretUpdate) => {
+        if (!api) throw new Error("桌面 Agent 未连接，无法同步 STT 配置");
+        await api.updateSettings({ sttSecretUpdate });
+      }),
+    [api],
+  );
+
+  const {
+    activeConversationView,
+    setActiveConversationView,
+    viewForConversation,
+    setConversationView,
+  } = useConversationViewState(displayedConversationId);
+  const handleQuoteSelection = useCallback(
+    (text: string) => {
+      composerRef.current?.insertQuote(text);
+    },
+    [composerRef],
+  );
+  const trajectoryHost = useMemo(
+    () => createGatewayTrajectoryHost(api, handleOpenChatFileLink),
+    [api, handleOpenChatFileLink],
+  );
+  // 正文只在切到轨迹页时才需要；转换本身很轻，跟随转录行 memo 即可。
+  const trajectoryMessages = useMemo(() => toTrajectoryMessages(transcriptRows), [transcriptRows]);
+  const hasConversationReply =
+    displayedConversationId !== "" &&
+    !isLocalDraftConversationId(displayedConversationId) &&
+    trajectoryMessages.some((message) => message.role === "assistant");
+  const renderedConversationView = hasConversationReply ? activeConversationView : "conversation";
+  // 实时骨架来自 ChatEvent 流；账本层按事件身份去重，所以与落盘那份合并安全。
+  const liveTrajectory = useSyncExternalStore(subscribeLiveTrajectory, () =>
+    liveTrajectoryEvents(displayedConversationId),
+  );
+  const trajectoryAuthoritativeRevision = useSyncExternalStore(subscribeLiveTrajectory, () =>
+    liveTrajectoryAuthoritativeRevision(displayedConversationId),
+  );
+  const handleSelectExecutionMode = useCallback(
+    (mode: "text" | "tools") =>
+      setSettings((prev) => updateExecutionModeFromChatSelection(prev, mode)),
+    [setSettings],
+  );
+  // 语音输入失败（麦克风不可用等）以 toast 提示，不占用输入框区域。
+  const handleSttError = useCallback((message: string) => addNotify("error", message), [addNotify]);
+  const resolveCheckpointAuthorizedRoots = useCallback(async () => {
+    const roots: string[] = [];
+    const push = (value?: string | null) => {
+      const normalized = value?.trim();
+      if (normalized && !roots.includes(normalized)) roots.push(normalized);
+    };
+    push(displayedConversationWorkdir);
+    if (
+      activeWorkspaceProject &&
+      activeWorkspaceProjectPath &&
+      activeWorkspaceProjectPath === displayedConversationWorkdir
+    ) {
+      try {
+        const grants = await api.listWorkspaceRootGrants(
+          activeWorkspaceProject.id,
+          activeWorkspaceProject.path,
+        );
+        for (const grant of grants) {
+          if (grant.state === "active" && grant.access === "write") push(grant.canonicalPath);
+        }
+      } catch {
+        // Keep the primary root when additional grant lookup fails.
+      }
+    }
+    return roots;
+  }, [activeWorkspaceProject, activeWorkspaceProjectPath, api, displayedConversationWorkdir]);
+  const checkpointClient = useMemo<CheckpointRewindClient>(
+    () => ({
+      list: (conversationId) => api.listCheckpointTurns(conversationId),
+      preview: (params) => api.previewCheckpointRewind(params),
+      rewind: (params) => api.rewindCheckpoint(params),
+    }),
+    [api],
+  );
+
+  const handleCheckpointRewound = useCallback(
+    (info: CheckpointRewoundInfo) => {
+      const notice = formatCheckpointRewoundNotification(info, settings.locale === "zh-CN");
+      addNotify(notice.level, notice.message);
+    },
+    [addNotify, settings.locale],
+  );
+  // 提示词澄清执行器：经 gateway 中继到桌面宿主，用当前会话模型跑一轮纯文本
+  // 补全；模型覆盖/回退/错误拍平在 executeClarifyPromptTurn（两宿主共用）。
+  const runClarifyTurn = useCallback<RunClarifyTurn>(
+    (messages, _signal, onTextDelta) =>
+      executeClarifyPromptTurn(
+        api,
+        settings,
+        {
+          provider: currentChatProvider,
+          model: activeSelectedModel?.model,
+          runtimeControls: chatRuntimeControlsForCurrentProvider,
+        },
+        messages,
+        onTextDelta,
+      ),
+    [
+      settings,
+      activeSelectedModel,
+      currentChatProvider,
+      chatRuntimeControlsForCurrentProvider,
+      api,
+    ],
+  );
+
+  const clarifyContext = useMemo<ClarifyContext | undefined>(
+    () => (displayedConversationWorkdir ? { workdir: displayedConversationWorkdir } : undefined),
+    [displayedConversationWorkdir],
+  );
+
+  // --- Session Workbench（多看板分屏）----------------------------------------
+  // Pane 标题/无障碍标签取自侧栏权威索引；标题变化需要触发重渲染，所以走
+  // useSidebarSelector 而不是 store.peek。
+  const sidebarConversationsById = useSidebarSelector(sidebarStore, (snapshot) => snapshot.byId);
+  // 与桌面端 workbenchPaneTitle 同口径:chrome 提示、拖拽幽灵与无障碍标签共用。
+  const workbenchPaneTitle = useCallback(
+    (surface: PaneRecord["surface"]): string => {
+      switch (surface.kind) {
+        case "conversation":
+          return sidebarConversationsById.get(surface.conversationId)?.title?.trim() || "";
+        case "fileTree":
+        case "gitReview":
+        case "tunnel":
+        case "sshTunnel":
+        case "backgroundTasks":
+        case "browser":
+          return translate(projectToolSurfaceTitleKey(surface.kind), settings.locale);
+        case "localTerminal":
+          return surface.launchSpec.title?.trim() || surface.launchSpec.shell?.trim() || "Terminal";
+        case "sshTerminal":
+          return surface.launchSpec.title?.trim() || surface.launchSpec.sshHostId.trim() || "SSH";
+        case "unsupported":
+          return surface.originalKind;
+      }
+    },
+    [settings.locale, sidebarConversationsById],
+  );
+
+  const workbenchHasMultiplePanes =
+    sessionWorkbench.enabled && Object.keys(workbenchController.workbench.layout.panes).length >= 2;
+  const primarySendInFlightConversationRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    const handleQueueEditEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape" || event.defaultPrevented || !(event.target instanceof Element))
+        return;
+      const composer = event.target.closest("[data-file-upload-conversation-id]");
+      const session = queuedChatEditSessionRef.current;
+      if (
+        !session ||
+        composer?.getAttribute("data-file-upload-conversation-id") !== session.conversationId
+      )
+        return;
+      event.preventDefault();
+      void cancelQueuedChatEdit();
+    };
+    document.addEventListener("keydown", handleQueueEditEscape);
+    return () => document.removeEventListener("keydown", handleQueueEditEscape);
+  }, [cancelQueuedChatEdit, queuedChatEditSessionRef]);
+
+  const handlePrimaryComposerSend = useCallback(() => {
+    const sendConversationId = getDisplayedConversationId();
+    if (primarySendInFlightConversationRef.current === sendConversationId) return;
+    // 上传在途只封锁归属会话:背景 Pane 的导入不应吞掉主 Pane 的发送。
+    // 归属未知(null)时保守封锁,与旧全局互斥语义一致。
+    const uploadBlocksSend =
+      isUploadingFiles &&
+      (!uploadingConversationId || uploadingConversationId === sendConversationId);
+    if (uploadBlocksSend || isImportingPastedTextRef.current) return;
+    if (composerInputDisabled) return;
+    if (queuedChatEditSessionRef.current?.conversationId === getDisplayedConversationId()) {
+      primarySendInFlightConversationRef.current = sendConversationId;
+      void (async () => {
+        try {
+          await commitQueuedChatEdit();
+        } finally {
+          if (primarySendInFlightConversationRef.current === sendConversationId) {
+            primarySendInFlightConversationRef.current = null;
+          }
+        }
+      })();
+      return;
+    }
+    if (
+      displayedConversationBusyRef.current ||
+      queuedChatTurnsForDisplayedConversation.length > 0
+    ) {
+      primarySendInFlightConversationRef.current = sendConversationId;
+      void (async () => {
+        try {
+          await submitCurrentComposerToGuiQueue("append");
+        } finally {
+          if (primarySendInFlightConversationRef.current === sendConversationId) {
+            primarySendInFlightConversationRef.current = null;
+          }
+        }
+      })();
+      return;
+    }
+    primarySendInFlightConversationRef.current = sendConversationId;
+    void (async () => {
+      try {
+        const draft = composerRef.current?.getDraft() ?? null;
+        let text: string;
+        let files: PendingUploadedFile[];
+        let referencedConversations = draft?.conversationMentions ?? [];
+        try {
+          const materialized = draft
+            ? await materializeComposerDraftForSend(
+                draft,
+                pendingUploadedFiles,
+                displayedConversationWorkdir,
+                sendConversationId,
+              )
+            : { text: "", uploadedFiles: pendingUploadedFiles, referencedConversations: [] };
+          text = materialized.text;
+          files = materialized.uploadedFiles;
+          referencedConversations = materialized.referencedConversations;
+        } catch (error) {
+          addNotify(
+            "error",
+            asErrorMessage(error, translate("chat.largePasteImportFailed", settings.locale)),
+          );
+          return;
+        }
+        if (!text && files.length === 0) return;
+        if (getDisplayedConversationId() === sendConversationId) {
+          composerRef.current?.clear();
+        }
+        setPendingUploadsForConversation(sendConversationId, []);
+        void sendChat(text, {
+          conversationId: sendConversationId,
+          uploadedFiles: files,
+          referencedConversations,
+          runtimeControls: chatRuntimeControlsForCurrentProvider,
+        }).catch(() => {
+          updatePendingUploadsForConversation(sendConversationId, (current) =>
+            mergePendingUploadedFiles(current, files),
+          );
+        });
+      } finally {
+        if (primarySendInFlightConversationRef.current === sendConversationId) {
+          primarySendInFlightConversationRef.current = null;
+        }
+      }
+    })();
+  }, [
+    addNotify,
+    chatRuntimeControlsForCurrentProvider,
+    commitQueuedChatEdit,
+    composerInputDisabled,
+    composerRef,
+    displayedConversationBusyRef,
+    displayedConversationWorkdir,
+    getDisplayedConversationId,
+    isImportingPastedTextRef,
+    isUploadingFiles,
+    uploadingConversationId,
+    materializeComposerDraftForSend,
+    pendingUploadedFiles,
+    queuedChatEditSessionRef,
+    queuedChatTurnsForDisplayedConversation.length,
+    sendChat,
+    setPendingUploadsForConversation,
+    settings.locale,
+    submitCurrentComposerToGuiQueue,
+    updatePendingUploadsForConversation,
+  ]);
+
+  const handlePrimaryComposerStop = useCallback(() => {
+    const nextQueuedTurn = queuedChatTurnsForDisplayedConversation[0];
+    if (nextQueuedTurn && !queuePaused) {
+      runQueuedTurnNow(nextQueuedTurn.id);
+      return;
+    }
+    void cancelChat(displayedConversationId);
+  }, [
+    cancelChat,
+    displayedConversationId,
+    queuedChatTurnsForDisplayedConversation,
+    queuePaused,
+    runQueuedTurnNow,
+  ]);
+
+  // 背景会话 Pane 的共享上下文(复刻桌面端 buildBackgroundPaneBinding):所有
+  // 会话级动作按 Pane 自己的 conversationId 显式路由;页面级机制(选模型、
+  // 编辑队列项等)由宿主内部先聚焦本 Pane(focusGuard 口径)。
+  const conversationPaneHostContext: GatewayConversationPaneHostContext = {
+    api,
+    registry: transcriptStoreRegistry,
+    settings,
+    hasModels: modelOptions.length > 0,
+    showUsage: isAgentDevExecutionMode,
+    isInputDisabled: composerInputDisabled,
+    transportInputDisabled: !status?.online || Boolean(chatProtocolIncompatibleMessage),
+    uploadingConversationId,
+    inputPlaceholder: composerPlaceholder,
+    modelOptions,
+    enabledSkills: enabledComposerSkills,
+    mentionableConversations,
+    searchMentionableConversations,
+    mentionApps,
+    contextDisplayMode: settings.customSettings.composerContextDisplay,
+    commandSafetyMode: settings.system.commandSafetyMode,
+    onCommandSafetyModeChange: (mode) =>
+      setSettings((prev) =>
+        prev.system.commandSafetyMode === mode
+          ? prev
+          : updateSystem(prev, { commandSafetyMode: mode }),
+      ),
+    sttProvider: settings.stt.enabled
+      ? (sttProviderOverride ?? settings.stt.provider ?? "tencent_cloud")
+      : null,
+    sttProviderConfigured:
+      settings.stt.providers[sttProviderOverride ?? settings.stt.provider ?? "tencent_cloud"]
+        ?.configured,
+    sttTransport: webSttTransport,
+    onSttError: handleSttError,
+    gitClient,
+    gitWriteEnabled: settings.remote.enableWebGit,
+    gitDisabledMessage,
+    workspaceActivityClient,
+    onOpenWorktree: handleOpenWorktree,
+    onWorktreeRemoved: handleWorktreeRemoved,
+    openSettings,
+    onOpenFileLink: handleOpenChatFileLink,
+    onLoadUploadedImagePreview: handleLoadUploadedImagePreview,
+    transcriptContentWidth: settings.customSettings.chatTranscript.width,
+    selectionForConversation,
+    workdirForConversation,
+    isConversationBusy,
+    sendChat,
+    cancelChat,
+    materializeComposerDraftForSend,
+    getPendingUploads: getPendingUploadsForConversation,
+    subscribePendingUploads,
+    updatePendingUploads: updatePendingUploadsForConversation,
+    importFilesForConversation,
+    getCachedComposerDraft,
+    setCachedComposerDraft,
+    notifyError: (message) => addNotify("error", message),
+    trajectoryHost,
+  };
+
+  // 文件拖入时按指针命中聚焦会话 Pane,使 overlay 落在焦点输入框(桌面端
+  // workbenchNativeDropHoverRef 同口径;Web 走 HTML5 DnD)。
+  const lastFileDropHoverPaneRef = useRef<string | null>(null);
+  const focusWorkbenchPaneUnderPoint = useCallback(
+    (clientX: number, clientY: number) => {
+      if (!sessionWorkbench.enabled) return;
+      const geometry = workbenchController.geometryRef.current;
+      const canvasElement = workbenchController.canvasRef.current;
+      if (!geometry || !canvasElement) return;
+      const canvasRect = canvasElement.getBoundingClientRect();
+      const target = hitTestWorkbenchDrop(
+        geometry,
+        clientX - canvasRect.left,
+        clientY - canvasRect.top,
+      );
+      const paneId =
+        target && (target.kind === "pane-center" || target.kind === "pane-edge")
+          ? target.paneId
+          : null;
+      if (!paneId || paneId === lastFileDropHoverPaneRef.current) return;
+      lastFileDropHoverPaneRef.current = paneId;
+      if (workbenchController.workbench.layoutRef.current.focusedPaneId !== paneId) {
+        workbenchController.handleFocusPane(paneId);
+      }
+    },
+    [workbenchController],
+  );
+  const handleChatFileDragEnter = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      handleFileDragEnter(event);
+      focusWorkbenchPaneUnderPoint(event.clientX, event.clientY);
+    },
+    [focusWorkbenchPaneUnderPoint, handleFileDragEnter],
+  );
+  const handleChatFileDragOver = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      handleFileDragOver(event);
+      focusWorkbenchPaneUnderPoint(event.clientX, event.clientY);
+    },
+    [focusWorkbenchPaneUnderPoint, handleFileDragOver],
+  );
+  const handleChatFileDragLeave = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      handleFileDragLeave(event);
+      lastFileDropHoverPaneRef.current = null;
+    },
+    [handleFileDragLeave],
+  );
+  const handleChatFileDrop = useCallback(
+    (event: DragEvent<HTMLDivElement>) => {
+      lastFileDropHoverPaneRef.current = null;
+      handleFileDrop(event);
+    },
+    [handleFileDrop],
+  );
+
+  // 输入框“/”指令宿主：引用只随 api、工作目录和语言变化（输入框按宿主引用重新拉
+  // 指令目录），动作与状态读数经 ref 取最新值——sendChat 等每次渲染都是新函数。
+  const composerCommandLatestRef = useRef({
+    handleManualCompact,
+    handleSelectModel,
+    isConversationBusy,
+    modelOptions,
+    runtimeControls: chatRuntimeControlsForCurrentProvider,
+    sendChat,
+  });
+  composerCommandLatestRef.current = {
+    handleManualCompact,
+    handleSelectModel,
+    isConversationBusy,
+    modelOptions,
+    runtimeControls: chatRuntimeControlsForCurrentProvider,
+    sendChat,
+  };
+  const composerCommandHost = useMemo<ComposerCommandHost>(
+    () => ({
+      ...createWebComposerCommandHost({
+        t: (key) => translate(key, settings.locale),
+        client: api ?? undefined,
+        getConversationId: () => {
+          const id = getDisplayedConversationId();
+          return isLocalDraftConversationId(id) ? undefined : id;
+        },
+        getWorkdir: () => displayedConversationWorkdir || undefined,
+        getRuntimeControls: () => composerCommandLatestRef.current.runtimeControls,
+        sendTurn: (text, command, runtimeControls) =>
+          sendComposerCommandTurn(
+            composerCommandLatestRef.current.sendChat,
+            (key) => translate(key, settings.locale),
+            text,
+            command,
+            {
+              runtimeControls,
+              isBusy: () =>
+                composerCommandLatestRef.current.isConversationBusy(getDisplayedConversationId()),
+            },
+          ),
+        compact: () => composerCommandLatestRef.current.handleManualCompact(),
+        getModelOptions: () => composerCommandLatestRef.current.modelOptions,
+        selectModel: (value) => {
+          const selection = parseModelValue(value);
+          if (selection) composerCommandLatestRef.current.handleSelectModel(selection);
+        },
+      }),
+      // 正在编辑排队消息时，发送是保存编辑，不按指令执行。
+      isDraftReserved: () =>
+        queuedChatEditSessionRef.current?.conversationId === getDisplayedConversationId(),
+    }),
+    [
+      api,
+      displayedConversationWorkdir,
+      getDisplayedConversationId,
+      queuedChatEditSessionRef,
+      settings.locale,
+    ],
+  );
+
+  const primaryConversationSurface: GatewayConversationPrimarySurface = {
+    isSending: composerIsSending,
+    // 上传态只归属目标会话:背景 Pane 的导入不在主 Pane 显示"上传中"。
+    isUploadingFiles:
+      isUploadingFiles &&
+      (!uploadingConversationId || uploadingConversationId === displayedConversationId),
+    isInputDisabled: composerInputDisabled,
+    onSend: handlePrimaryComposerSend,
+    onStop: handlePrimaryComposerStop,
+    onSelectModel: handleSelectModel,
+    onSelectExecutionMode: handleSelectExecutionMode,
+    onChatRuntimeControlsChange: handleChatRuntimeControlsChange,
+    onPrepareChatRuntime: () => {
+      if (!api || historyShareToken) return;
+      void prepareChatRuntime(
+        "composer-focus",
+        api,
+        CHAT_RUNTIME_FOREGROUND_PREPARE_TIMEOUT_MS,
+      ).catch(() => undefined);
+    },
+    onComposerBusyChange: handleComposerBusyChange,
+    onPickReadableFiles: () => fileInputRef.current?.click(),
+    onPickWorkspaceFolder: () => folderInputRef.current?.click(),
+    onPasteFiles: handleImportReadableFiles,
+    loadHistoryPrompts: loadComposerHistoryPrompts,
+    pendingUploadedFiles,
+    onRemovePendingUpload: (relativePath) => {
+      updatePendingUploadsForConversation(getDisplayedConversationId(), (current) =>
+        current.filter((file) => file.relativePath !== relativePath),
+      );
+    },
+    queuedTurns: queuedChatTurnsForDisplayedConversation,
+    queuePaused,
+    onRunQueuedTurnNow: runQueuedTurnNow,
+    onMoveQueuedTurnUp: moveQueuedTurnUp,
+    onEditQueuedTurn: editQueuedTurn,
+    onRemoveQueuedTurn: removeQueuedTurn,
+    onManualCompactConfirm: handleManualCompact,
+    manualCompactBlocked: manualCompactPending || composerCompactionBlocked,
+    commandHost: composerCommandHost,
+    approvalBar,
+    taskProgressBar: (
+      <TaskProgressBar
+        key={displayedConversationId}
+        snapshot={taskProgressSnapshot}
+        isConversationRunning={transcriptBusy}
+      />
+    ),
+    statsBar: (
+      <ConversationStatsBarHost
+        key={`stats-${displayedConversationId}`}
+        conversationId={displayedConversationId}
+        host={trajectoryHost}
+        enabled={renderedConversationView !== "trajectory"}
+        contextUsageTokensSource={contextUsageTokensSource}
+        contextWindow={currentModelContextWindow}
+        onManualCompactConfirm={handleManualCompact}
+        manualCompactBlocked={manualCompactPending || composerCompactionBlocked}
+      />
+    ),
+    fileDropOverlay: isFileDropActive ? (
+      <FileDropOverlay
+        variant="composer"
+        canDropUpload={canDropUpload}
+        title={fileDropTitle}
+        description={fileDropDescription}
+        limitHint={fileDropLimitHint}
+      />
+    ) : null,
+    transcriptExtras: (
+      <>
+        <TranscriptWidthControls
+          hostRef={transcriptStageRef}
+          width={settings.customSettings.chatTranscript.width}
+          onWidthChange={handleChatTranscriptWidthChange}
+          resizeLabel={translate("chat.transcript.resizeWidth", settings.locale)}
+          resetLabel={translate("chat.transcript.resizeWidthReset", settings.locale)}
+          // The history overlay below is a blocking panel layer above the
+          // handles; suspend them for exactly as long as it is mounted (#749).
+          suspended={conversationOpenState.showOverlay}
+        />
+        {displayedTranscriptRowCount > 0 && !conversationOpenState.showOverlay ? (
+          <FloorNavRail
+            conversationId={displayedConversationId}
+            floors={transcriptFloors}
+            activeRowKey={activeFloorKey}
+            bottomOffset="calc(var(--gateway-chat-composer-overlay-height, var(--spacing-176px)) + var(--spacing-12px))"
+            scrollViewport={transcriptViewport}
+            onJump={handleFloorJump}
+          />
+        ) : null}
+        {conversationOpenState.showOverlay ? (
+          <HistorySwitchLoadingOverlay locale={settings.locale} />
+        ) : null}
+      </>
+    ),
+    stageRef: transcriptStageRef,
+    setTranscriptScrollAreaRoot,
+    setTranscriptViewport,
+    isViewportFollowing: transcriptFollow.isFollowing,
+    viewportFollowing: transcriptFollowing,
+    onJumpToBottom: transcriptFollow.jumpToBottom,
+    navRef: transcriptNavRef,
+    onAnchorUserRowChange: setActiveFloorKey,
+    onResendFromEdit: handleResendFromEdit,
+    onBranchConversation: handleBranchConversation,
+    branchPendingMessageId,
+    onSuggestionSelect: handleEmptyStateSuggestion,
+    hasMoreHistory: selectedHistoryHasMore,
+    isLoadingMoreHistory: loadingOlderHistory,
+    onLoadEarlierHistory: selectedHistoryHasMore ? handleLoadEarlierHistory : undefined,
+    isLoading: transcriptHistoryLoading,
+    loadingTitle: historyDetailLoadingTitle,
+    transcriptError,
+    changedFilesActions,
+    checkpoint: {
+      client: checkpointClient,
+      disabled: !displayedConversationId || transcriptBusy,
+      resolveAuthorizedRoots: resolveCheckpointAuthorizedRoots,
+      onRewound: handleCheckpointRewound,
+    },
+  };
+
+  // 每个会话 Pane 始终渲染同一宿主(桌面端 RestorableConversationPaneHost
+  // 口径):焦点只换 primary 绑定,绝不把页面舞台注入聚焦 Pane,也不按
+  // conversationId 做 key(会在焦点切换时拆掉宿主)。终端 / unsupported 走
+  // 各自的自包含表面。
+  // 项目工具 Pane 的运行环境:与 RightDockPanel 同一批网关 client/回调,按
+  // Pane 自己的 ProjectRef 解析项目(见 ProjectToolPaneHost)。终端 client 未
+  // 连接时(网关离线)工具 Pane 与终端 Pane 一样不渲染。
+  const projectToolPaneEnvironment = useMemo<ProjectToolPaneEnvironment | null>(() => {
+    if (!terminalClient) return null;
+    return {
+      theme: effectiveTheme,
+      fontScale: settings.customSettings.fontScale.rightDock,
+      workspaceProjects,
+      activeProjectPathKey: terminalProjectPathKey,
+      clients: {
+        terminal: terminalClient,
+        git: gitClient,
+        tunnel: isAgentMode ? api : null,
+        workspaceActivity: workspaceActivityClient,
+      },
+      capabilities: {
+        disabledMessage: projectToolsDisabledMessage,
+        terminalDisabledMessage,
+        gitWriteEnabled: settings.remote.enableWebGit,
+        gitDisabledMessage,
+        tunnelEnabled,
+        tunnelDisabledMessage,
+        tunnelPublicBaseUrl: window.location.origin,
+      },
+      workspaceProjectRootClient,
+      workspaceRootRevision,
+      fileTree: {
+        getState: (projectPathKey) =>
+          getRightDockFileTreeState(settings.customSettings, projectPathKey),
+        onStateChange: (projectPathKey, patch) =>
+          setSettings((current) => updateRightDockFileTreeState(current, projectPathKey, patch)),
+        onInsertFileMention: handleRightDockInsertFileMention,
+        onOpenFile: (request) => {
+          if (isWorkspacePreviewPath(request.path)) {
+            openWorkspaceFilePreview(request);
+          } else {
+            openWorkspaceEditorFile(request);
+          }
+        },
+        onRevealInFileTree: (projectPathKey, path) => {
+          if (projectPathKey === terminalProjectPathKey) {
+            changedFilesActions.onRevealInFileTree?.(path);
+          }
+        },
+      },
+      git: {
+        onInsertCodeReviewSkill: codeReviewSkill ? handleRightDockInsertCodeReviewSkill : undefined,
+        onInsertCommitMention: handleRightDockInsertCommitMention,
+        onInsertGitFileMention: handleRightDockInsertGitFileMention,
+        onInsertComposerSegments: handleRightDockInsertComposerSegments,
+        focusRequest: gitReviewFocusRequest,
+        onFocusRequestHandled: handleGitReviewFocusRequestHandled,
+      },
+      ssh: {
+        hosts: settings.ssh.hosts,
+        getAssociatedHostIds: (projectPathKey) =>
+          getSshProjectHostIds(settings.ssh, projectPathKey),
+        onAssociatedHostIdsChange: (projectPathKey, hostIds) =>
+          setSettings((prev) => updateSshProjectHostIds(prev, projectPathKey, hostIds)),
+        sessions: terminalSessions,
+        // 按 React 当前值函数式合并(与 dock 侧 sessionsRef.current 同口径),
+        // 避免一次重渲染之间连续到达的 snapshot / reconcile 互相覆盖。
+        onSessionSnapshot: (snapshot) =>
+          updateProjectTerminalSessions((current) =>
+            mergeTerminalSession(current, snapshot.session),
+          ),
+        onSessionClosed: (sessionId) =>
+          updateProjectTerminalSessions((current) => removeTerminalSession(current, sessionId)),
+        onSessionsReconcile: (sessions) =>
+          updateProjectTerminalSessions((current) =>
+            reconcileSshTerminalSessions(current, sessions),
+          ),
+        onOpenSession: handleOpenSshTerminal,
+      },
+      openExternal: (url) => {
+        void openUrl(url);
+      },
+    };
+  }, [
+    api,
+    changedFilesActions,
+    codeReviewSkill,
+    effectiveTheme,
+    gitClient,
+    gitDisabledMessage,
+    gitReviewFocusRequest,
+    handleGitReviewFocusRequestHandled,
+    handleOpenSshTerminal,
+    handleRightDockInsertCodeReviewSkill,
+    handleRightDockInsertCommitMention,
+    handleRightDockInsertComposerSegments,
+    handleRightDockInsertFileMention,
+    handleRightDockInsertGitFileMention,
+    isAgentMode,
+    openWorkspaceEditorFile,
+    openWorkspaceFilePreview,
+    projectToolsDisabledMessage,
+    setSettings,
+    settings.customSettings,
+    settings.remote.enableWebGit,
+    settings.ssh,
+    terminalClient,
+    terminalDisabledMessage,
+    terminalProjectPathKey,
+    terminalSessions,
+    tunnelDisabledMessage,
+    tunnelEnabled,
+    updateProjectTerminalSessions,
+    workspaceActivityClient,
+    workspaceProjectRootClient,
+    workspaceProjects,
+    workspaceRootRevision,
+  ]);
+
+  // 被画板 Pane 租用的项目工具:dock 隐藏对应 tab/内容/入口(与终端租约同口径)。
+  const leasedDockTools = useMemo(
+    () =>
+      leasedProjectToolKinds(
+        workbenchController.workbench.layout,
+        terminalProjectPathKey,
+        PROJECT_TOOL_SURFACE_KINDS,
+      ),
+    [terminalProjectPathKey, workbenchController.workbench.layout],
+  );
+
+  const renderConversationWorkbench = (): ReactNode => {
+    const { workbench, dragState } = workbenchController;
+    return (
+      <WorkbenchCanvas
+        canvasRef={workbenchController.canvasRef}
+        layout={workbench.layout}
+        labels={{
+          paneRegion: (pane) => {
+            const surface = pane.surface;
+            if (surface.kind === "unsupported") {
+              return translate("workbench.paneRegionUnsupported", settings.locale);
+            }
+            const title = workbenchPaneTitle(surface);
+            if (surface.kind === "localTerminal" || surface.kind === "sshTerminal") {
+              return translate("workbench.paneRegionTerminal", settings.locale).replace(
+                "{title}",
+                title,
+              );
+            }
+            if (isProjectToolSurface(surface)) {
+              return translate("workbench.paneRegionTool", settings.locale).replace(
+                "{title}",
+                title,
+              );
+            }
+            if (!title) return translate("workbench.paneRegion", settings.locale);
+            const workspaceName =
+              surface.kind === "conversation"
+                ? workspaceProjects
+                    .find(
+                      (entry) =>
+                        workspaceProjectPathKey(entry.path) === surface.project.projectPathKey,
+                    )
+                    ?.name.trim()
+                : undefined;
+            if (!workspaceName) {
+              return translate("workbench.paneRegionConversation", settings.locale).replace(
+                "{title}",
+                title,
+              );
+            }
+            return translate("workbench.paneRegionConversationInWorkspace", settings.locale)
+              .replace("{title}", title)
+              .replace("{workspace}", workspaceName);
+          },
+          separator: translate("workbench.resizeDivider", settings.locale),
+        }}
+        renderPaneContent={(pane, paneContext) => {
+          const surface = pane.surface;
+          if (surface.kind === "localTerminal" || surface.kind === "sshTerminal") {
+            if (!terminalClient) return null;
+            return (
+              <GatewayTerminalPaneHost
+                paneId={pane.paneId}
+                surface={surface}
+                isFocused={paneContext.isFocused}
+                isCompact={paneContext.isCompact}
+                theme={effectiveTheme}
+                client={terminalClient}
+                sessions={terminalSessions}
+                sessionsLoaded={terminalSessionsLoaded}
+                onSessionGhost={verifyTerminalSessionAlive}
+                closeRequest={
+                  workbenchController.terminalPaneCloseRequest?.paneId === pane.paneId
+                    ? {
+                        busy: workbenchController.terminalPaneCloseRequest.busy,
+                        onConfirm: workbenchController.confirmTerminalPaneClose,
+                        onCancel: workbenchController.cancelTerminalPaneClose,
+                      }
+                    : undefined
+                }
+              />
+            );
+          }
+          if (isProjectToolSurface(surface)) {
+            if (!projectToolPaneEnvironment) return null;
+            return (
+              <ProjectToolPaneHost
+                paneId={pane.paneId}
+                surface={surface}
+                environment={projectToolPaneEnvironment}
+              />
+            );
+          }
+          if (surface.kind === "unsupported") {
+            return (
+              <UnsupportedPaneSurface paneId={pane.paneId} originalKind={surface.originalKind} />
+            );
+          }
+          const conversationId = surface.conversationId;
+          const isPrimary = conversationId === displayedConversationId;
+          const panePathKey = surface.project.projectPathKey;
+          const blockedMessage = archivedWorkspaceProjectPathKeys.has(panePathKey)
+            ? translate("workbench.projectArchived", settings.locale)
+            : missingWorkspaceProjectPathKeys.has(panePathKey)
+              ? translate("workbench.projectMissing", settings.locale)
+              : null;
+          return (
+            <GatewayConversationPaneHost
+              paneId={pane.paneId}
+              conversationId={conversationId}
+              context={conversationPaneHostContext}
+              isPrimary={isPrimary}
+              onFocusPane={() => workbenchController.handleFocusPane(pane.paneId)}
+              pageComposerRef={isPrimary ? composerRef : undefined}
+              primary={isPrimary ? primaryConversationSurface : undefined}
+              blockedMessage={blockedMessage}
+              trajectoryActive={viewForConversation(conversationId) === "trajectory"}
+            />
+          );
+        }}
+        renderPaneChrome={(pane, context) => {
+          if (context.paneCount < 2) return null;
+          const surface = pane.surface;
+          const title = workbenchPaneTitle(surface);
+          const paneConversationView =
+            surface.kind === "conversation"
+              ? viewForConversation(surface.conversationId)
+              : "conversation";
+          return (
+            <PaneChrome
+              paneId={pane.paneId}
+              title={title}
+              isFocused={context.isFocused}
+              isCompact={context.isCompact}
+              dragHandleLabel={translate("workbench.dragPane", settings.locale)}
+              closeLabel={translate("workbench.closePane", settings.locale)}
+              onClose={() => workbenchController.requestClosePane(pane.paneId)}
+              trajectoryToggle={
+                surface.kind === "conversation"
+                  ? {
+                      isTrajectory: paneConversationView === "trajectory",
+                      label:
+                        paneConversationView === "trajectory"
+                          ? translate("workbench.showConversation", settings.locale)
+                          : translate("workbench.showTrajectory", settings.locale),
+                      onToggle: () => {
+                        if (surface.kind !== "conversation") return;
+                        setConversationView(
+                          surface.conversationId,
+                          paneConversationView === "trajectory" ? "conversation" : "trajectory",
+                        );
+                      },
+                    }
+                  : undefined
+              }
+              onDragHandlePointerDown={(event) => {
+                workbenchController.beginPaneDrag(pane, title, {
+                  pointerId: event.pointerId,
+                  clientX: event.clientX,
+                  clientY: event.clientY,
+                  currentTarget: event.currentTarget,
+                });
+              }}
+            />
+          );
+        }}
+        onResizeSplit={workbench.resizeSplit}
+        onEqualizeSplit={workbench.equalizeSplit}
+        onFocusPane={workbenchController.handleFocusPane}
+        onGeometryChange={workbenchController.handleGeometryChange}
+        dropPreview={
+          dragState?.previewRect
+            ? { rect: dragState.previewRect, label: dragState.payload.title }
+            : null
+        }
+        emptyState={
+          <WorkbenchEmptyState
+            title={translate("workbench.emptyTitle", settings.locale)}
+            description={translate("workbench.emptyDescription", settings.locale)}
+          />
+        }
+      />
+    );
+  };
+
+  // 被画布 Pane 租用的会话从 Right Dock 的终端 tab 中隐藏(终端任一时刻只
+  // 出现在一个宿主里);Pane 关闭(Detach)释放租约后自动回归 dock。
+  const workbenchLeasedDockSessionIds = useMemo(
+    () =>
+      workbenchController.leasedDockSessionIds.length > 0
+        ? new Set(workbenchController.leasedDockSessionIds)
+        : undefined,
+    [workbenchController.leasedDockSessionIds],
+  );
+
+  // Cmd/Ctrl+K palette: rebuilt per render, read by the sidebar only when it opens.
+  const buildCommandPaletteActionsLatestRef = useRef<() => CommandPaletteAction[]>(() => []);
+  buildCommandPaletteActionsLatestRef.current = () =>
+    buildCommandPaletteActions({
+      t: (key) => translate(key, settings.locale),
+      isMac: isMacLikePlatform(),
+      onNewConversation: handleSidebarNewConversation,
+      onOpenWorkspace: isAgentMode ? handleOpenCreateWorkspaceProject : undefined,
+      onOpenSettings: (section) => openSettings(section as Parameters<typeof openSettings>[0]),
+      // The WebUI hides the remote section (see the SettingsPage below).
+      settingsSections: [
+        ...SHARED_COMMAND_PALETTE_SETTINGS_SECTIONS.filter((section) => section.id !== "remote"),
+        { id: "shortcuts", labelKey: "settings.navShortcuts" },
+      ],
+      sidebar: { open: sidebarOpen, onToggle: () => setSidebarOpen((open) => !open) },
+      theme: {
+        current: settings.theme,
+        onToggle: () => setSettings((prev) => ({ ...prev, theme: getNextTheme(prev.theme) })),
+      },
+      projectTools: projectToolsDisabledMessage
+        ? undefined
+        : {
+            open: activeView === "chat" && rightDockOpen,
+            onToggle: () => {
+              const open = activeView === "chat" && rightDockOpen;
+              setActiveView("chat");
+              setRightDockOpen(!open);
+            },
+            onOpenTool: terminalProjectPathKey
+              ? (tool) => {
+                  setActiveView("chat");
+                  setRightDockOpen(true);
+                  setSettings((prev) =>
+                    openRightDockSingletonTab(prev, terminalProjectPathKey, tool),
+                  );
+                }
+              : undefined,
+          },
+      resourceHubs: {
+        visible: normalizeSidebarShortcuts(settings.customSettings.sidebarShortcuts),
+        onOpen: handleSidebarOpenResourceHub,
+      },
+      conversationView:
+        activeView === "chat" && hasConversationReply && !workbenchHasMultiplePanes
+          ? { active: renderedConversationView, onChange: setActiveConversationView }
+          : undefined,
+      executionMode: { isAgent: isAgentMode, onSelect: handleSelectExecutionMode },
+      models:
+        modelOptions.length > 0
+          ? {
+              options: modelOptions,
+              selectedValue,
+              onSelect: (value) => {
+                const parsed = parseModelValue(value);
+                if (parsed) handleSelectModel(parsed);
+              },
+            }
+          : undefined,
+      onStopRun: composerIsSending ? handlePrimaryComposerStop : undefined,
+    });
+  const getCommandPaletteActions = useCallback(
+    () => buildCommandPaletteActionsLatestRef.current(),
+    [],
+  );
+
+  // 拖拽幽灵:跟随指针的载荷标题,提交/取消后随 dragState 清空。
+  const workbenchDragGhost =
+    sessionWorkbench.enabled && workbenchController.dragState ? (
+      <div
+        ref={workbenchController.dragGhostRef}
+        data-workbench-drag-ghost=""
+        className={cn(
+          "layer-popover pointer-events-none fixed max-w-220px",
+          "truncate rounded-md border border-border bg-background/95 px-2.5 py-1",
+          "text-xs text-foreground shadow-md",
+        )}
+        style={{
+          left: 0,
+          top: 0,
+          transform: "translate3d(var(--workbench-drag-ghost-x), var(--workbench-drag-ghost-y), 0)",
+          willChange: "transform",
+        }}
+      >
+        {workbenchController.dragState.payload.title ||
+          translate("chat.pendingTitle", settings.locale)}
+      </div>
+    ) : null;
+  return (
+    <LocaleContext.Provider value={localeContextValue}>
+      <Toaster />
+      <AppErrorBoundary>
+        <div className={GATEWAY_SHELL_CLASS}>
+          <input
+            ref={fileInputRef}
+            type="file"
+            multiple
+            aria-label={translate("chat.upload.selectFiles", settings.locale)}
+            className="gateway-hidden-file-input hidden"
+            onChange={(event) => {
+              const files = Array.from(event.currentTarget.files ?? []);
+              void handleImportReadableFiles(files);
+              event.currentTarget.value = "";
+            }}
+          />
+          <input
+            ref={(element) => {
+              folderInputRef.current = element;
+              element?.setAttribute("webkitdirectory", "");
+            }}
+            type="file"
+            multiple
+            aria-label={translate("chat.upload.selectFolder", settings.locale)}
+            className="gateway-hidden-file-input hidden"
+            onChange={(event) => {
+              handleImportSelectedDirectoryFiles(Array.from(event.currentTarget.files ?? []));
+              event.currentTarget.value = "";
+            }}
+          />
+          {workbenchDragGhost}
+
+          <div className="gateway-editor-host relative flex min-w-0 min-h-0 flex-1 h-full flex-col overflow-hidden">
+            <AppWorkbenchChrome
+              settings={settings}
+              sidebarOpen={sidebarOpen}
+              onOpenSettings={openSettings}
+              onToggleTheme={() =>
+                setSettings((prev) => ({
+                  ...prev,
+                  theme: getNextTheme(prev.theme),
+                }))
+              }
+              onOpenSidebar={() => setSidebarOpen((open) => !open)}
+              leadingActions={
+                activeView === "chat" && hasConversationReply && !workbenchHasMultiplePanes ? (
+                  <ConversationViewTabs
+                    active={renderedConversationView}
+                    onChange={setActiveConversationView}
+                  />
+                ) : null
+              }
+              trailingActions={
+                <>
+                  <ProjectToolsPanelToggle
+                    isOpen={rightDockOpen}
+                    sessionCount={projectTerminalSessions.length}
+                    disabledMessage={projectToolsDisabledMessage}
+                    className="mr-6px max-520:mr-8px"
+                    onToggle={() => setRightDockOpen((open) => !open)}
+                  />
+                  <UserMenu
+                    open={userMenuOpen}
+                    onOpenChange={setUserMenuOpen}
+                    userMenuLabel={userMenuLabel}
+                    userAvatarLabel={userAvatarLabel}
+                    agentStatus={status === null ? "unknown" : status.online ? "online" : "offline"}
+                    agentSelector={
+                      <AgentSelector api={api} onAgentChange={handleActiveAgentChange} />
+                    }
+                    onLogout={handleLogout}
+                  />
+                </>
+              }
+            />
+            <div
+              data-app-workbench-body=""
+              className="relative flex min-h-0 min-w-0 flex-1 overflow-hidden"
+            >
+              <GatewaySidebarContainer
+                pinnedOrder={settings.system.sidebarPinnedOrder}
+                onReorderPinned={(sidebarPinnedOrder) =>
+                  setSettings((previous) => ({
+                    ...previous,
+                    system: { ...previous.system, sidebarPinnedOrder },
+                  }))
+                }
+                projectOrder={settings.system.workspaceProjectOrder}
+                onReorderProjects={(workspaceProjectOrder) =>
+                  setSettings((previous) => ({
+                    ...previous,
+                    system: { ...previous.system, workspaceProjectOrder },
+                  }))
+                }
+                store={sidebarStore}
+                approvalConversationIds={approvalConversationIds}
+                transientRunningConversations={manualCompactTransientConversations}
+                currentConversationId={displayedConversationId}
+                isOpen={sidebarOpen}
+                fontScale={settings.customSettings.fontScale.sidebar}
+                activeView={activeView}
+                showProjects={isAgentMode && status?.online === true}
+                projects={workspaceProjects}
+                workspaceProjectGroups={settings.system.workspaceProjectGroups}
+                activeProjectId={activeWorkspaceProject?.id ?? ""}
+                missingProjectPathKeys={missingWorkspaceProjectPathKeys}
+                projectsCollapsed={settings.customSettings.chatSidebar.projectsCollapsed}
+                workspaceFolderDropActive={workspaceFolderDropActive}
+                workspaceFolderDropHandlers={workspaceFolderDropHandlers}
+                recentCollapsed={settings.customSettings.chatSidebar.recentCollapsed}
+                canShareConversations={canShareHistory}
+                sharedConversationCount={sharedHistoryItems.length}
+                externalErrorMessage={sidebarActionError}
+                connectionLost={gatewayConnectionLost}
+                sectionsDisabled={sidebarSectionsDisabled}
+                isLocalDraftConversationId={isLocalDraftConversationId}
+                onProjectsCollapsedChange={handleSidebarProjectsCollapsedChange}
+                onRecentCollapsedChange={handleSidebarRecentCollapsedChange}
+                onCreateProject={handleOpenCreateWorkspaceProject}
+                onCreateWorkspaceGroup={handleCreateWorkspaceGroup}
+                onRenameWorkspaceGroup={handleRenameWorkspaceGroup}
+                onDeleteWorkspaceGroup={handleDeleteWorkspaceGroup}
+                onMoveProjectToGroup={handleMoveWorkspaceProjectToGroup}
+                onToggleWorkspaceGroupCollapsed={handleToggleWorkspaceGroupCollapsed}
+                onSelectProject={handleSelectWorkspaceProject}
+                onNewConversationForProject={handleNewConversationForProject}
+                onBrowseProjectInFileTree={handleBrowseWorkspaceProjectInFileTree}
+                onConfigureProject={setProjectSettingsProject}
+                onSetProjectPinned={handleSetWorkspaceProjectPinned}
+                onRemoveProject={handleRemoveWorkspaceProject}
+                onArchiveProject={handleArchiveWorkspaceProject}
+                onUnarchiveProject={handleUnarchiveWorkspaceProject}
+                archivedProjectPathKeys={archivedWorkspaceProjectPathKeys}
+                onNewConversation={handleSidebarNewConversation}
+                onSelectConversation={handleSidebarSelectConversation}
+                onConversationOpenInWorkbenchSplit={
+                  sessionWorkbench.enabled
+                    ? workbenchController.handleOpenConversationInSplit
+                    : undefined
+                }
+                onConversationWorkbenchDragIntent={
+                  sessionWorkbench.enabled
+                    ? workbenchController.handleConversationDragIntent
+                    : undefined
+                }
+                onProjectWorkbenchDragIntent={
+                  sessionWorkbench.enabled ? workbenchController.handleProjectDragIntent : undefined
+                }
+                onShareConversation={handleOpenShareModal}
+                onOpenSharedConversations={handleOpenSharedHistoryManager}
+                onLocalDraftDeleted={handleSidebarLocalDraftDeleted}
+                onConversationsRemoved={handleSidebarConversationsRemoved}
+                sidebarShortcuts={settings.customSettings.sidebarShortcuts}
+                onOpenSettings={openSettings}
+                onOpenResourceHub={handleSidebarOpenResourceHub}
+                getCommandPaletteActions={getCommandPaletteActions}
+              />
+
+              {shareConversation ? (
+                <HistoryShareModal
+                  conversation={shareConversation}
+                  share={shareStatus}
+                  isLoading={shareLoading}
+                  isUpdating={shareUpdating}
+                  errorMessage={shareError}
+                  onToggle={handleToggleHistoryShare}
+                  onRedactToolContentChange={handleSetShareRedactToolContent}
+                  onClose={handleCloseShareModal}
+                />
+              ) : null}
+
+              {sharedManagerOpen ? (
+                <SharedHistoryManagerModal
+                  conversations={sharedHistoryItems}
+                  statuses={sharedManagerStatuses}
+                  loadingIds={sharedManagerLoadingIds}
+                  updatingIds={sharedManagerUpdatingIds}
+                  errors={sharedManagerErrors}
+                  listError={sharedHistoryListError}
+                  onRefresh={handleRefreshSharedHistoryStatuses}
+                  onLoadStatus={handleLoadSharedHistoryStatus}
+                  onDisableShare={handleDisableSharedHistory}
+                  onSetRedactToolContent={handleSetSharedHistoryRedactToolContent}
+                  onClose={() => setSharedManagerOpen(false)}
+                />
+              ) : null}
+
+              {projectPickerOpen ? (
+                <WorkdirPickerModal
+                  initialWorkdir={activeWorkspaceProjectPath || settings.system.workdir.trim()}
+                  onClose={() => setProjectPickerOpen(false)}
+                  onSelect={handleWorkdirPickerSelect}
+                />
+              ) : null}
+
+              {workspaceCreateModalOpen ? (
+                <WorkspaceCloneModal
+                  initialParent={activeWorkspaceProjectPath || settings.system.workdir.trim()}
+                  canClone={settings.remote.enableWebGit}
+                  cloneDisabledMessage={translate(
+                    "chat.workspaceCloneWebDisabled",
+                    settings.locale,
+                  )}
+                  onOpenFolder={handleOpenWorkspaceFolder}
+                  onClone={handleCloneWorkspaceProject}
+                  onLoadBranches={handleLoadWorkspaceRemoteBranches}
+                  onClose={() => setWorkspaceCreateModalOpen(false)}
+                />
+              ) : null}
+              <WorkspaceCloneTaskOverlay
+                tasks={workspaceCloneTasks}
+                onCancel={handleCancelWorkspaceCloneTask}
+                onDismiss={handleDismissWorkspaceCloneTask}
+                onOpenWorkspace={handleOpenClonedWorkspace}
+              />
+
+              {confirmDialog}
+
+              <WorkspacePanelGroup
+                open={Boolean(terminalClient) && activeView === "chat" && rightDockOpen}
+                width={settings.customSettings.rightDock.width}
+                onWidthChange={handleRightDockWidthChange}
+                onClose={handleRightDockClose}
+                immediate={activeView !== "chat"}
+              >
+                <WorkspaceMainPanel>
+                  <main className={GATEWAY_MAIN_SHELL_CLASS}>
+                    <div className={GATEWAY_MAIN_BACKDROP_CLASS} />
+
+                    {activeView === "image-studio-hub" && !imageStudio.host && (
+                      <section className="relative flex min-h-0 flex-1 flex-col items-center justify-center gap-3 p-6 text-center">
+                        <h1 className="text-lg font-semibold">
+                          {translate("imageStudio.name", viewModel.settings.locale)}
+                        </h1>
+                        <p role="status" className="max-w-lg text-sm text-muted-foreground">
+                          {imageStudio.unavailable}
+                        </p>
+                        {imageStudioIdentity && (
+                          <Button variant="outline" onClick={imageStudio.retry}>
+                            {translate("imageStudio.retryConnect", viewModel.settings.locale)}
+                          </Button>
+                        )}
+                      </section>
+                    )}
+                    <ApplicationView
+                      activeView={activeView}
+                      imageStudioHost={
+                        imageStudio.host && {
+                          ...imageStudio.host,
+                          onOpenSettings: () => openSettings("image-studio"),
+                        }
+                      }
+                      settings={settings}
+                      setSettings={setSettings}
+                      resourceHost={kbrainResourceHostCapabilities}
+                      kbrainSettings={settingsHostAdapter.kbrain}
+                      isAgentMode={isAgentMode}
+                      initialSkills={availableSkills}
+                      initialSkillsRootDir={skillsRootDir}
+                      onOpenView={setActiveView}
+                      className={
+                        activeView === "image-studio-hub" && !imageStudio.host
+                          ? "hidden"
+                          : "contents"
+                      }
+                      chat={{
+                        containerRef: chatFrameRef,
+                        containerProps: {
+                          className: `${GATEWAY_CHAT_FRAME_CLASS} zone-font-scale`,
+                          style: {
+                            "--zone-font-scale": settings.customSettings.fontScale.chat,
+                          } as CSSProperties,
+                          onDragEnter: handleChatFileDragEnter,
+                          onDragOver: handleChatFileDragOver,
+                          onDragLeave: handleChatFileDragLeave,
+                          onDrop: handleChatFileDrop,
+                        },
+                        content: (
+                          <>
+                            {statusError ? (
+                              <div
+                                className={cn(
+                                  "gateway-banner-error mx-20px mt-12px mb-0",
+                                  "rounded-14px border border-destructive/16 bg-destructive/8 px-12px py-10px text-sm text-destructive",
+                                  "max-640:mx-10px max-640:mt-8px max-640:mb-0",
+                                )}
+                              >
+                                {statusError}
+                              </div>
+                            ) : null}
+                            {chatProtocolIncompatibleMessage && !statusError ? (
+                              <div
+                                className={cn(
+                                  "gateway-banner-error mx-20px mt-12px mb-0",
+                                  "rounded-14px border border-destructive/16 bg-destructive/8 px-12px py-10px text-sm text-destructive",
+                                  "max-640:mx-10px max-640:mt-8px max-640:mb-0",
+                                )}
+                              >
+                                {chatProtocolIncompatibleMessage}
+                              </div>
+                            ) : null}
+                            {settingsSyncError ? (
+                              <div
+                                className={cn(
+                                  "gateway-banner-error mx-20px mt-12px mb-0",
+                                  "rounded-14px border border-destructive/16 bg-destructive/8 px-12px py-10px text-sm text-destructive",
+                                  "max-640:mx-10px max-640:mt-8px max-640:mb-0",
+                                )}
+                              >
+                                {settingsSyncError}
+                              </div>
+                            ) : null}
+                            {chatError && displayedTranscriptRowCount === 0 ? (
+                              <div
+                                className={cn(
+                                  "gateway-banner-error mx-20px mt-12px mb-0",
+                                  "rounded-14px border border-destructive/16 bg-destructive/8 px-12px py-10px text-sm text-destructive",
+                                  "max-640:mx-10px max-640:mt-8px max-640:mb-0",
+                                )}
+                              >
+                                {chatError}
+                              </div>
+                            ) : null}
+
+                            {sessionWorkbench.enabled ? (
+                              renderConversationWorkbench()
+                            ) : (
+                              <section
+                                ref={transcriptStageRef}
+                                // Scopes Esc-to-stop to this transcript + composer.
+                                data-conversation-scope=""
+                                className="gateway-transcript-stage relative min-h-0 flex-1 overflow-hidden @container"
+                                // Preferred (persisted) width, so a fresh mount paints at
+                                // the user's width instead of the default.
+                                // TranscriptWidthControls narrows this same variable to
+                                // the stage in a layout effect — see its header.
+                                style={
+                                  {
+                                    [CHAT_TRANSCRIPT_WIDTH_CSS_VAR]: `${settings.customSettings.chatTranscript.width}px`,
+                                  } as CSSProperties
+                                }
+                              >
+                                {renderedConversationView === "trajectory" ? (
+                                  <TrajectoryView
+                                    conversationId={displayedConversationId}
+                                    host={trajectoryHost}
+                                    messages={trajectoryMessages}
+                                    workdir={displayedConversationWorkdir}
+                                    hasMoreMessages={selectedHistoryHasMore}
+                                    loadEarlierMessages={
+                                      selectedHistoryHasMore ? handleLoadEarlierHistory : undefined
+                                    }
+                                    liveEvents={liveTrajectory}
+                                    authoritativeRevision={trajectoryAuthoritativeRevision}
+                                  />
+                                ) : (
+                                  <div className="relative h-full min-h-0">
+                                    <ScrollArea
+                                      ref={setTranscriptScrollAreaRoot}
+                                      viewportRef={setTranscriptViewport}
+                                      className={GATEWAY_TRANSCRIPT_SCROLL_CLASS}
+                                    >
+                                      <ChangedFilesActionsProvider value={changedFilesActions}>
+                                        <CheckpointRewindProvider
+                                          client={checkpointClient}
+                                          conversationId={displayedConversationId}
+                                          disabled={!displayedConversationId || transcriptBusy}
+                                          resolveAuthorizedRoots={resolveCheckpointAuthorizedRoots}
+                                          onRewound={handleCheckpointRewound}
+                                        >
+                                          <GatewayTranscript
+                                            conversationId={displayedConversationId}
+                                            rows={transcriptRows}
+                                            liveStartIndex={transcriptLiveStartIndex}
+                                            activeTurnKey={displayedTranscript.activeTurnKey}
+                                            contentWidth={
+                                              settings.customSettings.chatTranscript.width
+                                            }
+                                            expandProcessByDefault={
+                                              settings.customSettings.chatTranscript
+                                                .expandProcessByDefault
+                                            }
+                                            isViewportFollowing={transcriptFollow.isFollowing}
+                                            viewportFollowing={transcriptFollowing}
+                                            navRef={transcriptNavRef}
+                                            onAnchorUserRowChange={setActiveFloorKey}
+                                            error={transcriptError}
+                                            toolStatus={transcriptToolStatus}
+                                            toolStatusIsCompaction={
+                                              transcriptToolStatusIsCompaction
+                                            }
+                                            retryAttempts={displayedTranscript.retryAttempts}
+                                            isStreaming={transcriptBusy}
+                                            isLoading={transcriptHistoryLoading}
+                                            loadingTitle={historyDetailLoadingTitle}
+                                            hasModels={modelOptions.length > 0}
+                                            onOpenSettings={openSettings}
+                                            hasMoreHistory={selectedHistoryHasMore}
+                                            isLoadingMoreHistory={loadingOlderHistory}
+                                            onLoadEarlierHistory={
+                                              selectedHistoryHasMore
+                                                ? handleLoadEarlierHistory
+                                                : undefined
+                                            }
+                                            showUsage={isAgentDevExecutionMode}
+                                            usageContextWindow={currentModelContextWindow}
+                                            workspaceRoot={displayedConversationWorkdir}
+                                            onOpenFileLink={handleOpenChatFileLink}
+                                            gitClient={gitClient}
+                                            onLoadUploadedImagePreview={
+                                              handleLoadUploadedImagePreview
+                                            }
+                                            onResendFromEdit={handleResendFromEdit}
+                                            onBranchConversation={handleBranchConversation}
+                                            branchPendingMessageId={branchPendingMessageId}
+                                            onSuggestionSelect={handleEmptyStateSuggestion}
+                                            onQuoteSelection={handleQuoteSelection}
+                                          />
+                                        </CheckpointRewindProvider>
+                                      </ChangedFilesActionsProvider>
+                                    </ScrollArea>
+                                    <TranscriptWidthControls
+                                      hostRef={transcriptStageRef}
+                                      width={settings.customSettings.chatTranscript.width}
+                                      onWidthChange={handleChatTranscriptWidthChange}
+                                      resizeLabel={translate(
+                                        "chat.transcript.resizeWidth",
+                                        settings.locale,
+                                      )}
+                                      resetLabel={translate(
+                                        "chat.transcript.resizeWidthReset",
+                                        settings.locale,
+                                      )}
+                                      suspended={conversationOpenState.showOverlay}
+                                    />
+                                    {displayedTranscriptRowCount > 0 &&
+                                    !conversationOpenState.showOverlay ? (
+                                      <FloorNavRail
+                                        conversationId={displayedConversationId}
+                                        floors={transcriptFloors}
+                                        activeRowKey={activeFloorKey}
+                                        bottomOffset="calc(var(--gateway-chat-composer-overlay-height, var(--spacing-176px)) + var(--spacing-12px))"
+                                        scrollViewport={transcriptViewport}
+                                        onJump={handleFloorJump}
+                                      />
+                                    ) : null}
+                                    {conversationOpenState.showOverlay ? (
+                                      <HistorySwitchLoadingOverlay locale={settings.locale} />
+                                    ) : null}
+                                  </div>
+                                )}
+                                {renderedConversationView === "conversation" &&
+                                !transcriptFollowing ? (
+                                  <button
+                                    type="button"
+                                    className={GATEWAY_SCROLL_TO_BOTTOM_CLASS}
+                                    onClick={transcriptFollow.jumpToBottom}
+                                    aria-label={translate(
+                                      "chat.transcript.scrollToBottom",
+                                      settings.locale,
+                                    )}
+                                    title={translate(
+                                      "chat.transcript.scrollToBottom",
+                                      settings.locale,
+                                    )}
+                                  >
+                                    <ChevronDown className="size-4" />
+                                  </button>
+                                ) : null}
+                                <ChatComposerBar
+                                  surface="web"
+                                  overlayHeightOwnerRef={chatFrameRef}
+                                  runClarifyTurn={
+                                    settings.customSettings.promptClarifyEnabled
+                                      ? runClarifyTurn
+                                      : undefined
+                                  }
+                                  clarifyContext={clarifyContext}
+                                  conversationId={displayedConversationId}
+                                  // 轨迹页是只读分析视图：挂起输入区（保持挂载，草稿不丢）。
+                                  hidden={renderedConversationView === "trajectory"}
+                                  composerRef={composerRef}
+                                  isSending={composerIsSending}
+                                  isUploadingFiles={isUploadingFiles}
+                                  isInputDisabled={composerInputDisabled}
+                                  // 麦克风在开启语音输入后显示；点击设置卡片会立即切换当前供应商。
+                                  sttSessionKey={displayedConversationId}
+                                  sttProvider={
+                                    settings.stt.enabled
+                                      ? (sttProviderOverride ??
+                                        settings.stt.provider ??
+                                        "tencent_cloud")
+                                      : null
+                                  }
+                                  sttProviderConfigured={
+                                    settings.stt.providers[
+                                      sttProviderOverride ??
+                                        settings.stt.provider ??
+                                        "tencent_cloud"
+                                    ]?.configured
+                                  }
+                                  sttTransport={webSttTransport}
+                                  onSttError={handleSttError}
+                                  inputPlaceholder={composerPlaceholder}
+                                  workdir={displayedConversationWorkdir}
+                                  enabledSkills={enabledComposerSkills}
+                                  mentionableConversations={mentionableConversations}
+                                  searchMentionableConversations={searchMentionableConversations}
+                                  mentionApps={mentionApps}
+                                  commandHost={composerCommandHost}
+                                  goalBar={
+                                    <WebGoalBarHost
+                                      key={`goal-${displayedConversationId}`}
+                                      conversationId={
+                                        isLocalDraftConversationId(displayedConversationId)
+                                          ? undefined
+                                          : displayedConversationId
+                                      }
+                                      client={api ?? undefined}
+                                      commandHost={composerCommandHost}
+                                      running={composerIsSending}
+                                    />
+                                  }
+                                  executionMode={settings.system.executionMode}
+                                  hasModels={modelOptions.length > 0}
+                                  currentModelLabel={currentModelLabel}
+                                  modelOptions={modelOptions}
+                                  selectedValue={selectedValue}
+                                  chatRuntimeControls={chatRuntimeControlsForCurrentProvider}
+                                  commandSafetyMode={settings.system.commandSafetyMode}
+                                  onCommandSafetyModeChange={(mode) =>
+                                    setSettings((prev) =>
+                                      prev.system.commandSafetyMode === mode
+                                        ? prev
+                                        : updateSystem(prev, { commandSafetyMode: mode }),
+                                    )
+                                  }
+                                  reasoningOptions={chatRuntimeReasoningOptions}
+                                  thinkingAlwaysOn={chatRuntimeThinkingAlwaysOn}
+                                  contextUsageTokensSource={contextUsageTokensSource}
+                                  contextWindow={currentModelContextWindow}
+                                  contextDisplayMode={
+                                    settings.customSettings.composerContextDisplay
+                                  }
+                                  onManualCompactConfirm={handleManualCompact}
+                                  manualCompactBlocked={
+                                    manualCompactPending || composerCompactionBlocked
+                                  }
+                                  gitClient={gitClient}
+                                  onOpenWorktree={handleOpenWorktree}
+                                  onWorktreeRemoved={handleWorktreeRemoved}
+                                  gitWriteEnabled={settings.remote.enableWebGit}
+                                  gitDisabledMessage={gitDisabledMessage}
+                                  workspaceActivityClient={workspaceActivityClient}
+                                  onSelectModel={handleSelectModel}
+                                  onSelectExecutionMode={handleSelectExecutionMode}
+                                  onOpenSettings={openSettings}
+                                  onSend={() => {
+                                    if (
+                                      submitInFlightRef.current ||
+                                      isUploadingFiles ||
+                                      isImportingPastedTextRef.current ||
+                                      composerInputDisabled
+                                    ) {
+                                      return;
+                                    }
+                                    if (
+                                      queuedChatEditSessionRef.current?.conversationId ===
+                                      getDisplayedConversationId()
+                                    ) {
+                                      submitInFlightRef.current = true;
+                                      void (async () => {
+                                        try {
+                                          await commitQueuedChatEdit();
+                                        } finally {
+                                          submitInFlightRef.current = false;
+                                        }
+                                      })();
+                                      return;
+                                    }
+                                    if (
+                                      displayedConversationBusyRef.current ||
+                                      queuedChatTurnsForDisplayedConversation.length > 0
+                                    ) {
+                                      submitInFlightRef.current = true;
+                                      void (async () => {
+                                        try {
+                                          await submitCurrentComposerToGuiQueue("append");
+                                        } finally {
+                                          submitInFlightRef.current = false;
+                                        }
+                                      })();
+                                      return;
+                                    }
+                                    submitInFlightRef.current = true;
+                                    void (async () => {
+                                      try {
+                                        const draft = composerRef.current?.getDraft() ?? null;
+                                        // Capture the send target before the paste import
+                                        // awaits: switching conversations mid-import must
+                                        // not reroute the message or clear the composer of
+                                        // the newly displayed conversation.
+                                        const sendConversationId = getDisplayedConversationId();
+                                        let text: string;
+                                        let files: PendingUploadedFile[];
+                                        let referencedConversations =
+                                          draft?.conversationMentions ?? [];
+                                        try {
+                                          const materialized = draft
+                                            ? await materializeComposerDraftForSend(
+                                                draft,
+                                                pendingUploadedFiles,
+                                                displayedConversationWorkdir,
+                                                sendConversationId,
+                                              )
+                                            : {
+                                                text: "",
+                                                uploadedFiles: pendingUploadedFiles,
+                                                referencedConversations: [],
+                                              };
+                                          text = materialized.text;
+                                          files = materialized.uploadedFiles;
+                                          referencedConversations =
+                                            materialized.referencedConversations;
+                                        } catch (error) {
+                                          addNotify(
+                                            "error",
+                                            asErrorMessage(
+                                              error,
+                                              translate(
+                                                "chat.largePasteImportFailed",
+                                                settings.locale,
+                                              ),
+                                            ),
+                                          );
+                                          return;
+                                        }
+
+                                        if (!text && files.length === 0) {
+                                          return;
+                                        }
+                                        if (getDisplayedConversationId() === sendConversationId) {
+                                          composerRef.current?.clear();
+                                        }
+                                        setPendingUploadsForConversation(sendConversationId, []);
+                                        void sendChat(text, {
+                                          conversationId: sendConversationId,
+                                          uploadedFiles: files,
+                                          referencedConversations,
+                                          runtimeControls: chatRuntimeControlsForCurrentProvider,
+                                        }).catch(() => {
+                                          updatePendingUploadsForConversation(
+                                            sendConversationId,
+                                            (current) => mergePendingUploadedFiles(current, files),
+                                          );
+                                        });
+                                      } finally {
+                                        submitInFlightRef.current = false;
+                                      }
+                                    })();
+                                  }}
+                                  onStop={() => {
+                                    const nextQueuedTurn =
+                                      queuedChatTurnsForDisplayedConversation[0];
+                                    if (nextQueuedTurn && !queuePaused) {
+                                      // Keep WebUI's stop button aligned with the desktop
+                                      // composer: stop the active run, then drain the queue.
+                                      runQueuedTurnNow(nextQueuedTurn.id);
+                                      return;
+                                    }
+                                    void cancelChat(displayedConversationId);
+                                  }}
+                                  onPrepareChatRuntime={() => {
+                                    if (!api || historyShareToken) {
+                                      return;
+                                    }
+                                    void prepareChatRuntime(
+                                      "composer-focus",
+                                      api,
+                                      CHAT_RUNTIME_FOREGROUND_PREPARE_TIMEOUT_MS,
+                                    ).catch(() => undefined);
+                                  }}
+                                  onComposerBusyChange={handleComposerBusyChange}
+                                  onChatRuntimeControlsChange={handleChatRuntimeControlsChange}
+                                  onPickReadableFiles={() => fileInputRef.current?.click()}
+                                  onPickWorkspaceFolder={() => folderInputRef.current?.click()}
+                                  onPasteFiles={handleImportReadableFiles}
+                                  onLoadUploadedImagePreview={handleLoadUploadedImagePreview}
+                                  loadHistoryPrompts={loadComposerHistoryPrompts}
+                                  pendingUploadedFiles={pendingUploadedFiles}
+                                  onRemovePendingUpload={(relativePath) => {
+                                    updatePendingUploadsForConversation(
+                                      getDisplayedConversationId(),
+                                      (current) =>
+                                        current.filter(
+                                          (file) => file.relativePath !== relativePath,
+                                        ),
+                                    );
+                                  }}
+                                  queuedTurns={queuedChatTurnsForDisplayedConversation}
+                                  queuePaused={queuePaused}
+                                  queueControlPending={queueControlPending}
+                                  onQueuePausedChange={handleQueuePausedChange}
+                                  onRunQueuedTurnNow={runQueuedTurnNow}
+                                  onMoveQueuedTurnUp={moveQueuedTurnUp}
+                                  onEditQueuedTurn={editQueuedTurn}
+                                  onRemoveQueuedTurn={removeQueuedTurn}
+                                  taskProgressBar={
+                                    <TaskProgressBar
+                                      key={displayedConversationId}
+                                      snapshot={taskProgressSnapshot}
+                                      isConversationRunning={transcriptBusy}
+                                    />
+                                  }
+                                  approvalBar={approvalBar}
+                                  statsBar={
+                                    <ConversationStatsBarHost
+                                      // 前缀防与同级 taskProgressBar 的 key（裸会话 id）碰撞：React 对
+                                      // 同键兄弟的 keyed diff 会让旧 fiber 逃过删除，DOM 残留逐次累积。
+                                      key={`stats-${displayedConversationId}`}
+                                      conversationId={displayedConversationId}
+                                      host={trajectoryHost}
+                                      // 轨迹视图下输入区隐藏，状态栏无需拉取。
+                                      enabled={renderedConversationView !== "trajectory"}
+                                      contextUsageTokensSource={contextUsageTokensSource}
+                                      contextWindow={currentModelContextWindow}
+                                      onManualCompactConfirm={handleManualCompact}
+                                      manualCompactBlocked={
+                                        manualCompactPending || composerCompactionBlocked
+                                      }
+                                    />
+                                  }
+                                  fileDropOverlay={
+                                    isFileDropActive ? (
+                                      <FileDropOverlay
+                                        variant="composer"
+                                        canDropUpload={canDropUpload}
+                                        title={fileDropTitle}
+                                        description={fileDropDescription}
+                                        limitHint={fileDropLimitHint}
+                                      />
+                                    ) : null
+                                  }
+                                />
+                              </section>
+                            )}
+                          </>
+                        ),
+                      }}
+                      workspaceOverlays={
+                        <WorkspaceOverlayHost
+                          locale={settings.locale}
+                          theme={effectiveTheme}
+                          workspaceEditorMounted={workspaceEditorMounted}
+                          workspaceEditorOpenRequest={workspaceEditorOpenRequest}
+                          workspaceEditorCloseRequestId={workspaceEditorCloseRequestId}
+                          workspaceEditorOpen={workspaceEditorOpen}
+                          workspaceEditorCleanupPending={workspaceEditorCleanupPending}
+                          onWorkspaceEditorPreviewFile={openWorkspaceFilePreview}
+                          onWorkspaceEditorInsertCodeMention={handleInsertCodeMention}
+                          onWorkspaceEditorHide={handleWorkspaceEditorHide}
+                          onWorkspaceEditorClose={handleWorkspaceEditorClosed}
+                          workspaceFilePreviewMounted={workspaceFilePreviewMounted}
+                          workspaceFilePreviewOpenRequest={workspaceFilePreviewOpenRequest}
+                          workspaceFilePreviewOpen={workspaceFilePreviewOpen}
+                          onWorkspaceFilePreviewOpenEditor={openWorkspaceEditorFile}
+                          onWorkspaceFilePreviewRequestClose={requestWorkspaceFilePreviewClose}
+                          onWorkspaceFilePreviewClose={handleWorkspaceFilePreviewClosed}
+                          workspaceSshTerminalMounted={workspaceSshTerminalMounted}
+                          workspaceSshTerminalOpenRequest={workspaceSshTerminalOpenRequest}
+                          workspaceSshTerminalOpen={workspaceSshTerminalOpen}
+                          terminalProjectPathKey={terminalProjectPathKey}
+                          terminalClient={terminalClient}
+                          sftpClient={sftpClient}
+                          terminalSessions={terminalSessions}
+                          onWorkspaceSshTerminalHide={hideWorkspaceSshTerminalOverlay}
+                          onSshTerminalOpenFile={handleOpenSftpFile}
+                          sshTerminalPaneLeasedSessionIds={workbenchLeasedDockSessionIds}
+                          onSshTerminalFocusLeasedSession={
+                            sessionWorkbench.enabled
+                              ? workbenchController.focusTerminalPaneForSession
+                              : undefined
+                          }
+                          onSshTerminalSessionTabDragStart={
+                            sessionWorkbench.enabled
+                              ? workbenchController.handleTerminalTabDragIntent
+                              : undefined
+                          }
+                        />
+                      }
+                    />
+                  </main>
+                </WorkspaceMainPanel>
+                <WorkspaceToolsPanel>
+                  {terminalClient ? (
+                    <RightDockPanel
+                      isOpen={activeView === "chat" && rightDockOpen}
+                      fontScale={settings.customSettings.fontScale.rightDock}
+                      projectPathKey={terminalProjectPathKey}
+                      cwd={terminalProjectPath}
+                      workspaceProject={activeWorkspaceProject}
+                      workspaceProjectRootClient={workspaceProjectRootClient}
+                      workspaceRootRevision={workspaceRootRevision}
+                      sessions={terminalSessions}
+                      sessionsLoaded={terminalSessionsLoaded}
+                      leasedSessionIds={workbenchLeasedDockSessionIds}
+                      leasedTools={leasedDockTools}
+                      theme={effectiveTheme}
+                      disabledMessage={projectToolsDisabledMessage}
+                      terminalDisabledMessage={terminalDisabledMessage}
+                      projectState={rightDockProjectState}
+                      fileTreeState={rightDockFileTreeState}
+                      sshHosts={settings.ssh.hosts}
+                      associatedSshHostIds={associatedSshHostIds}
+                      client={terminalClient}
+                      gitClient={gitClient}
+                      gitWriteEnabled={settings.remote.enableWebGit}
+                      gitDisabledMessage={gitDisabledMessage}
+                      tunnelClient={isAgentMode ? api : null}
+                      tunnelEnabled={tunnelEnabled}
+                      tunnelDisabledMessage={tunnelDisabledMessage}
+                      tunnelPublicBaseUrl={window.location.origin}
+                      workspaceActivityClient={workspaceActivityClient}
+                      onProjectStateChange={handleRightDockProjectStateChange}
+                      onFileTreeStateChange={handleRightDockFileTreeStateChange}
+                      onSshProjectHostIdsChange={handleSshProjectHostIdsChange}
+                      onOpenSshSession={handleOpenSshTerminal}
+                      onSessionsChange={handleProjectTerminalSessionsChange}
+                      onTerminalTabDragStart={
+                        sessionWorkbench.enabled
+                          ? workbenchController.handleTerminalTabDragIntent
+                          : undefined
+                      }
+                      onNewTerminalDragStart={
+                        sessionWorkbench.enabled
+                          ? workbenchController.handleNewTerminalDragIntent
+                          : undefined
+                      }
+                      onOpenTerminalInWorkbench={
+                        sessionWorkbench.enabled
+                          ? workbenchController.handleOpenTerminalInSplit
+                          : undefined
+                      }
+                      onToolDragStart={
+                        sessionWorkbench.enabled && terminalProjectPath.trim()
+                          ? workbenchController.handleToolDragIntent
+                          : undefined
+                      }
+                      onOpenToolInWorkbench={
+                        sessionWorkbench.enabled && terminalProjectPath.trim()
+                          ? workbenchController.handleOpenToolInSplit
+                          : undefined
+                      }
+                      onOpenNewTerminalInWorkbench={
+                        sessionWorkbench.enabled
+                          ? workbenchController.handleOpenNewTerminalInSplit
+                          : undefined
+                      }
+                      onSessionGhost={verifyTerminalSessionAlive}
+                      onInsertFileMention={handleRightDockInsertFileMention}
+                      onOpenFile={handleOpenWorkspaceFile}
+                      gitReviewFocusRequest={gitReviewFocusRequest}
+                      onGitReviewFocusRequestHandled={handleGitReviewFocusRequestHandled}
+                      onInsertCodeReviewSkill={
+                        codeReviewSkill ? handleRightDockInsertCodeReviewSkill : undefined
+                      }
+                      onInsertCommitMention={handleRightDockInsertCommitMention}
+                      onInsertGitFileMention={handleRightDockInsertGitFileMention}
+                      onInsertComposerSegments={handleRightDockInsertComposerSegments}
+                      onClose={handleRightDockClose}
+                    />
+                  ) : null}
+                </WorkspaceToolsPanel>
+              </WorkspacePanelGroup>
+            </div>
+          </div>
+
+          {projectSettingsProject ? (
+            <WorkspaceProjectSettingsModal
+              project={projectSettingsProject}
+              settings={settings}
+              skills={availableSkills}
+              rootClient={workspaceProjectRootClient}
+              rootClientUnavailableDescription={
+                workspaceProjectRootClient
+                  ? undefined
+                  : translate(
+                      "chat.workspaceSettingsDirectoriesGatewayDescription",
+                      settings.locale,
+                    )
+              }
+              onClose={() => setProjectSettingsProject(null)}
+              onRenameProject={(name) => {
+                handleCommitWorkspaceProjectRename(projectSettingsProject, name);
+              }}
+              onSave={(draft) => {
+                setSettings((prev) =>
+                  updateWorkspaceResourceSettings(prev, projectSettingsProject.path, draft),
+                );
+              }}
+            />
+          ) : null}
+
+          {settingsOpen ? (
+            <div
+              // The settings overlay covers the chat, so the Cmd/Ctrl+K palette stays closed.
+              data-command-palette-suppressed=""
+              className={cn(
+                GATEWAY_SETTINGS_OVERLAY_CLASS,
+                // Keep the settled translate at none: a transformed settings scroller
+                // can leave blank rasterized regions on Android Chrome. Tailwind v4
+                // puts translate-y-* on `translate`, which transform-none! does not reset.
+                overlay === "open" ? "opacity-100! translate-none!" : "",
+              )}
+              onTransitionEnd={handleSettingsTransitionEnd}
+            >
+              <SettingsPage
+                imageClient={imageStudio.host?.client}
+                registerLeaveGuard={viewModel.registerSettingsLeaveGuard}
+                settings={{
+                  ...settings,
+                  system: { ...settings.system, workspaceProjects },
+                }}
+                settingsHost={settingsHostAdapter}
+                setSettings={setSettings}
+                saveState={settingsSaveState}
+                onBack={closeSettings}
+                initialSection={settingsSection}
+                initialProviderId={settingsProviderId}
+                hiddenSections={["remote"]}
+                sttSettingsService={sttSettingsService}
+                onSttProviderChange={setSttProviderOverride}
+                onAgentDirectoryChanged={async () => {
+                  if (!api) return;
+                  await api.listAgents();
+                  handleActiveAgentChange(api.getActiveAgent());
+                }}
+              />
+            </div>
+          ) : null}
+        </div>
+      </AppErrorBoundary>
+    </LocaleContext.Provider>
+  );
+}

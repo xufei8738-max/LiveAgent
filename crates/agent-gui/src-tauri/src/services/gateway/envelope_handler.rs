@@ -1,0 +1,1605 @@
+use std::sync::Arc;
+
+use serde_json::Value;
+use tauri::Emitter;
+
+use crate::commands::chat_history::{self};
+use crate::commands::settings::{
+    apply_ssh_patch_with_conn, open_db, redact_gateway_settings_sync_payload,
+    reset_ssh_known_host_everywhere, SSH_PATCH_FIELD,
+};
+use crate::services::gateway_bridge;
+use crate::services::workspace_watch::WatchSource;
+
+use super::*;
+
+pub(super) fn provider_usage_agent_envelope(
+    request_id: String,
+    response: proto::ProviderUsageResponse,
+) -> proto::AgentEnvelope {
+    proto::AgentEnvelope {
+        request_id,
+        timestamp: now_unix_seconds(),
+        payload: Some(proto::agent_envelope::Payload::ProviderUsageResp(response)),
+    }
+}
+
+impl GatewayController {
+    pub(crate) async fn handle_gateway_envelope(
+        self: &Arc<Self>,
+        envelope: proto::GatewayEnvelope,
+    ) -> Result<(), String> {
+        let request_id = envelope.request_id.clone();
+        if matches!(
+            envelope.payload.as_ref(),
+            Some(
+                proto::gateway_envelope::Payload::HistoryList(_)
+                    | proto::gateway_envelope::Payload::HistoryWorkdirs(_)
+                    | proto::gateway_envelope::Payload::HistoryGet(_)
+                    | proto::gateway_envelope::Payload::HistoryRename(_)
+                    | proto::gateway_envelope::Payload::HistoryPin(_)
+                    | proto::gateway_envelope::Payload::HistorySetCwd(_)
+                    | proto::gateway_envelope::Payload::HistoryDelete(_)
+                    | proto::gateway_envelope::Payload::HistoryBranch(_)
+                    | proto::gateway_envelope::Payload::HistoryShareGet(_)
+                    | proto::gateway_envelope::Payload::HistoryShareSet(_)
+                    | proto::gateway_envelope::Payload::HistoryShareResolve(_)
+                    | proto::gateway_envelope::Payload::TrajectoryFetch(_)
+                    | proto::gateway_envelope::Payload::Checkpoint(_)
+            )
+        ) {
+            // Every desktop conversation is a K-brain session, and only the
+            // webview owns the local->backend id mapping, so these requests go
+            // through the frontend's K-brain history bridge, not the legacy store.
+            let controller = Arc::clone(self);
+            tauri::async_runtime::spawn(async move {
+                if let Some(payload) = envelope.payload {
+                    if let Err(error) = controller
+                        .handle_kbrain_history_request(request_id, &payload)
+                        .await
+                    {
+                        eprintln!("gateway K-brain history request failed: {error}");
+                    }
+                }
+            });
+            return Ok(());
+        }
+
+        match envelope.payload {
+            Some(proto::gateway_envelope::Payload::Ping(ping)) => {
+                let pong = proto::AgentEnvelope {
+                    request_id: request_id.clone(),
+                    timestamp: now_unix_seconds(),
+                    payload: Some(proto::agent_envelope::Payload::Pong(proto::PongResponse {
+                        timestamp: ping.timestamp,
+                    })),
+                };
+                if is_chat_runtime_wake_request_id(&request_id) {
+                    if let Err(error) = self.wake_chat_runtime("gateway_ping") {
+                        eprintln!("emit gateway chat runtime wake ping failed: {error}");
+                    }
+                }
+                // Never block the receive loop on outbound saturation, and
+                // never let a pong failure tear down the connection. Pongs
+                // ride the dedicated control lane so chat.prepare probes are
+                // answered even while streamed tokens saturate the data
+                // queue; the data queue is only a best-effort fallback while
+                // the lanes are being swapped mid-reconnect.
+                let pong = match self.current_outbound_control_sender() {
+                    Ok(sender) => match sender.try_send(pong) {
+                        Ok(()) => return Ok(()),
+                        Err(envelope) => envelope,
+                    },
+                    Err(_) => pong,
+                };
+                if let Ok(sender) = self.current_outbound_sender() {
+                    let _ = sender.try_send(pong);
+                }
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::TunnelState(snapshot)) => {
+                self.handle_tunnel_state_snapshot(snapshot);
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::TunnelMutation(mutation)) => {
+                self.handle_tunnel_mutation_request(request_id, mutation);
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::TunnelFrame(frame)) => {
+                self.tunnel_proxy.handle_frame(self, frame)
+            }
+            Some(proto::gateway_envelope::Payload::WorkspaceWatch(request)) => {
+                self.workspace_watch
+                    .set_desired(WatchSource::Gateway, request.workdirs);
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::ChatCommand(command)) => {
+                self.handle_chat_command(request_id, command).await
+            }
+            Some(proto::gateway_envelope::Payload::ChatQueue(request)) => {
+                self.handle_chat_queue_request(request_id, request).await
+            }
+            Some(proto::gateway_envelope::Payload::ClarifyTurn(request)) => {
+                // handle_clarify_turn blocks on a 120s oneshot for slow
+                // completions; spawn it so it never stalls the single-threaded
+                // gateway dispatcher loop.
+                let this = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = this.handle_clarify_turn(request_id, request).await {
+                        eprintln!("handle clarify turn failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::ChatIngressAck(ack)) => {
+                self.handle_chat_ingress_ack(request_id, ack).await
+            }
+            Some(proto::gateway_envelope::Payload::Planning(request)) => {
+                let result =
+                    crate::services::planning::handle_request(&self.app_handle, request).await;
+                match result {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::PlanningResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::CronManage(request)) => {
+                // Successful apply actions broadcast their own snapshot via the
+                // AutomationStore notifier; no extra refresh is needed here.
+                match gateway_bridge::handle_cron_manage(
+                    self.app_handle.clone(),
+                    Arc::clone(&self.automation_store),
+                    request,
+                )
+                .await
+                {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::CronManageResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::HistoryList(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_list(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(proto::agent_envelope::Payload::HistoryListResp(
+                                        response,
+                                    )),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.list handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryWorkdirs(_request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_workdirs().await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryWorkdirsResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.workdirs handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryGet(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_get(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(proto::agent_envelope::Payload::HistoryGetResp(
+                                        response,
+                                    )),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.get handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::TrajectoryFetch(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_trajectory_fetch(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::TrajectoryFetchResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway trajectory.fetch handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryPrefix(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_prefix(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryPrefixResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.prefix handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryRename(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_rename(request).await {
+                        Ok(response) => {
+                            if let Some(conversation) = response.conversation.as_ref() {
+                                controller
+                                    .publish_history_sync(build_history_sync_upsert_from_proto(
+                                        conversation,
+                                    ))
+                                    .await;
+                            }
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryRenameResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.rename handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryBranch(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_branch(request).await {
+                        Ok(response) => {
+                            if let Some(conversation) = response.conversation.as_ref() {
+                                controller
+                                    .publish_history_sync(build_history_sync_upsert_from_proto(
+                                        conversation,
+                                    ))
+                                    .await;
+                            }
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryBranchResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.branch handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryPin(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_pin(request).await {
+                        Ok(response) => {
+                            if let Some(conversation) = response.conversation.as_ref() {
+                                controller
+                                    .publish_history_sync(build_history_sync_upsert_from_proto(
+                                        conversation,
+                                    ))
+                                    .await;
+                            }
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(proto::agent_envelope::Payload::HistoryPinResp(
+                                        response,
+                                    )),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.pin handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistorySetCwd(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_set_cwd(request).await {
+                        Ok(response) => {
+                            if let Some(conversation) = response.conversation.as_ref() {
+                                controller
+                                    .publish_history_sync(build_history_sync_upsert_from_proto(
+                                        conversation,
+                                    ))
+                                    .await;
+                            }
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistorySetCwdResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.set_cwd handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryShareGet(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_share_get(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryShareGetResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.share.get handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryShareSet(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_share_set(request).await {
+                        Ok(response) => {
+                            if let Some(share) = response.share.as_ref() {
+                                match chat_history::chat_history_get_summary_inner(
+                                    share.conversation_id.clone(),
+                                )
+                                .await
+                                {
+                                    Ok(summary) => {
+                                        controller
+                                            .publish_history_sync(build_history_sync_upsert(
+                                                &summary,
+                                            ))
+                                            .await;
+                                    }
+                                    Err(error) => {
+                                        eprintln!(
+                                            "publish history share sync event failed: {error}"
+                                        )
+                                    }
+                                }
+                            }
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryShareSetResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.share.set handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryShareResolve(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_share_resolve(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryShareResolveResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            let code = history_share_resolve_error_code(&error);
+                            controller
+                                .send_error_response(request_id.clone(), code, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.share.resolve handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryDelete(request)) => {
+                let deleted_conversation_id = request.conversation_id.trim().to_string();
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_history_delete(request).await {
+                        Ok(response) => {
+                            controller
+                                .publish_history_sync(build_history_sync_delete(
+                                    deleted_conversation_id,
+                                ))
+                                .await;
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::HistoryDeleteResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(err) = result {
+                        eprintln!("gateway history.delete handler failed: {err}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::ProviderList(_request)) => {
+                match gateway_bridge::handle_provider_list(self.app_handle.clone()).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::ProviderListResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::ProviderUsage(request)) => {
+                let sender = self.current_outbound_sender()?;
+                let provider_usage_service = Arc::clone(&self.provider_usage_service);
+                tauri::async_runtime::spawn(async move {
+                    let envelope = match gateway_bridge::handle_provider_usage(
+                        provider_usage_service,
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(response) => provider_usage_agent_envelope(request_id, response),
+                        Err(error) => build_error_response_envelope(request_id, 500, error),
+                    };
+                    if let Err(error) = send_agent_envelope_to(sender, envelope).await {
+                        eprintln!("gateway provider usage handler failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::ProviderModels(request)) => {
+                match gateway_bridge::handle_provider_models(self.app_handle.clone(), request).await
+                {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::ProviderModelsResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 502, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::PromptTemplateList(_))
+            | Some(proto::gateway_envelope::Payload::PromptTemplateExpand(_)) => {
+                // 提示词模板已并入指令目录（slash_command_list）与 ChatRequest.prompt_command，
+                // Gateway 也不再放行这两条通道；保留 proto 字段只为兼容。
+                self.send_error_response(
+                    request_id,
+                    410,
+                    "prompt template requests are retired; use slash_command_list and prompt_command"
+                        .to_string(),
+                )
+                .await
+            }
+            // 以下三类都要等 K-brain 或 WebView 回应，一律 spawn，避免卡住单线程的分发循环。
+            Some(proto::gateway_envelope::Payload::SlashCommandList(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_slash_command_list(
+                        controller.app_handle.clone(),
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::SlashCommandListResp(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => controller.send_error_response(request_id, 502, error).await,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("handle slash command list failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::GoalManage(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = controller.handle_goal_manage(request_id, request).await {
+                        eprintln!("handle goal manage failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::LoopManage(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = controller.handle_loop_manage(request_id, request).await {
+                        eprintln!("handle loop manage failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::SettingsGet(_request)) => {
+                match self.settings_get_snapshot().await {
+                    Ok(snapshot) => {
+                        let settings_json = match serialize_settings_sync_payload(&snapshot) {
+                            Ok(settings_json) => settings_json,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 500, error).await;
+                            }
+                        };
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SettingsGetResp(
+                                proto::SettingsGetResponse { settings_json },
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::SettingsUpdate(request)) => {
+                match parse_settings_sync_payload(&request.settings_json) {
+                    Ok(mut snapshot) => {
+                        let sync_client = match take_settings_sync_client(&mut snapshot) {
+                            Ok(client) => client,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        // The memory switch, the memory organizer schedule, the AI approval
+                        // reviewer and the web search service go to K-brain and never into
+                        // LiveAgent's own settings; an update carrying only them ends here.
+                        let memory_switch = match kbrain_memory::take_switch_update(&mut snapshot) {
+                            Ok(switch) => switch,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        let organizer = match kbrain_memory::take_organizer_update(&mut snapshot) {
+                            Ok(organizer) => organizer,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        let ai_approval =
+                            match kbrain_ai_approval::take_approval_update(&mut snapshot) {
+                                Ok(approval) => approval,
+                                Err(error) => {
+                                    return self.send_error_response(request_id, 400, error).await;
+                                }
+                            };
+                        let web_search =
+                            match kbrain_web_search::take_web_search_update(&mut snapshot) {
+                                Ok(web_search) => web_search,
+                                Err(error) => {
+                                    return self.send_error_response(request_id, 400, error).await;
+                                }
+                            };
+                        if memory_switch.is_some()
+                            || organizer.is_some()
+                            || ai_approval.is_some()
+                            || web_search.is_some()
+                        {
+                            let Some(connection) = kbrain_memory::running_kbrain(&self.app_handle)
+                            else {
+                                return self
+                                    .send_error_response(
+                                        request_id,
+                                        503,
+                                        "K-brain backend is not running".to_string(),
+                                    )
+                                    .await;
+                            };
+                            let written = tauri::async_runtime::spawn_blocking(move || {
+                                if let Some(enabled) = memory_switch {
+                                    kbrain_memory::write_switch(&connection, enabled)?;
+                                }
+                                if let Some(organizer) = &organizer {
+                                    kbrain_memory::write_organizer(&connection, organizer)?;
+                                }
+                                if let Some(approval) = &ai_approval {
+                                    kbrain_ai_approval::write_approval(&connection, approval)?;
+                                }
+                                if let Some(web_search) = &web_search {
+                                    kbrain_web_search::write_web_search(&connection, web_search)?;
+                                }
+                                Ok(())
+                            })
+                            .await
+                            .map_err(|error| format!("save K-brain settings join failed: {error}"))
+                            .and_then(|result| result);
+                            if let Err(error) = written {
+                                return self.send_error_response(request_id, 502, error).await;
+                            }
+                            if snapshot.as_object().is_some_and(|map| map.is_empty()) {
+                                // Nothing reaches LiveAgent settings, but the WebUI still
+                                // waits for this seq: let the frontend ack it in order.
+                                if sync_client.is_some() {
+                                    let ack_only = with_settings_sync_client(
+                                        Value::Object(serde_json::Map::new()),
+                                        sync_client.as_ref(),
+                                    );
+                                    if let Err(error) =
+                                        self.app_handle.emit(GATEWAY_SETTINGS_SYNC_EVENT, ack_only)
+                                    {
+                                        eprintln!("emit gateway settings sync ack failed: {error}");
+                                    }
+                                }
+                                return self
+                                    .send_agent_envelope(proto::AgentEnvelope {
+                                        request_id,
+                                        timestamp: now_unix_seconds(),
+                                        payload: Some(
+                                            proto::agent_envelope::Payload::SettingsUpdateResp(
+                                                proto::SettingsUpdateResponse {
+                                                    accepted: true,
+                                                    message: "ok".to_string(),
+                                                },
+                                            ),
+                                        ),
+                                    })
+                                    .await;
+                            }
+                        }
+                        if snapshot.get(SSH_PATCH_FIELD).is_some() {
+                            let patch_payload = snapshot.clone();
+                            let apply_response =
+                                match tauri::async_runtime::spawn_blocking(move || {
+                                    let mut conn = open_db()?;
+                                    apply_ssh_patch_with_conn(&mut conn, patch_payload)
+                                })
+                                .await
+                                .map_err(|e| format!("settings ssh patch join failed: {e}"))
+                                {
+                                    Ok(Ok(response)) => response,
+                                    Ok(Err(error)) | Err(error) => {
+                                        return self
+                                            .send_error_response(request_id, 500, error)
+                                            .await;
+                                    }
+                                };
+                            if let Some(conflict) = apply_response.conflict {
+                                return self
+                                    .send_agent_envelope(proto::AgentEnvelope {
+                                        request_id,
+                                        timestamp: now_unix_seconds(),
+                                        payload: Some(
+                                            proto::agent_envelope::Payload::SettingsUpdateResp(
+                                                proto::SettingsUpdateResponse {
+                                                    accepted: false,
+                                                    message: conflict.gateway_message().to_string(),
+                                                },
+                                            ),
+                                        ),
+                                    })
+                                    .await;
+                            }
+
+                            let (fresh_snapshot, stamp) = match self
+                                .current_settings_snapshot_stamped()
+                                .await
+                            {
+                                Ok(read) => read,
+                                Err(error) => {
+                                    return self.send_error_response(request_id, 500, error).await;
+                                }
+                            };
+                            let merged_ssh =
+                                fresh_snapshot.get("ssh").cloned().unwrap_or(Value::Null);
+                            let event_payload =
+                                match build_local_settings_update_event_payload_with_ssh(
+                                    snapshot.clone(),
+                                    merged_ssh,
+                                ) {
+                                    Ok(payload) => {
+                                        with_settings_sync_client(payload, sync_client.as_ref())
+                                    }
+                                    Err(error) => {
+                                        return self
+                                            .send_error_response(request_id, 400, error)
+                                            .await;
+                                    }
+                                };
+                            if let Err(error) = self
+                                .app_handle
+                                .emit(GATEWAY_SETTINGS_SYNC_EVENT, event_payload)
+                            {
+                                return self
+                                    .send_error_response(
+                                        request_id,
+                                        500,
+                                        format!("emit gateway settings sync failed: {error}"),
+                                    )
+                                    .await;
+                            }
+                            if let Err(error) =
+                                self.publish_settings_sync(fresh_snapshot, stamp).await
+                            {
+                                eprintln!("publish gateway ssh settings sync failed: {error}");
+                            }
+                            return self
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id,
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::SettingsUpdateResp(
+                                            proto::SettingsUpdateResponse {
+                                                accepted: true,
+                                                message: "ok".to_string(),
+                                            },
+                                        ),
+                                    ),
+                                })
+                                .await;
+                        }
+
+                        let event_payload =
+                            match build_local_settings_update_event_payload(snapshot.clone()) {
+                                Ok(payload) => {
+                                    with_settings_sync_client(payload, sync_client.as_ref())
+                                }
+                                Err(error) => {
+                                    return self.send_error_response(request_id, 400, error).await;
+                                }
+                            };
+                        let public_update = match redact_gateway_settings_sync_payload(snapshot) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        // The update is a partial payload (only changed fields, e.g.
+                        // {"theme":"dark"}). Overlay it onto the current full snapshot;
+                        // storing it as-is would drop every other cached field and let
+                        // rebuilt snapshots revert UI-only settings like theme.
+                        let (current_snapshot, stamp) =
+                            match self.current_settings_snapshot_stamped().await {
+                                Ok(read) => read,
+                                Err(error) => {
+                                    return self.send_error_response(request_id, 500, error).await;
+                                }
+                            };
+                        let removed_project_ids = match removed_workspace_project_ids(
+                            &current_snapshot,
+                            &public_update,
+                        ) {
+                            Ok(project_ids) => project_ids,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        let merged_snapshot = match merge_settings_update_into_snapshot(
+                            current_snapshot,
+                            public_update.clone(),
+                        ) {
+                            Ok(payload) => payload,
+                            Err(error) => {
+                                return self.send_error_response(request_id, 400, error).await;
+                            }
+                        };
+                        if let Err(error) =
+                            crate::commands::root_grants::revoke_workspace_root_grants_for_projects(
+                                removed_project_ids,
+                            )
+                            .await
+                        {
+                            return self.send_error_response(request_id, 500, error).await;
+                        }
+                        // A frontend publish may land while this update was being merged:
+                        // overlay the update onto that newer snapshot rather than overwrite it.
+                        if let Err(error) = self
+                            .store_merged_settings_update(
+                                merged_snapshot,
+                                stamp.generation,
+                                &public_update,
+                            )
+                            .await
+                        {
+                            return self.send_error_response(request_id, 500, error).await;
+                        }
+                        match self
+                            .app_handle
+                            .emit(GATEWAY_SETTINGS_SYNC_EVENT, event_payload)
+                        {
+                            Ok(()) => {
+                                self.send_agent_envelope(proto::AgentEnvelope {
+                                    request_id,
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::SettingsUpdateResp(
+                                            proto::SettingsUpdateResponse {
+                                                accepted: true,
+                                                message: "ok".to_string(),
+                                            },
+                                        ),
+                                    ),
+                                })
+                                .await
+                            }
+                            Err(error) => {
+                                self.send_error_response(
+                                    request_id,
+                                    500,
+                                    format!("emit gateway settings sync failed: {error}"),
+                                )
+                                .await
+                            }
+                        }
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::SettingsResetSshKnownHost(request)) => {
+                let host = request.host.trim().to_string();
+                let port = match u16::try_from(request.port) {
+                    Ok(port) if port > 0 => port,
+                    _ => {
+                        return self
+                            .send_error_response(
+                                request_id,
+                                400,
+                                "SSH port must be between 1 and 65535".to_string(),
+                            )
+                            .await;
+                    }
+                };
+                let reset = tauri::async_runtime::spawn_blocking(move || {
+                    reset_ssh_known_host_everywhere(&host, port)
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("reset SSH known host join failed: {e}")));
+                match reset {
+                    Ok(response) => {
+                        let deleted = u32::try_from(response.deleted).unwrap_or(u32::MAX);
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(
+                                proto::agent_envelope::Payload::SettingsResetSshKnownHostResp(
+                                    proto::SettingsResetSshKnownHostResponse { deleted },
+                                ),
+                            ),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsRoots(_request)) => {
+                match gateway_bridge::handle_fs_roots().await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsRootsResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::WorkspaceRootGrants(request)) => {
+                match gateway_bridge::handle_workspace_root_grants(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::WorkspaceRootGrantsResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::Checkpoint(request)) => {
+                match gateway_bridge::handle_checkpoint(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::CheckpointResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsListDirs(request)) => {
+                match gateway_bridge::handle_fs_list_dirs(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsListDirsResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsCreateProjectFolder(request)) => {
+                match gateway_bridge::handle_fs_create_project_folder(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(
+                                proto::agent_envelope::Payload::FsCreateProjectFolderResp(response),
+                            ),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsList(request)) => {
+                match gateway_bridge::handle_fs_list(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsListResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsReadEditableText(request)) => {
+                match gateway_bridge::handle_fs_read_editable_text(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsReadEditableTextResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsReadWorkspaceImage(request)) => {
+                match gateway_bridge::handle_fs_read_workspace_image(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(
+                                proto::agent_envelope::Payload::FsReadWorkspaceImageResp(response),
+                            ),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::ChatFileOpen(request)) => {
+                let sender = self.current_outbound_sender()?;
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let conversation_id = request.conversation_id.clone();
+                    let lookup_id = format!("{request_id}:chat-file-workdir");
+                    let current_workdir =
+                        || controller.kbrain_conversation_workdir(lookup_id, conversation_id);
+                    let result =
+                        gateway_bridge::handle_chat_file_open(request, current_workdir).await;
+                    let envelope = match result {
+                        Ok(response) => proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::ChatFileOpenResp(
+                                response,
+                            )),
+                        },
+                        Err(error) => build_error_response_envelope(request_id, 500, error),
+                    };
+                    if let Err(error) = send_agent_envelope_to(sender, envelope).await {
+                        eprintln!("send gateway chat file open response failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::FsWriteText(request)) => {
+                match gateway_bridge::handle_fs_write_text(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsWriteTextResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsCreateDir(request)) => {
+                match gateway_bridge::handle_fs_create_dir(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsCreateDirResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsRename(request)) => {
+                match gateway_bridge::handle_fs_rename(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsRenameResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FsDelete(request)) => {
+                match gateway_bridge::handle_fs_delete(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FsDeleteResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::SkillFilesList(_request)) => {
+                match gateway_bridge::handle_skill_files_list().await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SkillFilesListResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::FileMentionList(request)) => {
+                match gateway_bridge::handle_file_mention_list(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::FileMentionListResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::InstalledAppsList(_request)) => {
+                let host_identifier = self.app_handle.config().identifier.clone();
+                match gateway_bridge::handle_installed_apps_list(host_identifier).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::InstalledAppsListResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::CuaDriver(request)) => {
+                match gateway_bridge::handle_cua_driver(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::CuaDriverResp(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::PermissionRules(request)) => {
+                // 读写 K-brain 规则文件，spawn 出去，别占单线程调度循环。
+                let this = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_permission_rules(
+                        this.app_handle.clone(),
+                        request,
+                    )
+                    .await
+                    {
+                        Ok(response) => {
+                            this.send_agent_envelope(proto::AgentEnvelope {
+                                request_id: request_id.clone(),
+                                timestamp: now_unix_seconds(),
+                                payload: Some(proto::agent_envelope::Payload::PermissionRulesResp(
+                                    response,
+                                )),
+                            })
+                            .await
+                        }
+                        Err(error) => this.send_error_response(request_id, 400, error).await,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("handle permission rules failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::UsageStats(request)) => {
+                // 设置 → 用量统计：只读；K-brain 聚合一年的用量可能要一会儿，放到阻塞线程。
+                let this = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let app = this.app_handle.clone();
+                    let outcome = tauri::async_runtime::spawn_blocking(move || {
+                        super::kbrain_usage_stats::handle_usage_stats(&app, request)
+                    })
+                    .await
+                    .unwrap_or_else(|error| Err(format!("usage stats task failed: {error}")));
+                    let result = match outcome {
+                        Ok(response) => {
+                            this.send_agent_envelope(proto::AgentEnvelope {
+                                request_id: request_id.clone(),
+                                timestamp: now_unix_seconds(),
+                                payload: Some(proto::agent_envelope::Payload::UsageStatsResp(
+                                    response,
+                                )),
+                            })
+                            .await
+                        }
+                        Err(error) => this.send_error_response(request_id, 400, error).await,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("handle usage stats failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::ProxyDetect(request)) => {
+                // 检测要等握手超时（约 1.5s），测速最长 10s；spawn 出去，别让 Ping、
+                // 聊天探活（ChatPrepareTimeout 2s）在单线程调度循环里排队。
+                let this = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match gateway_bridge::handle_proxy_detect(request).await {
+                        Ok(response) => {
+                            this.send_agent_envelope(proto::AgentEnvelope {
+                                request_id: request_id.clone(),
+                                timestamp: now_unix_seconds(),
+                                payload: Some(proto::agent_envelope::Payload::ProxyDetectResp(
+                                    response,
+                                )),
+                            })
+                            .await
+                        }
+                        Err(error) => this.send_error_response(request_id, 400, error).await,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("handle proxy detect failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::UploadReadableFiles(request)) => {
+                match gateway_bridge::handle_upload_readable_files(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::UploadReadableFilesResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::ImportDirectory(request)) => {
+                match gateway_bridge::handle_import_directory(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::ImportDirectoryResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 400, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::UploadedImagePreview(request)) => {
+                self.spawn_uploaded_image_preview_response(request_id, request)
+            }
+            // 记忆命令要等 K-brain 回应（手动整理可达 2 分钟），spawn 出去，避免卡住分发循环。
+            Some(proto::gateway_envelope::Payload::MemoryManage(request)) => {
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let outcome =
+                        match super::kbrain_history::history_archive_action(&request.command) {
+                            Some(action) => {
+                                controller
+                                    .handle_history_archive_command(
+                                        request_id.clone(),
+                                        action,
+                                        &request,
+                                    )
+                                    .await
+                            }
+                            None => {
+                                gateway_bridge::handle_memory_manage(
+                                    controller.app_handle.clone(),
+                                    request,
+                                )
+                                .await
+                            }
+                        };
+                    let result = match outcome {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::MemoryManageResp(response),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => controller.send_error_response(request_id, 500, error).await,
+                    };
+                    if let Err(error) = result {
+                        eprintln!("handle memory manage failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::SkillMetadataRead(request)) => {
+                match gateway_bridge::handle_skill_metadata_read(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SkillMetadataReadResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::SkillTextRead(request)) => {
+                match gateway_bridge::handle_skill_text_read(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SkillTextReadResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::SkillManage(request)) => {
+                match gateway_bridge::handle_skill_manage(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SkillManageResp(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::GitRequest(request)) => {
+                match gateway_bridge::handle_git_request(
+                    request,
+                    Arc::clone(&self.git_clone_task_registry),
+                )
+                .await
+                {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::GitResponse(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::TerminalRequest(request)) => {
+                match self.handle_terminal_request(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::TerminalResponse(
+                                response,
+                            )),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+
+            Some(proto::gateway_envelope::Payload::SftpRequest(request)) => {
+                match self.handle_sftp_request(request).await {
+                    Ok(response) => {
+                        self.send_agent_envelope(proto::AgentEnvelope {
+                            request_id,
+                            timestamp: now_unix_seconds(),
+                            payload: Some(proto::agent_envelope::Payload::SftpResponse(response)),
+                        })
+                        .await
+                    }
+                    Err(error) => self.send_error_response(request_id, 500, error).await,
+                }
+            }
+            Some(proto::gateway_envelope::Payload::ManagedProcessRequest(request)) => {
+                // A stop carries a bounded TERM grace; run it off the inbound
+                // stream loop so tunnel frames and pings keep flowing.
+                let controller = Arc::clone(self);
+                tauri::async_runtime::spawn(async move {
+                    let result = match controller.handle_managed_process_request(request).await {
+                        Ok(response) => {
+                            controller
+                                .send_agent_envelope(proto::AgentEnvelope {
+                                    request_id: request_id.clone(),
+                                    timestamp: now_unix_seconds(),
+                                    payload: Some(
+                                        proto::agent_envelope::Payload::ManagedProcessResponse(
+                                            response,
+                                        ),
+                                    ),
+                                })
+                                .await
+                        }
+                        Err(error) => {
+                            controller
+                                .send_error_response(request_id.clone(), 500, error)
+                                .await
+                        }
+                    };
+                    if let Err(error) = result {
+                        eprintln!("send gateway managed process response failed: {error}");
+                    }
+                });
+                Ok(())
+            }
+            Some(proto::gateway_envelope::Payload::HistoryResync(_)) => self
+                .send_error_response(
+                    request_id,
+                    400,
+                    "history resync is handled by the Gateway".to_string(),
+                )
+                .await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl GatewayController {
+    pub(crate) async fn publish_planning_changed(&self, seq: u64) -> Result<(), String> {
+        self.send_agent_envelope(proto::AgentEnvelope {
+            request_id: String::new(),
+            timestamp: now_unix_seconds(),
+            payload: Some(proto::agent_envelope::Payload::PlanningChanged(
+                proto::PlanningChanged { seq },
+            )),
+        })
+        .await
+    }
+}

@@ -1,0 +1,1102 @@
+// GitReview toolbar: panel header (branch summary, remote actions, counters,
+// mode/pane switchers) plus the modal dialogs and the operation toast shared
+// by the status and history views.
+//
+// Shared implementation owned by @liveagent/ui. Host-specific Git operations
+// and optional platform capabilities enter through the shared contracts.
+
+import {
+  AlertTriangle,
+  BrushCleaning,
+  Check,
+  CheckCircle2,
+  ChevronDown,
+  Cloud,
+  Download,
+  Eye,
+  Folder,
+  GitBranch,
+  History,
+  Loader2,
+  RefreshCw,
+  Search,
+  Sparkles,
+  Trash2,
+  Upload,
+  X,
+  XCircle,
+} from "@liveagent/ui/components/IconSet";
+import { useLocale } from "@liveagent/ui/i18n/index";
+import type { GitBranch as GitBranchInfo } from "@liveagent/ui/lib/git/types";
+import {
+  gitDiscoveredRepositoryLabel,
+  selectedGitRepositoryLabel,
+} from "@liveagent/ui/lib/git/types";
+import { hostAwareErrorMessage } from "@liveagent/ui/lib/shared/hostErrors";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
+import { cn } from "../../../lib/shared/utils";
+import { SettingsToggleGroup, SettingsToggleGroupItem } from "../../settings/SettingsToggleGroup";
+import {
+  AlertDialog,
+  AlertDialogActions,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "../../ui/alert-dialog";
+import { Button, RefreshButton } from "../../ui/button";
+import {
+  Dialog,
+  DialogActions,
+  DialogBody,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "../../ui/dialog";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuTrigger,
+} from "../../ui/dropdown-menu";
+import { Input } from "../../ui/input";
+import { ShortcutTooltip } from "../../ui/shortcut-tooltip";
+import { Tabs, TabsList, TabsTrigger } from "../../ui/tabs";
+import { useRightDockToolContext } from "../RightDockContext";
+import {
+  type GitBranchFromCommitState,
+  type GitBranchSwitchConflictState,
+  type GitDiscardConfirmState,
+  type GitOperationNotice,
+  type GitRemoteSetupAction,
+  type GitReviewStackedPane,
+  remoteSetupDescriptionKey,
+  remoteSetupSubmitKey,
+} from "./model";
+import type { GitReviewData } from "./useGitReviewData";
+
+export function GitRemoteSetupModal(props: {
+  open: boolean;
+  action: GitRemoteSetupAction;
+  workdir: string;
+  branch: string;
+  remoteUrl: string;
+  loading: boolean;
+  error: string;
+  onRemoteUrlChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const {
+    open,
+    action,
+    workdir,
+    branch,
+    remoteUrl,
+    loading,
+    error,
+    onRemoteUrlChange,
+    onClose,
+    onSubmit,
+  } = props;
+  const { t } = useLocale();
+  const remoteUrlId = useId();
+
+  return (
+    <Dialog
+      open={open}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !loading) onClose();
+      }}
+    >
+      <DialogContent
+        className="max-w-md p-0"
+        closeDisabled={loading}
+        closeLabel={t("chat.cancel")}
+        showCloseButton
+      >
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle className="text-sm leading-normal">
+              {t("projectTools.gitReview.remoteSetupTitle")}
+            </DialogTitle>
+            <DialogDescription className="mt-1 text-xs leading-5">
+              {t(remoteSetupDescriptionKey(action))}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="space-y-4">
+            <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
+              <div
+                className="truncate rounded-lg border border-border/70 bg-muted/35 px-3 py-2"
+                title={branch}
+              >
+                {branch}
+              </div>
+              <div
+                className="truncate rounded-lg border border-border/70 bg-muted/35 px-3 py-2"
+                title={workdir}
+              >
+                {workdir}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={remoteUrlId} className="text-xs text-muted-foreground">
+                {t("projectTools.gitReview.remoteUrl")}
+              </label>
+              <Input
+                variant="plain"
+                id={remoteUrlId}
+                value={remoteUrl}
+                onChange={(event) => onRemoteUrlChange(event.target.value)}
+                className="h-9 text-xs placeholder:text-xs"
+                placeholder={t("projectTools.gitReview.remoteUrlPlaceholder")}
+                autoFocus
+                disabled={loading}
+              />
+            </div>
+            {error ? (
+              <div className="rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {error}
+              </div>
+            ) : null}
+          </DialogBody>
+          <DialogFooter>
+            <DialogActions>
+              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+                {t("chat.cancel")}
+              </Button>
+              <Button type="submit" size="sm" disabled={loading || !remoteUrl.trim()}>
+                {loading ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : action === "push" ? (
+                  <Upload className="size-3.5" />
+                ) : (
+                  <RefreshCw className="size-3.5" />
+                )}
+                {t(remoteSetupSubmitKey(action))}
+              </Button>
+            </DialogActions>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function GitDiscardConfirmModal(props: {
+  target: GitDiscardConfirmState | null;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const { target, loading, onClose, onConfirm } = props;
+  const { t } = useLocale();
+  if (!target) return null;
+
+  const isAll = target.kind === "all";
+  const title = isAll
+    ? t("projectTools.gitReview.discardAllChanges")
+    : t("projectTools.gitReview.discardChanges");
+  const description = isAll
+    ? t("projectTools.gitReview.discardAllConfirm")
+    : t("projectTools.gitReview.discardConfirm").replace("{path}", target.path);
+
+  return (
+    <AlertDialog
+      open={Boolean(target)}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !loading) onClose();
+      }}
+    >
+      <AlertDialogContent className="max-w-md p-0">
+        <AlertDialogHeader className="flex-row items-start gap-3">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-destructive/10">
+            <AlertTriangle className="size-4 text-destructive" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <AlertDialogTitle className="text-sm leading-normal">{title}</AlertDialogTitle>
+            <AlertDialogDescription className="mt-1 text-xs leading-5">
+              {description}
+            </AlertDialogDescription>
+          </div>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogActions>
+            <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+              {t("chat.cancel")}
+            </Button>
+            <Button
+              type="button"
+              variant="destructive"
+              size="sm"
+              onClick={onConfirm}
+              disabled={loading}
+            >
+              {loading ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : isAll ? (
+                <Trash2 className="size-3.5" />
+              ) : (
+                <BrushCleaning className="size-3.5" />
+              )}
+              {title}
+            </Button>
+          </AlertDialogActions>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+export function GitBranchFromCommitModal(props: {
+  target: GitBranchFromCommitState | null;
+  branchName: string;
+  loading: boolean;
+  error: string;
+  onBranchNameChange: (value: string) => void;
+  onClose: () => void;
+  onSubmit: () => void;
+}) {
+  const { target, branchName, loading, error, onBranchNameChange, onClose, onSubmit } = props;
+  const { t } = useLocale();
+  const branchNameId = useId();
+
+  if (!target) return null;
+
+  return (
+    <Dialog
+      open={Boolean(target)}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !loading) onClose();
+      }}
+    >
+      <DialogContent
+        className="max-w-md p-0"
+        closeDisabled={loading}
+        closeLabel={t("chat.cancel")}
+        showCloseButton
+      >
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            onSubmit();
+          }}
+        >
+          <DialogHeader>
+            <DialogTitle className="text-sm leading-normal">
+              {t("projectTools.gitReview.createBranchFromCommitTitle")}
+            </DialogTitle>
+            <DialogDescription className="mt-1 text-xs leading-5">
+              {t("projectTools.gitReview.createBranchFromCommitDescription")
+                .replace("{sha}", target.shortSha)
+                .replace("{subject}", target.subject || target.shortSha)}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogBody className="space-y-4">
+            <div className="rounded-lg border border-border/70 bg-muted/35 px-3 py-2 text-xs">
+              <div className="font-mono text-xs text-muted-foreground">{target.shortSha}</div>
+              <div className="mt-1 truncate font-medium" title={target.subject}>
+                {target.subject || target.commitSha}
+              </div>
+            </div>
+            <div className="space-y-1.5">
+              <label htmlFor={branchNameId} className="text-xs text-muted-foreground">
+                {t("projectTools.gitReview.branchName")}
+              </label>
+              <Input
+                variant="plain"
+                id={branchNameId}
+                value={branchName}
+                onChange={(event) => onBranchNameChange(event.target.value)}
+                className="h-9 text-xs placeholder:text-xs"
+                placeholder={t("projectTools.gitReview.branchNamePlaceholder")}
+                autoFocus
+                disabled={loading}
+              />
+            </div>
+            {error ? (
+              <div className="rounded-lg bg-destructive/10 px-3 py-2 text-xs text-destructive">
+                {error}
+              </div>
+            ) : null}
+          </DialogBody>
+          <DialogFooter>
+            <DialogActions>
+              <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+                {t("chat.cancel")}
+              </Button>
+              <Button type="submit" size="sm" disabled={loading || !branchName.trim()}>
+                {loading ? (
+                  <Loader2 className="size-3.5 animate-spin" />
+                ) : (
+                  <GitBranch className="size-3.5" />
+                )}
+                {t("projectTools.gitReview.createBranch")}
+              </Button>
+            </DialogActions>
+          </DialogFooter>
+        </form>
+      </DialogContent>
+    </Dialog>
+  );
+}
+
+export function GitOperationNoticeToast({
+  notice,
+  onDismiss,
+}: {
+  notice: GitOperationNotice | null;
+  onDismiss: () => void;
+}) {
+  useEffect(() => {
+    if (!notice) return;
+    const timer = window.setTimeout(onDismiss, notice.kind === "success" ? 4200 : 7000);
+    return () => window.clearTimeout(timer);
+  }, [notice, onDismiss]);
+
+  if (!notice) return null;
+
+  const isSuccess = notice.kind === "success";
+  return (
+    <div className="pointer-events-none absolute bottom-3 right-3 z-50 flex max-w-inset-1p5rem justify-end">
+      <div
+        role={isSuccess ? "status" : "alert"}
+        aria-live={isSuccess ? "polite" : "assertive"}
+        className={cn(
+          "pointer-events-auto flex w-80 max-w-full items-start gap-2.5 rounded-lg border",
+          "px-3 py-2.5 text-sm shadow-lg backdrop-blur-xl",
+          isSuccess
+            ? "border-emerald-500/25 bg-emerald-50/95 text-emerald-900 dark:bg-emerald-950/85 dark:text-emerald-100"
+            : "border-red-500/30 bg-red-50/95 text-red-900 dark:bg-red-950/85 dark:text-red-100",
+        )}
+      >
+        {isSuccess ? (
+          <CheckCircle2 className="mt-0.5 size-4 shrink-0 text-emerald-600 dark:text-emerald-300" />
+        ) : (
+          <XCircle className="mt-0.5 size-4 shrink-0 text-red-600 dark:text-red-300" />
+        )}
+        <div className="min-w-0 flex-1">
+          <div className="font-medium leading-5">{notice.title}</div>
+          {notice.message ? (
+            <div
+              className={cn(
+                "mt-0.5 max-h-24 overflow-auto whitespace-pre-wrap break-words text-xs leading-5",
+                isSuccess
+                  ? "text-emerald-800/80 dark:text-emerald-100/75"
+                  : "text-red-800/80 dark:text-red-100/75",
+              )}
+            >
+              {notice.message}
+            </div>
+          ) : null}
+        </div>
+        <Button
+          variant="ghost"
+          size="icon-xs"
+          type="button"
+          onClick={onDismiss}
+          className="mt-0.5 shrink-0 rounded p-0.5 opacity-55 transition-opacity hover:opacity-100"
+          aria-label="Dismiss"
+        >
+          <X className="size-3.5" />
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+const GIT_REVIEW_REMOTE_BRANCH_DISPLAY_LIMIT = 40;
+
+// A checkout aborted by uncommitted local changes offers stash-and-switch
+// instead of surfacing the raw git error.
+export function GitBranchSwitchConflictModal(props: {
+  conflict: GitBranchSwitchConflictState | null;
+  loading: boolean;
+  onClose: () => void;
+  onConfirm: () => void;
+}) {
+  const { conflict, loading, onClose, onConfirm } = props;
+  const { t } = useLocale();
+  if (!conflict) return null;
+
+  return (
+    <AlertDialog
+      open={Boolean(conflict)}
+      onOpenChange={(nextOpen) => {
+        if (!nextOpen && !loading) onClose();
+      }}
+    >
+      <AlertDialogContent className="max-w-md p-0">
+        <AlertDialogHeader className="flex-row items-start gap-3">
+          <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-amber-500/10">
+            <AlertTriangle className="size-4 text-amber-500" />
+          </div>
+          <div className="min-w-0 flex-1">
+            <AlertDialogTitle className="text-sm leading-normal">
+              {t("projectTools.gitReview.switchBranchConflictTitle")}
+            </AlertDialogTitle>
+            <AlertDialogDescription className="mt-1 text-xs leading-5">
+              {t("projectTools.gitReview.switchBranchConflictDescription").replace(
+                "{branch}",
+                conflict.branch,
+              )}
+            </AlertDialogDescription>
+          </div>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogActions>
+            <Button type="button" variant="ghost" size="sm" onClick={onClose} disabled={loading}>
+              {t("chat.cancel")}
+            </Button>
+            <Button type="button" size="sm" onClick={onConfirm} disabled={loading}>
+              {loading ? (
+                <Loader2 className="size-3.5 animate-spin" />
+              ) : (
+                <Download className="size-3.5" />
+              )}
+              {t("projectTools.gitReview.stashAndSwitch")}
+            </Button>
+          </AlertDialogActions>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
+// Head title as a branch switcher: branches load lazily when the menu opens
+// and switching runs through runOperation so status/history refresh and
+// errors surface exactly like the other toolbar operations.
+function GitReviewBranchMenu(props: { data: GitReviewData; writeDisabled: boolean }) {
+  const { data, writeDisabled } = props;
+  const { busy, cwd, gitClient, state, switchBranch } = data;
+  const { t } = useLocale();
+  const [open, setOpen] = useState(false);
+  const [branches, setBranches] = useState<GitBranchInfo[]>([]);
+  const [branchesLoading, setBranchesLoading] = useState(false);
+  const [branchesError, setBranchesError] = useState("");
+  const [filter, setFilter] = useState("");
+  const requestIdRef = useRef(0);
+  const operationBusy = busy !== "";
+
+  const loadBranches = useCallback(async () => {
+    const requestId = ++requestIdRef.current;
+    if (!gitClient || !cwd.trim()) return;
+    setBranchesLoading(true);
+    setBranchesError("");
+    try {
+      const response = await gitClient.branches(cwd);
+      if (requestIdRef.current !== requestId) return;
+      setBranches(response.branches);
+    } catch (err) {
+      if (requestIdRef.current !== requestId) return;
+      setBranchesError(hostAwareErrorMessage(err, t("git.branchSelector.runtimeUnsupported")));
+      setBranches([]);
+    } finally {
+      if (requestIdRef.current === requestId) {
+        setBranchesLoading(false);
+      }
+    }
+  }, [cwd, gitClient, t]);
+
+  const title = state.head || t("projectTools.gitReviewTitle");
+  if (state.status !== "ready") {
+    return (
+      <div className="flex min-w-0 flex-1 items-center px-2 text-xs font-medium text-muted-foreground">
+        <span className="min-w-0 truncate">{title}</span>
+      </div>
+    );
+  }
+
+  // Same matching rule as the composer GitBranchSelector: case-insensitive
+  // substring over the full ref name so `origin/feat` narrows remotes too.
+  const normalizedFilter = filter.trim().toLowerCase();
+  const matchesFilter = (branch: GitBranchInfo) =>
+    !normalizedFilter || branch.fullName.toLowerCase().includes(normalizedFilter);
+  const localBranches = branches.filter(
+    (branch) => branch.kind === "local" && matchesFilter(branch),
+  );
+  const remoteBranches = branches.filter(
+    (branch) => branch.kind === "remote" && matchesFilter(branch),
+  );
+  const hiddenRemoteCount = Math.max(
+    0,
+    remoteBranches.length - GIT_REVIEW_REMOTE_BRANCH_DISPLAY_LIMIT,
+  );
+  const noMatches =
+    normalizedFilter !== "" && localBranches.length === 0 && remoteBranches.length === 0;
+
+  const renderBranchRow = (branch: GitBranchInfo, isCurrent: boolean, labelText: string) => (
+    <DropdownMenuItem
+      key={`${branch.kind}:${branch.fullName}`}
+      disabled={operationBusy}
+      onSelect={() => {
+        if (isCurrent || writeDisabled) return;
+        void switchBranch(branch.fullName, branch.kind);
+      }}
+      className={cn("gap-2", (isCurrent || writeDisabled) && "text-muted-foreground")}
+      title={branch.fullName}
+    >
+      {isCurrent ? (
+        <Check className="size-3.5 shrink-0" />
+      ) : (
+        <GitBranch className="size-3.5 shrink-0 text-muted-foreground" />
+      )}
+      <span className="min-w-0 flex-1 truncate">{labelText}</span>
+    </DropdownMenuItem>
+  );
+
+  return (
+    <DropdownMenu
+      open={open}
+      onOpenChange={(next) => {
+        setOpen(next);
+        if (next) {
+          void loadBranches();
+        } else {
+          setFilter("");
+        }
+      }}
+    >
+      <DropdownMenuTrigger
+        disabled={operationBusy}
+        className={cn(
+          "flex min-w-0 flex-1 items-center gap-1.5 px-2",
+          "text-xs font-medium outline-hidden transition-colors",
+          "hover:bg-muted/70 focus-visible:bg-muted/70 disabled:pointer-events-none disabled:opacity-60",
+        )}
+        title={t("projectTools.gitReview.switchBranch")}
+        aria-label={t("projectTools.gitReview.switchBranch")}
+      >
+        <span className="min-w-0 flex-1 truncate text-left">{title}</span>
+        <ChevronDown className="size-3 shrink-0 text-muted-foreground opacity-70" />
+      </DropdownMenuTrigger>
+      <DropdownMenuContent
+        variant="soft"
+        align="start"
+        className="flex max-h-[min(400px,75dvh)] w-72 flex-col overflow-hidden p-0"
+      >
+        <DropdownMenuLabel className="shrink-0">
+          {t("projectTools.gitReview.switchBranch")}
+        </DropdownMenuLabel>
+        <div className="shrink-0 border-b border-border/60 px-2 pb-1.5">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2 top-1/2 size-3.5 -translate-y-1/2 text-muted-foreground" />
+            <Input
+              value={filter}
+              onChange={(event) => setFilter(event.target.value)}
+              onKeyDown={(event) => {
+                // Keep keystrokes out of the menu typeahead; Escape clears
+                // the filter without closing the menu.
+                event.stopPropagation();
+                if (event.nativeEvent.isComposing) return;
+                if (event.key === "Escape") {
+                  event.preventDefault();
+                  setFilter("");
+                }
+              }}
+              variant="plain"
+              placeholder={t("git.branchSelector.filterBranches")}
+              aria-label={t("git.branchSelector.filterBranches")}
+              className="h-8 pl-7 text-xs"
+            />
+          </div>
+        </div>
+        <div className="min-h-0 flex-1 overflow-y-auto p-1">
+          {branchesLoading ? (
+            <div className="flex items-center justify-center px-2 py-3">
+              <Loader2 className="size-4 animate-spin text-muted-foreground" />
+            </div>
+          ) : branchesError ? (
+            <div className="p-2 text-xs text-destructive">{branchesError}</div>
+          ) : (
+            <>
+              {localBranches.length > 0 ? (
+                <DropdownMenuLabel>{t("git.branchSelector.localBranches")}</DropdownMenuLabel>
+              ) : null}
+              {localBranches.map((branch) => renderBranchRow(branch, branch.current, branch.name))}
+              {remoteBranches.length > 0 ? (
+                <DropdownMenuLabel>{t("git.branchSelector.remoteBranches")}</DropdownMenuLabel>
+              ) : null}
+              {remoteBranches.slice(0, GIT_REVIEW_REMOTE_BRANCH_DISPLAY_LIMIT).map((branch) => {
+                const isCurrentUpstream =
+                  branch.current || (state.upstream !== "" && branch.fullName === state.upstream);
+                return renderBranchRow(branch, isCurrentUpstream, branch.fullName);
+              })}
+              {hiddenRemoteCount > 0 ? (
+                <div className="px-2 py-1 text-xs text-muted-foreground">
+                  {t("git.branchSelector.moreRemoteBranches").replace(
+                    "{count}",
+                    String(hiddenRemoteCount),
+                  )}
+                </div>
+              ) : null}
+              {noMatches ? (
+                <div className="p-2 text-xs text-muted-foreground">
+                  {t("git.branchSelector.noMatches")}
+                </div>
+              ) : null}
+            </>
+          )}
+        </div>
+      </DropdownMenuContent>
+    </DropdownMenu>
+  );
+}
+
+// Which selector the header's single dropdown edits: the repository (the
+// container) or the branch (the item inside it).
+type GitReviewScope = "repository" | "branch";
+
+// Horizontal rolling scope rail above the selector dropdown: both scope
+// icons share one row and the active one always rolls into the first
+// (leftmost) slot — full-size and tinted — while the inactive one rolls in
+// behind it, smaller and dimmed. Clicking the trailing icon swaps the slots
+// with an odometer-style slide (the active icon passes above via z-index)
+// and the dropdown below switches to that scope's selector, so whichever
+// selector is active always gets the full header width.
+function GitReviewScopeDial(props: {
+  value: GitReviewScope;
+  onChange: (value: GitReviewScope) => void;
+  repositoryLabel: string;
+  branchLabel: string;
+}) {
+  const { value, onChange, repositoryLabel, branchLabel } = props;
+  const items = [
+    {
+      key: "repository" as const,
+      label: repositoryLabel,
+      Icon: Folder,
+    },
+    {
+      key: "branch" as const,
+      label: branchLabel,
+      Icon: GitBranch,
+    },
+  ];
+  return (
+    <SettingsToggleGroup
+      value={[value]}
+      onValueChange={(values) => {
+        const next = values[0];
+        if (next === "repository" || next === "branch") onChange(next);
+      }}
+      className="shrink-0"
+      aria-label={`${repositoryLabel} / ${branchLabel}`}
+    >
+      {items.map((item) => {
+        const isActive = item.key === value;
+        return (
+          <SettingsToggleGroupItem
+            key={item.key}
+            value={item.key}
+            aria-label={item.label}
+            title={item.label}
+            className="min-w-7 px-1.5"
+          >
+            <item.Icon className={cn("size-3.5", isActive && "text-foreground")} />
+          </SettingsToggleGroupItem>
+        );
+      })}
+    </SettingsToggleGroup>
+  );
+}
+
+export function GitReviewToolbar(props: {
+  data: GitReviewData;
+  stackedPane: GitReviewStackedPane;
+  onStackedPaneChange: (pane: GitReviewStackedPane, dir: "forward" | "back") => void;
+  useSplitReviewLayout: boolean;
+  visibleError: string;
+  writeDisabled: boolean;
+}) {
+  const {
+    data,
+    stackedPane,
+    onStackedPaneChange,
+    useSplitReviewLayout,
+    visibleError,
+    writeDisabled,
+  } = props;
+  const {
+    branchDiff,
+    busy,
+    canWrite,
+    cwd,
+    disabledMessage,
+    discoverRepositories,
+    gitClient,
+    historyLoading,
+    loadHistory,
+    loading,
+    refresh,
+    repositories,
+    reviewMode,
+    runOperation,
+    selectRepository,
+    selectedRepoRoot,
+    setReviewMode,
+    state,
+  } = data;
+  const { t } = useLocale();
+  const { onInsertCodeReviewSkill } = useRightDockToolContext().git;
+  const operationBusy = busy !== "";
+  const aiReviewTitle = t(
+    !onInsertCodeReviewSkill
+      ? "projectTools.gitReview.aiReviewUnavailable"
+      : state.status === "ready"
+        ? "projectTools.gitReview.addAiReview"
+        : "projectTools.gitReview.noRepository",
+  );
+  // Which selector the dial exposes; branch is the everyday one, so it wins
+  // the full-width dropdown by default.
+  const [scope, setScope] = useState<GitReviewScope>("branch");
+  // The repository scope only earns UI when discovery found more than one
+  // repository to pick between; otherwise the dial collapses to a static
+  // branch icon and the branch selector owns the header.
+  const showRepositoryScope = repositories.length > 1;
+  const effectiveScope: GitReviewScope = showRepositoryScope ? scope : "branch";
+
+  return (
+    <div className="shrink-0 border-b border-border p-3">
+      <GitBranchSwitchConflictModal
+        conflict={data.branchSwitchConflict}
+        loading={busy === "switch_branch"}
+        onClose={data.dismissBranchSwitchConflict}
+        onConfirm={() => void data.stashAndSwitchBranch()}
+      />
+      {/* Single header line: horizontal scope rail (only when there are
+          multiple repositories to pick between — with a single repository it
+          collapses to a static branch icon), then the active scope's dropdown
+          taking the remaining width, then the action buttons. */}
+      <div className="flex items-center gap-2">
+        {showRepositoryScope ? (
+          <GitReviewScopeDial
+            value={effectiveScope}
+            onChange={setScope}
+            repositoryLabel={t("projectTools.gitReview.repositoryPicker")}
+            branchLabel={t("projectTools.gitReview.switchBranch")}
+          />
+        ) : (
+          <div
+            className="flex size-7 shrink-0 items-center justify-center"
+            title={t("projectTools.gitReview.switchBranch")}
+          >
+            <GitBranch className="size-18px text-emerald-600 dark:text-emerald-300" />
+          </div>
+        )}
+        <div
+          className={cn(
+            "flex h-7 min-w-0 flex-1 items-stretch overflow-hidden",
+            "rounded-md border border-border bg-muted/25",
+          )}
+        >
+          {effectiveScope === "repository" ? (
+            <DropdownMenu>
+              <DropdownMenuTrigger
+                disabled={operationBusy}
+                className={cn(
+                  "flex min-w-0 flex-1 items-center gap-1.5 px-2",
+                  "text-xs font-medium outline-hidden transition-colors",
+                  "hover:bg-muted/70 focus-visible:bg-muted/70 disabled:pointer-events-none disabled:opacity-60",
+                )}
+                title={t("projectTools.gitReview.repositoryPicker")}
+                aria-label={t("projectTools.gitReview.repositoryPicker")}
+              >
+                <span className="min-w-0 flex-1 truncate text-left">
+                  {selectedGitRepositoryLabel(repositories, selectedRepoRoot) ||
+                    state.repoRoot ||
+                    t("projectTools.gitReview.noRepository")}
+                </span>
+                <ChevronDown className="size-3 shrink-0 text-muted-foreground opacity-70" />
+              </DropdownMenuTrigger>
+              <DropdownMenuContent variant="soft" align="start" className="min-w-56 max-w-72">
+                <DropdownMenuLabel>
+                  {t("projectTools.gitReview.repositoryPicker")}
+                </DropdownMenuLabel>
+                {repositories.map((repo) => {
+                  const value = repo.isWorkspaceRoot ? "" : repo.root;
+                  const selected = value === selectedRepoRoot;
+                  return (
+                    <DropdownMenuItem
+                      key={repo.root}
+                      disabled={operationBusy}
+                      onSelect={() => {
+                        if (!selected) selectRepository(value);
+                      }}
+                      className="gap-2"
+                      title={repo.root}
+                    >
+                      {selected ? (
+                        <Check className="size-3.5 shrink-0" />
+                      ) : (
+                        <Folder className="size-3.5 shrink-0 text-muted-foreground" />
+                      )}
+                      <span className="min-w-0 flex-1 truncate">
+                        {gitDiscoveredRepositoryLabel(repo)}
+                      </span>
+                    </DropdownMenuItem>
+                  );
+                })}
+              </DropdownMenuContent>
+            </DropdownMenu>
+          ) : (
+            <GitReviewBranchMenu data={data} writeDisabled={writeDisabled} />
+          )}
+        </div>
+        <ShortcutTooltip
+          label={aiReviewTitle}
+          triggerDisabled={!onInsertCodeReviewSkill || state.status !== "ready"}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={!onInsertCodeReviewSkill || state.status !== "ready"}
+            className="size-7 px-0"
+            aria-label={t("projectTools.gitReview.addAiReview")}
+            onClick={onInsertCodeReviewSkill}
+          >
+            <Sparkles className="size-3.5 text-primary" />
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip
+          label={t("projectTools.gitReview.refresh")}
+          triggerDisabled={loading || historyLoading || operationBusy}
+        >
+          <RefreshButton
+            aria-busy={loading || historyLoading}
+            size="sm"
+            variant="ghost"
+            disabled={loading || historyLoading || operationBusy}
+            className="size-7 px-0"
+            aria-label={t("projectTools.gitReview.refresh")}
+            onClick={() => {
+              if (data.isBusy()) return;
+              // Manual refresh also re-scans for repositories so ones created
+              // mid-session (e.g. a fresh clone in a subdirectory) show up.
+              void discoverRepositories();
+              if (reviewMode === "history") {
+                void loadHistory();
+              } else {
+                void refresh();
+              }
+            }}
+          >
+            <RefreshCw
+              data-refresh-icon
+              className={cn("size-3.5", (loading || historyLoading) && "animate-spin")}
+            />
+          </RefreshButton>
+        </ShortcutTooltip>
+        <ShortcutTooltip
+          label={t("projectTools.gitReview.fetch")}
+          triggerDisabled={writeDisabled || operationBusy}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={writeDisabled || operationBusy}
+            aria-label={t("projectTools.gitReview.fetch")}
+            className="size-7 px-0"
+            onClick={() => {
+              if (gitClient) void runOperation("fetch", () => gitClient.fetch(cwd), "fetch");
+            }}
+          >
+            {busy === "fetch" ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Cloud className="size-3.5" />
+            )}
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip
+          label={t("projectTools.gitReview.pull")}
+          triggerDisabled={writeDisabled || operationBusy}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={writeDisabled || operationBusy}
+            aria-label={t("projectTools.gitReview.pull")}
+            className="size-7 px-0"
+            onClick={() => {
+              if (gitClient) void runOperation("pull", () => gitClient.pull(cwd), "pull");
+            }}
+          >
+            {busy === "pull" ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Download className="size-3.5" />
+            )}
+          </Button>
+        </ShortcutTooltip>
+        <ShortcutTooltip
+          label={t("projectTools.gitReview.push")}
+          triggerDisabled={writeDisabled || operationBusy}
+        >
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={writeDisabled || operationBusy}
+            aria-label={t("projectTools.gitReview.push")}
+            className="size-7 px-0"
+            onClick={() => {
+              if (gitClient) void runOperation("push", () => gitClient.push(cwd), "push");
+            }}
+          >
+            {busy === "push" ? (
+              <Loader2 className="size-3.5 animate-spin" />
+            ) : (
+              <Upload className="size-3.5" />
+            )}
+          </Button>
+        </ShortcutTooltip>
+      </div>
+      {state.status === "ready" ? (
+        <div
+          className={cn(
+            "mt-1.5 overflow-hidden rounded-xl border border-white/20 bg-white/50 shadow-sm backdrop-blur-xl",
+            "dark:border-white/[0.08] dark:bg-white/[0.03]",
+          )}
+        >
+          <div className="flex items-center gap-1.5 border-b border-black/[0.04] px-3 py-2 dark:border-white/[0.06]">
+            <span
+              className={cn(
+                "shrink-0 rounded bg-muted/70 px-1.5 py-0.5",
+                "text-tiny font-medium leading-none text-muted-foreground",
+              )}
+            >
+              {t("projectTools.gitReview.labelBase")}
+            </span>
+            <Cloud className="size-3 shrink-0 text-muted-foreground/60" />
+            <span
+              className="min-w-0 truncate font-mono text-xs text-foreground/75"
+              title={
+                branchDiff?.baseRef || state.upstream || t("projectTools.gitReview.unresolved")
+              }
+            >
+              {branchDiff?.baseRef || state.upstream || t("projectTools.gitReview.unresolved")}
+            </span>
+          </div>
+          <div className="grid grid-cols-5">
+            {[
+              {
+                count: state.ahead,
+                label: t("projectTools.gitReview.labelAhead"),
+                tone: "text-sky-600 dark:text-sky-400",
+              },
+              {
+                count: state.behind,
+                label: t("projectTools.gitReview.labelBehind"),
+                tone: "text-orange-600 dark:text-orange-400",
+              },
+              {
+                count: state.dirtyCounts.staged,
+                label: t("projectTools.gitReview.labelStaged"),
+                tone: "text-emerald-600 dark:text-emerald-400",
+              },
+              {
+                count: state.dirtyCounts.unstaged,
+                label: t("projectTools.gitReview.labelUnstaged"),
+                tone: "text-amber-600 dark:text-amber-400",
+              },
+              {
+                count: state.dirtyCounts.untracked,
+                label: t("projectTools.gitReview.labelUntracked"),
+                tone: "text-violet-600 dark:text-violet-400",
+              },
+            ].map((item, index) => (
+              <div
+                key={item.label}
+                className={cn(
+                  "flex flex-col items-center gap-0.5 py-2",
+                  index > 0 && "border-l border-black/[0.04] dark:border-white/[0.06]",
+                )}
+              >
+                <span
+                  className={cn(
+                    "text-sm font-semibold tabular-nums leading-none",
+                    item.count > 0 ? item.tone : "text-muted-foreground/40",
+                  )}
+                >
+                  {item.count}
+                </span>
+                <span className="text-tiny leading-none text-muted-foreground/60">
+                  {item.label}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      ) : null}
+      <div className="mt-3 flex items-center gap-2">
+        <Tabs
+          value={reviewMode}
+          onValueChange={(value) => {
+            if (value === "changes" || value === "history") setReviewMode(value);
+          }}
+        >
+          <TabsList variant="segmented" aria-label={t("projectTools.gitReview.commitHistoryTitle")}>
+            <TabsTrigger value="changes" variant="segmented" className="gap-1.5">
+              <GitBranch className="size-3.5" />
+              {t("projectTools.gitReview.localChangesView")}
+            </TabsTrigger>
+            <TabsTrigger value="history" variant="segmented" className="gap-1.5">
+              <History className="size-3.5" />
+              {t("projectTools.gitReview.commitHistoryView")}
+            </TabsTrigger>
+          </TabsList>
+        </Tabs>
+        {!useSplitReviewLayout ? (
+          <SettingsToggleGroup
+            className="ml-auto shrink-0"
+            value={[stackedPane]}
+            onValueChange={(values) => {
+              const pane = values[0];
+              if (pane === "list" || pane === "detail")
+                onStackedPaneChange(pane, pane === "list" ? "back" : "forward");
+            }}
+            aria-label={t("projectTools.gitReview.listPane")}
+          >
+            <ShortcutTooltip label={t("projectTools.gitReview.listPane")}>
+              <SettingsToggleGroupItem
+                value="list"
+                aria-label={t("projectTools.gitReview.listPane")}
+                className="min-w-7 px-1.5"
+              >
+                {reviewMode === "changes" ? (
+                  <GitBranch className="size-3.5" />
+                ) : (
+                  <History className="size-3.5" />
+                )}
+              </SettingsToggleGroupItem>
+            </ShortcutTooltip>
+            <ShortcutTooltip label={t("projectTools.gitReview.detailPane")}>
+              <SettingsToggleGroupItem
+                value="detail"
+                aria-label={t("projectTools.gitReview.detailPane")}
+                className="min-w-7 px-1.5"
+              >
+                <Eye className="size-3.5" />
+              </SettingsToggleGroupItem>
+            </ShortcutTooltip>
+          </SettingsToggleGroup>
+        ) : null}
+      </div>
+      {!canWrite && disabledMessage ? (
+        <div className="mt-2 rounded-md bg-muted px-2 py-1.5 text-xs text-muted-foreground">
+          {disabledMessage}
+        </div>
+      ) : null}
+      {visibleError ? <div className="mt-2 text-xs text-destructive">{visibleError}</div> : null}
+    </div>
+  );
+}

@@ -1,0 +1,54 @@
+#[path = "app/mod.rs"]
+pub mod app_commands;
+#[path = "automation/mod.rs"]
+pub mod automation_commands;
+#[path = "config/mod.rs"]
+pub mod config_commands;
+#[path = "history/mod.rs"]
+pub mod history_commands;
+#[path = "integration/mod.rs"]
+pub mod integration_commands;
+pub mod image_export;
+pub mod planning;
+#[path = "runtime/mod.rs"]
+pub mod runtime_commands;
+#[path = "workspace/mod.rs"]
+pub mod workspace_commands;
+
+pub use app_commands::app;
+pub use app_commands::data_dir;
+pub use app_commands::fonts;
+pub use app_commands::notifications;
+pub use app_commands::proxy_detect;
+pub use app_commands::system;
+pub use app_commands::tray;
+pub use app_commands::update;
+
+pub use automation_commands::cron;
+pub use automation_commands::hook;
+
+pub use config_commands::settings;
+
+pub use history_commands::chat_history;
+pub use history_commands::history_db;
+pub use history_commands::subagent_store;
+
+pub use integration_commands::browser;
+pub use integration_commands::browser_cookie_import;
+pub use integration_commands::cua_driver;
+pub use integration_commands::gateway;
+pub use integration_commands::mcp;
+pub use integration_commands::mcp_oauth;
+pub use integration_commands::memory;
+
+pub use runtime_commands::process;
+pub use runtime_commands::sftp;
+pub use runtime_commands::shell;
+pub use runtime_commands::terminal;
+
+pub use workspace_commands::chat_file_links;
+pub use workspace_commands::checkpoint;
+pub use workspace_commands::fs;
+pub use workspace_commands::git;
+pub use workspace_commands::root_grants;
+pub use workspace_commands::subagent_worktree;

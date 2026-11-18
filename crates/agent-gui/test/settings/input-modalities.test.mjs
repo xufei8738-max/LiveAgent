@@ -1,0 +1,243 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createTsModuleLoader } from "../helpers/load-ts-module.mjs";
+
+// inputModalities（模型输入模态用户覆盖）的反漂移锁：
+// 1. normalizer 的过滤/补齐/规范顺序契约；
+// 2. 设置加载往返不丢字段；
+// 3. modelFactory 对所有供应商（含 Anthropic 兼容）应用覆盖：K-brain 按模型条目的
+//    inputModalities 判定能否收图，与 API 类型无关（#1045）。
+const loader = createTsModuleLoader();
+const { normalizeInputModalities, normalizeProviderModelConfig, normalizeProviderModelConfigs } =
+  loader.loadModule("src/lib/settings/index.ts");
+const { createModelFromConfig } = loader.loadModule(
+  "src/lib/providers/runtime/modelFactory.ts",
+);
+// providerUtils 依赖 tauri invoke；normalizeFetchedModels 本身不触发网络，
+// mock 仅为满足模块加载。
+const providerUtilsLoader = createTsModuleLoader({
+  mocks: { "@tauri-apps/api/core": { invoke: async () => ({}) } },
+});
+const {
+  applyModelInputModalitiesMode,
+  getModelInputModalitiesMode,
+  normalizeFetchedModels,
+  providerSupportsModelInputModalitiesOverride,
+} = providerUtilsLoader.loadModule("@liveagent/ui/pages/settings/providerUtils.ts");
+
+test("normalizeInputModalities rejects non-arrays and empty/fully-invalid arrays", () => {
+  assert.equal(normalizeInputModalities(undefined), undefined);
+  assert.equal(normalizeInputModalities(null), undefined);
+  assert.equal(normalizeInputModalities("image"), undefined);
+  assert.equal(normalizeInputModalities({ 0: "image" }), undefined);
+  assert.equal(normalizeInputModalities([]), undefined);
+  assert.equal(normalizeInputModalities(["audio"]), undefined);
+  assert.equal(normalizeInputModalities([" image "]), undefined);
+});
+
+test("normalizeInputModalities filters mixed arrays and dedupes", () => {
+  assert.deepEqual(normalizeInputModalities(["image", 123, "future"]), ["text", "image"]);
+  assert.deepEqual(normalizeInputModalities(["image", "image", "text"]), ["text", "image"]);
+});
+
+test("normalizeInputModalities auto-adds text and emits canonical order", () => {
+  // 聊天协议始终发送文本：image-only 覆盖自动补齐 text
+  assert.deepEqual(normalizeInputModalities(["image"]), ["text", "image"]);
+  assert.deepEqual(normalizeInputModalities(["image", "text"]), ["text", "image"]);
+  assert.deepEqual(normalizeInputModalities(["text"]), ["text"]);
+});
+
+test("normalizeProviderModelConfig preserves a valid inputModalities override", () => {
+  const normalized = normalizeProviderModelConfig(
+    {
+      id: "k3",
+      contextWindow: 258000,
+      maxOutputToken: 32000,
+      limitsSource: "user",
+      inputModalities: ["text", "image"],
+    },
+    "codex",
+  );
+  assert.deepEqual(normalized.inputModalities, ["text", "image"]);
+});
+
+test("normalizeProviderModelConfig drops malformed inputModalities and legacy archives", () => {
+  const malformed = normalizeProviderModelConfig(
+    { id: "k3", contextWindow: 258000, maxOutputToken: 32000, inputModalities: "image" },
+    "codex",
+  );
+  assert.equal("inputModalities" in malformed, false);
+  const legacy = normalizeProviderModelConfig(
+    { id: "k3", contextWindow: 258000, maxOutputToken: 32000 },
+    "codex",
+  );
+  assert.equal("inputModalities" in legacy, false);
+});
+
+test("modelFactory: codex completions custom model honors the override", () => {
+  const base = ["codex", "k3", "https://api.kimi.com/coding/v1", "openai-completions"];
+  const withoutOverride = createModelFromConfig(...base);
+  assert.deepEqual(withoutOverride.input, ["text"]);
+  const withOverride = createModelFromConfig(...base, {
+    id: "k3",
+    contextWindow: 258000,
+    maxOutputToken: 32000,
+    inputModalities: ["text", "image"],
+  });
+  // 构造带覆盖的模型不能反向污染此前创建的无覆盖模型实例。
+  assert.deepEqual(withoutOverride.input, ["text"]);
+  assert.deepEqual(withOverride.input, ["text", "image"]);
+});
+
+test(
+  "ProviderModal input capability mode preserves auto/text/image semantics and provider boundary",
+  () => {
+    const baseModel = { id: "k3", contextWindow: 258000, maxOutputToken: 32000 };
+    const textOnly = applyModelInputModalitiesMode(baseModel, "text");
+    const textAndImage = applyModelInputModalitiesMode(textOnly, "text-image");
+    const automatic = applyModelInputModalitiesMode(textAndImage, "auto");
+
+    assert.equal(getModelInputModalitiesMode(baseModel), "auto");
+    assert.equal(getModelInputModalitiesMode(textOnly), "text");
+    assert.equal(getModelInputModalitiesMode(textAndImage), "text-image");
+    assert.equal("inputModalities" in automatic, false);
+
+    assert.equal(providerSupportsModelInputModalitiesOverride("codex"), true);
+    assert.equal(providerSupportsModelInputModalitiesOverride("xai"), true);
+    assert.equal(providerSupportsModelInputModalitiesOverride("gemini"), true);
+    assert.equal(providerSupportsModelInputModalitiesOverride("deepseek"), true);
+    // #1045：Anthropic 兼容供应商同样可以手动开启图片输入。
+    assert.equal(providerSupportsModelInputModalitiesOverride("claude_code"), true);
+  },
+);
+
+test("modelFactory: codex custom model ignores a malformed override", () => {
+  const model = createModelFromConfig(
+    "codex",
+    "k3",
+    "https://api.kimi.com/coding/v1",
+    "openai-completions",
+    { id: "k3", contextWindow: 258000, maxOutputToken: 32000, inputModalities: ["audio"] },
+  );
+  assert.deepEqual(model.input, ["text"]);
+});
+
+test("modelFactory: gemini custom model honors the override", () => {
+  const model = createModelFromConfig(
+    "gemini",
+    "some-custom-proxy-model",
+    "https://gemini-proxy.example.com",
+    undefined,
+    {
+      id: "some-custom-proxy-model",
+      contextWindow: 128000,
+      maxOutputToken: 32000,
+      inputModalities: ["text"],
+    },
+  );
+  assert.deepEqual(model.input, ["text"]);
+});
+
+test("modelFactory: K-brain model descriptors use explicit modality overrides", () => {
+  const flash = createModelFromConfig(
+    "deepseek",
+    "deepseek-v4-flash",
+    "https://api.deepseek.com",
+  );
+  assert.deepEqual(flash.input, ["text"]);
+
+  const pro = createModelFromConfig("deepseek", "deepseek-v4-pro", "https://api.deepseek.com");
+  assert.deepEqual(pro.input, ["text"]);
+
+  const forcedText = createModelFromConfig(
+    "deepseek",
+    "deepseek-v4-flash",
+    "https://relay.example.com",
+    undefined,
+    {
+      id: "deepseek-v4-flash",
+      contextWindow: 128000,
+      maxOutputToken: 32000,
+      inputModalities: ["text"],
+    },
+  );
+  assert.deepEqual(forcedText.input, ["text"]);
+
+  const forcedImage = createModelFromConfig(
+    "deepseek",
+    "deepseek-v4-pro",
+    "https://api.deepseek.com",
+    undefined,
+    {
+      id: "deepseek-v4-pro",
+      contextWindow: 128000,
+      maxOutputToken: 32000,
+      inputModalities: ["text", "image"],
+    },
+  );
+  assert.deepEqual(forcedImage.input, ["text", "image"]);
+});
+
+test("modelFactory: K-brain anthropic descriptor preserves explicit modalities", () => {
+  const model = createModelFromConfig(
+    "claude_code",
+    "unknown-relay-claude-model",
+    "https://claude-relay.example.com",
+    undefined,
+    {
+      id: "unknown-relay-claude-model",
+      contextWindow: 200000,
+      maxOutputToken: 32000,
+      inputModalities: ["text", "image"],
+    },
+  );
+  assert.deepEqual(model.input, ["text", "image"]);
+});
+
+test("gemini persisted model survives the ProviderModal open/save round trip", () => {
+  const persisted = [
+    {
+      id: "gemini-custom",
+      contextWindow: 123456,
+      maxOutputToken: 789,
+      limitsSource: "user",
+      inputModalities: ["text", "image"],
+    },
+  ];
+  // ProviderModal 初始化（持久化归一化）：所有用户字段原样往返
+  const viaModal = normalizeProviderModelConfigs(persisted, "gemini");
+  assert.deepEqual(viaModal[0], {
+    id: "gemini-custom",
+    contextWindow: 123456,
+    maxOutputToken: 789,
+    limitsSource: "user",
+    inputModalities: ["text", "image"],
+  });
+});
+
+test("gemini K-brain discovery normalization preserves the inputModalities override", () => {
+  // K-brain 已把供应商原始字段归一化为统一模型契约；前端只归一化该契约，
+  // 不再解析 Gemini 的原生 name/inputTokenLimit/outputTokenLimit 字段。
+  const fetched = [
+    {
+      id: "gemini-custom",
+      contextWindow: 123456,
+      maxOutputToken: 789,
+      limitsSource: "provider",
+      inputModalities: ["image"],
+    },
+  ];
+  const viaFetch = normalizeFetchedModels(fetched, "gemini");
+  assert.equal(viaFetch.length, 1);
+  assert.deepEqual(viaFetch[0].inputModalities, ["text", "image"]);
+});
+
+
+test("model display names survive normalization without changing the request id", () => {
+  for (const field of ["displayName", "display_name", "name"]) {
+    const model = normalizeProviderModelConfig({ id: "my-model-id", [field]: "My Model" }, "codex");
+    assert.equal(model.id, "my-model-id");
+    assert.equal(model.displayName, "My Model");
+    assert.equal(normalizeProviderModelConfig(model, "codex").displayName, "My Model");
+  }
+});
