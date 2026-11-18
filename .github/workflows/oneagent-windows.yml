@@ -78,18 +78,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p dist
+          mkdir -p dist/msi dist/exe
           msi_path="$(find target crates/agent-gui/src-tauri/target -type f -name '*.msi' -path '*bundle*' -print -quit 2>/dev/null || true)"
           setup_path="$(find target crates/agent-gui/src-tauri/target -type f -iname '*setup.exe' -path '*bundle*' -print -quit 2>/dev/null || true)"
           echo "msi=$msi_path"
           echo "setup=$setup_path"
           if [ -z "$msi_path" ]; then echo "no MSI produced"; exit 1; fi
-          cp "$msi_path" "dist/OneAgent-${APP_VERSION}-Windows-x64.msi"
-          if [ -n "$setup_path" ]; then cp "$setup_path" "dist/OneAgent-${APP_VERSION}-Windows-x64-Setup.exe"; fi
-          ls -la dist
+          cp "$msi_path" "dist/msi/OneAgent-${APP_VERSION}-Windows-x64.msi"
+          if [ -n "$setup_path" ]; then cp "$setup_path" "dist/exe/OneAgent-${APP_VERSION}-Windows-x64-Setup.exe"; fi
+          echo "=== SHA256 ==="
+          sha256sum dist/msi/* dist/exe/* 2>/dev/null || shasum -a 256 dist/msi/* dist/exe/*
+          ls -la dist/msi dist/exe
 
       - uses: actions/upload-artifact@v4
         with:
-          name: oneagent-windows-x64-${{ env.APP_VERSION }}
-          path: dist/*
+          name: oneagent-windows-x64-msi-${{ env.APP_VERSION }}
+          path: dist/msi/*
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oneagent-windows-x64-exe-${{ env.APP_VERSION }}
+          path: dist/exe/*
           if-no-files-found: error
